@@ -42,6 +42,16 @@ impl<'gc> OrphanManager<'gc> {
         }
     }
 
+    /// Remove a display object from the orphan list.
+    pub fn remove_orphan_obj(&mut self, dobj: DisplayObject<'gc>) {
+        self.orphans_mut()
+            .retain(|orphan| !std::ptr::eq(orphan.as_ptr(), dobj.as_ptr()));
+    }
+
+    pub fn len(&self) -> usize {
+        self.orphans.len()
+    }
+
     pub fn each_orphan_obj(
         context: &mut UpdateContext<'gc>,
         mut f: impl FnMut(DisplayObject<'gc>, &mut UpdateContext<'gc>),

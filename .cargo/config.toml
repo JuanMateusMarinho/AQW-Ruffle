@@ -7,9 +7,9 @@ rustflags = [
 ]
 
 [target.x86_64-pc-windows-msvc]
-# Use the LLD linker, it should be faster than the default.
-# See: https://github.com/rust-lang/rust/issues/71520
-linker = "rust-lld.exe"
+# Aumenta a stack para 64MB para evitar stack overflow durante recursão profunda do AVM2 (ex: AQW map changes)
+# O rust-lld foi removido pois ignorava a flag /STACK
+rustflags = ["-C", "link-arg=/STACK:134217728"]
 
 [env]
 # Set the minimum stack size for tests to 8 MiB.

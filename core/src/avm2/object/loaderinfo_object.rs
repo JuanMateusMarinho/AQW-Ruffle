@@ -14,6 +14,48 @@ use gc_arena::{Collect, Gc, GcWeak, Mutation, lock::RefLock};
 use ruffle_common::utils::HasPrefixField;
 use std::cell::{Cell, Ref};
 use std::sync::Arc;
+use swf::ButtonState;
+
+fn cleanup_unloaded_display_object_tree<'gc>(
+    context: &mut UpdateContext<'gc>,
+    root: DisplayObject<'gc>,
+) {
+    let mut stack = vec![root];
+
+    while let Some(dobj) = stack.pop() {
+        context.orphan_manager.remove_orphan_obj(dobj);
+
+        if let Some(object) = dobj.object2() {
+            context
+                .avm2
+                .remove_object_from_broadcast_list(object.as_ptr());
+        }
+
+        if let Some(movie_clip) = dobj.as_movie_clip() {
+            movie_clip.clear_avm2_frame_script_state();
+            context
+                .frame_script_cleanup_queue
+                .retain(|queued| !std::ptr::eq(queued.as_ptr(), movie_clip.as_ptr()));
+        }
+
+        if let Some(container) = dobj.as_container() {
+            stack.extend(container.iter_render_list());
+        }
+
+        if let Some(button) = dobj.as_avm2_button() {
+            for state in [
+                ButtonState::UP,
+                ButtonState::OVER,
+                ButtonState::DOWN,
+                ButtonState::HIT_TEST,
+            ] {
+                if let Some(child) = button.get_state_child(state) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+}
 
 /// Represents a thing which can be loaded by a loader.
 #[derive(Collect, Clone)]
@@ -98,6 +140,9 @@ pub struct LoaderInfoObjectData<'gc> {
     expose_content: Cell<bool>,
 
     errored: Cell<bool>,
+
+    /// True enquanto um SWF está sendo carregado. Impede loads simultâneos.
+    is_loading: Cell<bool>,
 }
 
 impl<'gc> LoaderInfoObject<'gc> {
@@ -142,6 +187,7 @@ impl<'gc> LoaderInfoObject<'gc> {
                 content_type: Cell::new(ContentType::Unknown),
                 expose_content: Cell::new(false),
                 errored: Cell::new(false),
+                is_loading: Cell::new(false),
             },
         ));
 
@@ -230,6 +276,8 @@ impl<'gc> LoaderInfoObject<'gc> {
                 }
 
                 self.0.complete_event_fired.set(true);
+                // Load concluído — libera para novos loads
+                self.0.is_loading.set(false);
                 let complete_evt = EventObject::bare_default_event(context, "complete");
                 Avm2::dispatch_event(context, complete_evt, self.into());
                 return true;
@@ -255,6 +303,16 @@ impl<'gc> LoaderInfoObject<'gc> {
         self.0.expose_content.set(true);
     }
 
+    /// Retorna true se um SWF está sendo carregado atualmente.
+    pub fn is_loading(self) -> bool {
+        self.0.is_loading.get()
+    }
+
+    /// Define o estado de carregamento.
+    pub fn set_is_loading(self, value: bool) {
+        self.0.is_loading.set(value);
+    }
+
     pub fn set_loader_stream(&self, stream: LoaderStream<'gc>, mc: &Mutation<'gc>) {
         *unlock!(Gc::write(mc, self.0), LoaderInfoObjectData, loaded_stream).borrow_mut() = stream;
     }
@@ -271,6 +329,8 @@ impl<'gc> LoaderInfoObject<'gc> {
         self.set_loader_stream(loader_stream, context.gc());
         self.set_errored(false);
         self.reset_init_and_complete_events();
+        // Reseta flag de loading ao fazer unload
+        self.0.is_loading.set(false);
 
         let mut loader = self
             .0
@@ -283,6 +343,7 @@ impl<'gc> LoaderInfoObject<'gc> {
         // Remove the Loader's content element if it exists.
         if let Some(child) = loader.child_by_index(0) {
             loader.remove_child(context, child);
+            cleanup_unloaded_display_object_tree(context, child);
         }
     }
 }
@@ -290,5 +351,33 @@ impl<'gc> LoaderInfoObject<'gc> {
 impl<'gc> TObject<'gc> for LoaderInfoObject<'gc> {
     fn gc_base(&self) -> Gc<'gc, ScriptObjectData<'gc>> {
         HasPrefixField::as_prefix_gc(self.0)
+    }
+}
+
+impl<'gc> LoaderInfoObject<'gc> {
+    /// Reseta o LoaderInfo para estado "não carregado" e dispara o evento "unload".
+    /// Chamado por Loader._unload() após remover o conteúdo da display list.
+    pub fn reset_and_dispatch_unload(
+        self,
+        activation: &mut Activation<'_, 'gc>,
+    ) -> Result<(), Error<'gc>> {
+        let context = &mut activation.context;
+
+        // Reseta stream para "não carregado"
+        let movie = &context.root_swf;
+        let empty_swf = Arc::new(crate::tag_utils::SwfMovie::empty(
+            movie.version(),
+            Some(movie.url().into()),
+        ));
+        let loader_stream = crate::avm2::object::LoaderStream::NotYetLoaded(empty_swf, None, false);
+        self.set_loader_stream(loader_stream, context.gc());
+        self.set_errored(false);
+        self.reset_init_and_complete_events();
+
+        // Dispara evento "unload" no LoaderInfo (Adobe spec §4.8.3)
+        let unload_event = EventObject::bare_default_event(context, "unload");
+        Avm2::dispatch_event(context, unload_event, self.into());
+
+        Ok(())
     }
 }

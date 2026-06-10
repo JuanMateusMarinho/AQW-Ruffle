@@ -17,6 +17,43 @@ use std::cell::Cell;
 use std::slice::Iter;
 use swf::{Color, Rectangle, Twips};
 
+const MAX_FOCUS_RECURSION_DEPTH: u32 = 64;
+
+thread_local! {
+    static FOCUS_RECURSION_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+struct FocusRecursionGuard;
+
+impl FocusRecursionGuard {
+    fn enter<'gc>(new: Option<InteractiveObject<'gc>>) -> Option<Self> {
+        let current_depth = FOCUS_RECURSION_DEPTH.with(|depth| {
+            let current_depth = depth.get().saturating_add(1);
+            depth.set(current_depth);
+            current_depth
+        });
+
+        if current_depth > MAX_FOCUS_RECURSION_DEPTH {
+            FOCUS_RECURSION_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+            tracing::error!(
+                depth = current_depth,
+                limit = MAX_FOCUS_RECURSION_DEPTH,
+                new = ?new,
+                "Focus recursion limit exceeded; skipping focus change"
+            );
+            None
+        } else {
+            Some(Self)
+        }
+    }
+}
+
+impl Drop for FocusRecursionGuard {
+    fn drop(&mut self) {
+        FOCUS_RECURSION_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
 #[derive(Collect)]
 #[collect(no_drop)]
 pub struct FocusTrackerData<'gc> {
@@ -147,6 +184,10 @@ impl<'gc> FocusTracker<'gc> {
         context: &mut UpdateContext<'gc>,
         run_actions: bool,
     ) {
+        let Some(_focus_guard) = FocusRecursionGuard::enter(new) else {
+            return;
+        };
+
         Self::roll_over(context, new);
 
         if run_actions {

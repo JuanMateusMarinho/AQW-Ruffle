@@ -525,6 +525,15 @@ pub trait TDisplayObjectContainer<'gc>:
 
     #[no_dynamic]
     fn fill_tab_order(&self, tab_order: &mut TabOrder<'gc>, context: &mut UpdateContext<'gc>) {
+        let this: DisplayObject<'_> = (*self).into();
+        let Some(_tab_order_guard) = super::DisplayObjectRecursionGuard::enter(
+            &super::TAB_ORDER_RECURSION_DEPTH,
+            "tab_order",
+            this,
+        ) else {
+            return;
+        };
+
         if !self.is_tab_children(context) {
             // AS3 docs say that objects with custom ordering (tabIndex set)
             // are included even when tabChildren is false.

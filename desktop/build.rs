@@ -42,11 +42,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     if target.contains("windows") {
         if target.contains("msvc") {
-            println!("cargo:rustc-link-arg=/STACK:4000000");
+            println!("cargo:rustc-link-arg=/STACK:536870912");
         } else {
             println!("cargo:rustc-link-arg=-Xlinker");
             println!("cargo:rustc-link-arg=--stack");
-            println!("cargo:rustc-link-arg=4000000");
+            println!("cargo:rustc-link-arg=536870912");
         }
     }
 

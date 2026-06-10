@@ -339,7 +339,9 @@ impl ActivePlayer {
             .with_avm2_optimizer_enabled(opt.avm2_optimizer_enabled);
         let player = builder.build();
 
-        window.set_title(&format!("Ruffle - {readable_name}"));
+        let window_title = std::env::var("ARTIX_RUFFLE_WINDOW_TITLE")
+            .unwrap_or_else(|_| "Artix Entertainment - AdventureQuest Worlds V0.1".to_string());
+        window.set_title(&window_title);
 
         SWF_INFO.with(|i| *i.borrow_mut() = Some(readable_name));
 

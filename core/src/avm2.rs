@@ -27,6 +27,7 @@ use crate::tag_utils::SwfMovie;
 use fnv::FnvHashMap;
 use gc_arena::lock::GcRefLock;
 use gc_arena::{Collect, Gc, Mutation};
+use std::cell::Cell;
 use std::sync::Arc;
 use swf::DoAbc2Flag;
 use swf::avm2::read::Reader;
@@ -102,6 +103,44 @@ pub use crate::avm2::value::Value;
 use self::api_version::ApiVersion;
 use self::object::WeakObject;
 use self::scope::Scope;
+
+const MAX_AVM2_EVENT_RECURSION_DEPTH: u32 = 256;
+
+thread_local! {
+    static AVM2_EVENT_RECURSION_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+struct Avm2EventRecursionGuard;
+
+impl Avm2EventRecursionGuard {
+    fn enter<'gc>(event_type: AvmString<'gc>, operation: &'static str) -> Option<Self> {
+        let current_depth = AVM2_EVENT_RECURSION_DEPTH.with(|depth| {
+            let current_depth = depth.get().saturating_add(1);
+            depth.set(current_depth);
+            current_depth
+        });
+
+        if current_depth > MAX_AVM2_EVENT_RECURSION_DEPTH {
+            AVM2_EVENT_RECURSION_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+            tracing::error!(
+                operation = operation,
+                event_type = ?event_type,
+                depth = current_depth,
+                limit = MAX_AVM2_EVENT_RECURSION_DEPTH,
+                "AVM2 event recursion limit exceeded; skipping event dispatch"
+            );
+            None
+        } else {
+            Some(Self)
+        }
+    }
+}
+
+impl Drop for Avm2EventRecursionGuard {
+    fn drop(&mut self) {
+        AVM2_EVENT_RECURSION_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
 
 const BROADCAST_WHITELIST: [&[u8]; 4] =
     [b"enterFrame", b"exitFrame", b"frameConstructed", b"render"];
@@ -359,6 +398,13 @@ impl<'gc> Avm2<'gc> {
         target: Object<'gc>,
         simulate_dispatch: bool,
     ) -> bool {
+        let event_type = event.event().event_type();
+        let Some(_event_guard) =
+            Avm2EventRecursionGuard::enter(event_type, "dispatch_event_internal")
+        else {
+            return false;
+        };
+
         let mut activation = Activation::from_nothing(context);
 
         events::dispatch_event(&mut activation, target, event, simulate_dispatch)
@@ -373,6 +419,19 @@ impl<'gc> Avm2<'gc> {
     ///
     /// Attempts to register the same listener for the same event will also do
     /// nothing.
+    pub fn remove_object_from_broadcast_list(
+        &mut self,
+        object_ptr: *const crate::avm2::object::ObjectPtr,
+    ) {
+        for bucket in self.broadcast_list.values_mut() {
+            bucket.retain(|weak| !std::ptr::eq(weak.as_ptr(), object_ptr));
+        }
+    }
+
+    pub fn broadcast_listener_count(&self) -> usize {
+        self.broadcast_list.values().map(std::vec::Vec::len).sum()
+    }
+
     pub fn register_broadcast_listener(
         context: &mut UpdateContext<'gc>,
         object: Object<'gc>,
@@ -416,6 +475,11 @@ impl<'gc> Avm2<'gc> {
         if !BROADCAST_WHITELIST.iter().any(|x| *x == &event_name) {
             return;
         }
+
+        let Some(_event_guard) = Avm2EventRecursionGuard::enter(event_name, "broadcast_event")
+        else {
+            return;
+        };
 
         let el_length = context
             .avm2
@@ -618,6 +682,10 @@ impl<'gc> Avm2<'gc> {
     /// Pops an executable off the call stack
     pub fn pop_call(&self, mc: &Mutation<'gc>) {
         self.call_stack.borrow_mut(mc).pop();
+    }
+
+    pub fn call_depth(&self) -> usize {
+        self.call_stack.borrow().depth()
     }
 
     pub fn call_stack(&self) -> GcRefLock<'gc, CallStack<'gc>> {

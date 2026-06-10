@@ -486,10 +486,10 @@ impl Player {
     /// This logic is far from perfect, as it doesn't take into account
     /// that things like rendering also take time. But for now it's good enough.
     fn max_frames_per_tick(&self) -> u32 {
-        const MAX_FRAMES_PER_TICK: u32 = 5;
+        const MAX_FRAMES_PER_TICK: u32 = 1;
 
         if self.recent_run_frame_timings.is_empty() {
-            5
+            MAX_FRAMES_PER_TICK
         } else {
             let frame_time = self.frame_time(1000.0);
             let average_run_frame_time = self.recent_run_frame_timings.iter().sum::<f64>()
@@ -563,9 +563,13 @@ impl Player {
         // so timer callbacks won't get cancelled/delayed.
         self.time_offset = 0;
 
-        // Sanity: If we had too many frames to tick, just reset the accumulator
-        // to prevent running at turbo speed.
-        if self.frame_accumulator >= frame_duration {
+        // When catch-up is disabled, prefer stable pacing over scheduling an
+        // almost-immediate follow-up frame after a delay.
+        if frame > 0 && max_frames_per_tick == 1 {
+            self.frame_accumulator = FloatDuration::ZERO;
+        } else if self.frame_accumulator >= frame_duration {
+            // Sanity: If we had too many frames to tick, just reset the accumulator
+            // to prevent running at turbo speed.
             self.frame_accumulator = FloatDuration::ZERO;
         }
 

@@ -924,6 +924,57 @@ pub enum BoundsMode {
     Script,
 }
 
+const MAX_DISPLAY_RECURSION_DEPTH: u32 = 512;
+
+thread_local! {
+    static RENDER_RECURSION_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static BOUNDS_RECURSION_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static FRAME_SCRIPT_RECURSION_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static LOCAL_FRAME_SCRIPT_RECURSION_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static TAB_ORDER_RECURSION_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+struct DisplayObjectRecursionGuard {
+    depth: &'static std::thread::LocalKey<Cell<u32>>,
+}
+
+impl DisplayObjectRecursionGuard {
+    fn enter<'gc>(
+        depth: &'static std::thread::LocalKey<Cell<u32>>,
+        operation: &'static str,
+        this: DisplayObject<'gc>,
+    ) -> Option<Self> {
+        let current_depth = depth.with(|depth| {
+            let current_depth = depth.get().saturating_add(1);
+            depth.set(current_depth);
+            current_depth
+        });
+
+        if current_depth > MAX_DISPLAY_RECURSION_DEPTH {
+            depth.with(|depth| depth.set(depth.get().saturating_sub(1)));
+            tracing::error!(
+                operation = operation,
+                depth = current_depth,
+                limit = MAX_DISPLAY_RECURSION_DEPTH,
+                id = ?this.id(),
+                ptr = ?this.as_ptr(),
+                name = ?this.name().map(|name| name.to_string()),
+                "Display object recursion limit exceeded; skipping recursive operation"
+            );
+            None
+        } else {
+            Some(Self { depth })
+        }
+    }
+}
+
+impl Drop for DisplayObjectRecursionGuard {
+    fn drop(&mut self) {
+        self.depth
+            .with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
 struct DrawCacheInfo {
     handle: BitmapHandle,
     dirty: bool,
@@ -942,6 +993,12 @@ pub fn render_base<'gc>(
         // Skip rendering masks (unless we are rendering one explicitly).
         return;
     }
+
+    let Some(_render_guard) =
+        DisplayObjectRecursionGuard::enter(&RENDER_RECURSION_DEPTH, "render", this)
+    else {
+        return;
+    };
 
     if options.apply_transform {
         let transform = this.base().transform(options.apply_matrix);
@@ -1195,7 +1252,13 @@ pub fn apply_standard_mask_and_scroll<'gc, F>(
     if let RenderMask::Stencil(m) = mask {
         context.commands.push_mask();
         context.transform_stack.push(&mask_transform);
-        m.render_self(context);
+        if let Some(_render_guard) = DisplayObjectRecursionGuard::enter(
+            &RENDER_RECURSION_DEPTH,
+            "stencil_mask_render_self",
+            m,
+        ) {
+            m.render_self(context);
+        }
         context.transform_stack.pop();
         context.commands.activate_mask();
     }
@@ -1254,7 +1317,13 @@ pub fn apply_standard_mask_and_scroll<'gc, F>(
     if let RenderMask::Stencil(m) = mask {
         context.commands.deactivate_mask();
         context.transform_stack.push(&mask_transform);
-        m.render_self(context);
+        if let Some(_render_guard) = DisplayObjectRecursionGuard::enter(
+            &RENDER_RECURSION_DEPTH,
+            "stencil_mask_clear_render_self",
+            m,
+        ) {
+            m.render_self(context);
+        }
         context.transform_stack.pop();
         context.commands.pop_mask();
     }
@@ -1376,6 +1445,12 @@ pub trait TDisplayObject<'gc>:
     ///
     /// The `mode` parameter indicates which kind of bounds to return.
     fn bounds_with_transform(self, matrix: &Matrix, mode: BoundsMode) -> Rectangle<Twips> {
+        let Some(_bounds_guard) =
+            DisplayObjectRecursionGuard::enter(&BOUNDS_RECURSION_DEPTH, "bounds", self.into())
+        else {
+            return *matrix * self.self_bounds(mode);
+        };
+
         // A scroll rect completely overrides an object's bounds,
         // and can even grow the bounding box to be larger than the actual content
         if let Some(scroll_rect) = self.scroll_rect() {
@@ -1412,6 +1487,14 @@ pub trait TDisplayObject<'gc>:
         include_own_filters: bool,
         view_matrix: &Matrix,
     ) -> Rectangle<Twips> {
+        let Some(_bounds_guard) = DisplayObjectRecursionGuard::enter(
+            &BOUNDS_RECURSION_DEPTH,
+            "render_bounds",
+            self.into(),
+        ) else {
+            return *matrix * self.self_bounds(BoundsMode::Engine);
+        };
+
         let mut bounds = *matrix * self.self_bounds(BoundsMode::Engine);
 
         if let Some(ctr) = self.as_container() {
@@ -2401,6 +2484,14 @@ pub trait TDisplayObject<'gc>:
 
     /// Run any frame scripts (if they exist and this object needs to run them).
     fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
+        let Some(_frame_script_guard) = DisplayObjectRecursionGuard::enter(
+            &FRAME_SCRIPT_RECURSION_DEPTH,
+            "frame_scripts",
+            self.into(),
+        ) else {
+            return;
+        };
+
         if let Some(container) = self.as_container() {
             for child in container.iter_render_list() {
                 child.run_frame_scripts(context);

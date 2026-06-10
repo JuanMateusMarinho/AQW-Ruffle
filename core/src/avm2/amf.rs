@@ -16,7 +16,41 @@ use flash_lso::types::{AMFVersion, Element, Lso, ObjectId};
 use flash_lso::types::{Attribute, ClassDefinition, Value as AmfValue};
 use fnv::FnvHashMap;
 
-pub type ObjectTable<'gc> = FnvHashMap<Object<'gc>, Rc<AmfValue>>;
+const MAX_AMF_SERIALIZE_DEPTH: usize = 512;
+
+#[derive(Clone)]
+enum ObjectTableEntry {
+    InProgress(ObjectId),
+    Complete(ObjectId, Rc<AmfValue>),
+}
+
+pub struct ObjectTable<'gc> {
+    entries: FnvHashMap<Object<'gc>, ObjectTableEntry>,
+    next_object_id: i64,
+    depth: usize,
+}
+
+impl Default for ObjectTable<'_> {
+    fn default() -> Self {
+        Self {
+            entries: Default::default(),
+            next_object_id: 0,
+            depth: 0,
+        }
+    }
+}
+
+impl ObjectTable<'_> {
+    fn next_object_id(&mut self, amf_version: AMFVersion) -> ObjectId {
+        if amf_version == AMFVersion::AMF3 {
+            let object_id = ObjectId(self.next_object_id);
+            self.next_object_id += 1;
+            object_id
+        } else {
+            ObjectId::INVALID
+        }
+    }
+}
 
 /// Serialize a Value to an AmfValue
 pub fn serialize_value<'gc>(
@@ -24,6 +58,27 @@ pub fn serialize_value<'gc>(
     elem: Value<'gc>,
     amf_version: AMFVersion,
     object_table: &mut ObjectTable<'gc>,
+) -> Option<AmfValue> {
+    if elem.as_object().is_some() {
+        return get_or_create_value(activation, elem, object_table, amf_version)
+            .map(|value| (*value).clone());
+    }
+
+    serialize_value_impl(
+        activation,
+        elem,
+        amf_version,
+        object_table,
+        ObjectId::INVALID,
+    )
+}
+
+fn serialize_value_impl<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    elem: Value<'gc>,
+    amf_version: AMFVersion,
+    object_table: &mut ObjectTable<'gc>,
+    object_id: ObjectId,
 ) -> Option<AmfValue> {
     match elem.normalize() {
         Value::Undefined => Some(AmfValue::Undefined),
@@ -65,10 +120,10 @@ pub fn serialize_value<'gc>(
                         }
                     }
 
-                    Some(AmfValue::ECMAArray(ObjectId::INVALID, dense, sparse, len))
+                    Some(AmfValue::ECMAArray(object_id, dense, sparse, len))
                 } else {
                     // TODO: is this right?
-                    Some(AmfValue::ECMAArray(ObjectId::INVALID, vec![], values, len))
+                    Some(AmfValue::ECMAArray(object_id, vec![], values, len))
                 }
             } else if let Some(vec) = o.as_vector_storage() {
                 let val_type = vec.value_type();
@@ -94,7 +149,7 @@ pub fn serialize_value<'gc>(
 
                     let name = class_to_alias(activation, val_type);
                     Some(AmfValue::VectorObject(
-                        ObjectId::INVALID,
+                        object_id,
                         obj_vec,
                         name,
                         vec.is_fixed(),
@@ -140,7 +195,7 @@ pub fn serialize_value<'gc>(
                 }
 
                 Some(AmfValue::Dictionary(
-                    ObjectId::INVALID,
+                    object_id,
                     dictionary_body,
                     has_weak_keys,
                 ))
@@ -165,7 +220,7 @@ pub fn serialize_value<'gc>(
                 )
                 .unwrap();
                 Some(AmfValue::Object(
-                    ObjectId::INVALID,
+                    object_id,
                     object_body,
                     if amf_version == AMFVersion::AMF3 {
                         Some(ClassDefinition {
@@ -280,30 +335,80 @@ fn get_or_create_value<'gc>(
     amf_version: AMFVersion,
 ) -> Option<Rc<AmfValue>> {
     if let Some(obj) = val.as_object() {
-        match object_table.get(&obj) {
-            Some(rc_val) => {
-                // Even though we'll clone the same 'Rc<AmfValue>' for each occurrence
-                // of 'Object', flash_lso doesn't serialize this correctly yet.
+        match object_table.entries.get(&obj).cloned() {
+            Some(ObjectTableEntry::InProgress(object_id)) => {
+                avm2_stub_method!(
+                    activation,
+                    "flash.utils.ByteArray",
+                    "writeObject",
+                    "with recursive Object reference"
+                );
+
+                if amf_version == AMFVersion::AMF3 && object_id != ObjectId::INVALID {
+                    Some(Rc::new(AmfValue::Amf3ObjectReference(object_id)))
+                } else {
+                    tracing::warn!(
+                        "AMF0 serialization encountered a recursive object reference; writing undefined"
+                    );
+                    Some(Rc::new(AmfValue::Undefined))
+                }
+            }
+            Some(ObjectTableEntry::Complete(object_id, rc_val)) => {
+                // AMF3 supports references for repeated objects. AMF0 references require the
+                // flash_lso writer API, so preserve the existing duplicate-object behavior there.
                 avm2_stub_method!(
                     activation,
                     "flash.utils.ByteArray",
                     "writeObject",
                     "with same Object used multiple times"
                 );
-                Some(rc_val.clone())
+
+                if amf_version == AMFVersion::AMF3 && object_id != ObjectId::INVALID {
+                    Some(Rc::new(AmfValue::Amf3ObjectReference(object_id)))
+                } else {
+                    Some(rc_val.clone())
+                }
             }
             None => {
-                if let Some(value) = serialize_value(activation, val, amf_version, object_table) {
+                if object_table.depth >= MAX_AMF_SERIALIZE_DEPTH {
+                    tracing::warn!(
+                        depth = object_table.depth,
+                        limit = MAX_AMF_SERIALIZE_DEPTH,
+                        "AMF serialization depth limit exceeded; writing undefined"
+                    );
+                    return Some(Rc::new(AmfValue::Undefined));
+                }
+
+                let object_id = object_table.next_object_id(amf_version);
+                object_table
+                    .entries
+                    .insert(obj, ObjectTableEntry::InProgress(object_id));
+                object_table.depth += 1;
+
+                let value =
+                    serialize_value_impl(activation, val, amf_version, object_table, object_id);
+
+                object_table.depth = object_table.depth.saturating_sub(1);
+
+                if let Some(value) = value {
                     let rc_val = Rc::new(value);
-                    // We cannot use Entry, since we need to pass in 'object_table' to 'serialize_value'
-                    object_table.insert(obj, rc_val.clone());
+                    object_table
+                        .entries
+                        .insert(obj, ObjectTableEntry::Complete(object_id, rc_val.clone()));
                     Some(rc_val)
                 } else {
+                    object_table.entries.remove(&obj);
                     None
                 }
             }
         }
-    } else if let Some(value) = serialize_value(activation, val, amf_version, object_table) {
+    } else if let Some(value) = serialize_value_impl(
+        activation,
+        val,
+        amf_version,
+        object_table,
+        ObjectId::INVALID,
+    ) {
         Some(Rc::new(value))
     } else {
         None

@@ -836,6 +836,14 @@ impl<'gc> MovieClip<'gc> {
         self.0.last_queued_script_frame.set(frame);
     }
 
+    pub fn clear_avm2_frame_script_state(self) {
+        self.set_has_pending_script(false);
+        self.set_last_queued_script_frame(None);
+        self.0.queued_goto_frame.take();
+        self.0
+            .set_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT, false);
+    }
+
     pub fn set_programmatically_played(self) {
         if self.header_frames() > 1 {
             self.0.set_programmatically_played()
@@ -929,6 +937,22 @@ impl<'gc> MovieClip<'gc> {
     }
 
     fn goto_frame_now(self, context: &mut UpdateContext<'gc>, frame: FrameNumber) {
+        // Guard against infinite recursion: goto_frame_now -> run_goto ->
+        // run_inner_goto_frame -> run_frame_scripts -> frame script -> gotoAndPlay -> goto_frame_now
+        use std::cell::Cell;
+        thread_local! {
+            static GOTO_NOW_DEPTH: Cell<u32> = const { Cell::new(0) };
+        }
+        const MAX_GOTO_NOW_DEPTH: u32 = 64;
+        let depth = GOTO_NOW_DEPTH.with(|d| d.get());
+        if depth >= MAX_GOTO_NOW_DEPTH {
+            tracing::warn!(
+                "goto_frame_now: recursion limit ({MAX_GOTO_NOW_DEPTH}) exceeded, dropping goto to prevent stack overflow"
+            );
+            return;
+        }
+        GOTO_NOW_DEPTH.with(|d| d.set(depth + 1));
+
         // In AS3, no-op gotos have side effects that are visible to user
         // code. Hence, we have to run them anyway.
         if frame != self.current_frame() {
@@ -936,6 +960,8 @@ impl<'gc> MovieClip<'gc> {
         } else {
             self.no_op_goto(context);
         }
+
+        GOTO_NOW_DEPTH.with(|d| d.set(d.get() - 1));
     }
 
     /// Perform a "no-op goto".
@@ -2443,6 +2469,23 @@ impl<'gc> MovieClip<'gc> {
     }
 
     pub fn run_local_frame_scripts(self, context: &mut UpdateContext<'gc>) {
+        let Some(_local_frame_script_guard) = super::DisplayObjectRecursionGuard::enter(
+            &super::LOCAL_FRAME_SCRIPT_RECURSION_DEPTH,
+            "local_frame_scripts",
+            self.into(),
+        ) else {
+            tracing::error!(
+                id = ?self.id(),
+                ptr = ?self.as_ptr(),
+                name = ?self.name().map(|name| name.to_string()),
+                current_frame = self.current_frame(),
+                queued_script_frame = self.0.queued_script_frame.get(),
+                avm2_call_depth = context.avm2.call_depth(),
+                "MovieClip local frame-script recursion limit exceeded"
+            );
+            return;
+        };
+
         let avm2_object = self.0.object2.get();
 
         if let Some(avm2_object) = avm2_object
@@ -2501,12 +2544,6 @@ impl<'gc> MovieClip<'gc> {
         if let Some(frame) = goto_frame {
             self.goto_frame_now(context, frame);
 
-            // In SWFv10+, the `goto_frame_now` above will trigger an inner goto
-            // frame, which will call `construct_frame`. However, this is not
-            // the case in SWFv9, where inner goto frames are no-ops, so we need
-            // to manually run `construct_frame` to ensure that children are
-            // constructed. This prevents situations such as a frame script
-            // queued to run on this frame seeing not-yet-constructed children.
             if self.swf_version() <= 9 {
                 self.construct_frame(context);
             }
@@ -2654,6 +2691,14 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     }
 
     fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
+        let Some(_frame_script_guard) = super::DisplayObjectRecursionGuard::enter(
+            &super::FRAME_SCRIPT_RECURSION_DEPTH,
+            "movie_clip_frame_scripts",
+            self.into(),
+        ) else {
+            return;
+        };
+
         self.run_local_frame_scripts(context);
 
         for child in self.iter_render_list() {

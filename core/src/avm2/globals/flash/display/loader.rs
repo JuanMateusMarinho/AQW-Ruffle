@@ -290,24 +290,40 @@ pub fn load_bytes<'gc>(
     Ok(Value::Undefined)
 }
 
-pub fn unload<'gc>(
+pub fn _unload<'gc>(
     activation: &mut Activation<'_, 'gc>,
     this: Value<'gc>,
-    _args: &[Value<'gc>],
+    args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    let this = this.as_object().unwrap();
+    let this_obj = this.as_object().unwrap();
 
-    // TODO: Broadcast an "unload" event on the LoaderInfo
-    avm2_stub_method!(activation, "flash.display.Loader", "unload");
+    let stop_sounds = args
+        .get(0)
+        .copied()
+        .unwrap_or(Value::Bool(false))
+        .coerce_to_boolean();
 
-    let loader_info = this
-        .get_slot(loader_slots::_CONTENT_LOADER_INFO)
-        .as_object()
-        .unwrap();
+    let loader_info_val = this_obj.get_slot(loader_slots::_CONTENT_LOADER_INFO);
+    let loader_info_obj = match loader_info_val.as_object() {
+        Some(obj) => obj,
+        None => return Ok(Value::Undefined),
+    };
+    let loader_info = match loader_info_obj.as_loader_info_object() {
+        Some(li) => li,
+        None => return Ok(Value::Undefined),
+    };
 
-    let loader_info = loader_info.as_loader_info_object().unwrap();
+    if stop_sounds && let Some(dobj) = this_obj.as_display_object() {
+        activation
+            .context
+            .audio_manager
+            .stop_sounds_on_parent_and_children(activation.context.audio, dobj);
+    }
 
     loader_info.unload(activation.context);
+
+    let unload_event = crate::avm2::EventObject::bare_default_event(activation.context, "unload");
+    crate::avm2::Avm2::dispatch_event(activation.context, unload_event, loader_info_obj);
 
     Ok(Value::Undefined)
 }

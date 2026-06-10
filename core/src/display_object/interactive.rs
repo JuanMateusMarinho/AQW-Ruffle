@@ -30,6 +30,46 @@ use std::cell::Cell;
 use std::fmt::Debug;
 use swf::{Point, Rectangle, Twips};
 
+const MAX_CLIP_EVENT_RECURSION_DEPTH: u32 = 512;
+
+thread_local! {
+    static CLIP_EVENT_RECURSION_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+struct ClipEventRecursionGuard;
+
+impl ClipEventRecursionGuard {
+    fn enter<'gc>(event: ClipEvent<'gc>, this: DisplayObject<'gc>) -> Option<Self> {
+        let current_depth = CLIP_EVENT_RECURSION_DEPTH.with(|depth| {
+            let current_depth = depth.get().saturating_add(1);
+            depth.set(current_depth);
+            current_depth
+        });
+
+        if current_depth > MAX_CLIP_EVENT_RECURSION_DEPTH {
+            CLIP_EVENT_RECURSION_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+            tracing::error!(
+                event = ?event,
+                depth = current_depth,
+                limit = MAX_CLIP_EVENT_RECURSION_DEPTH,
+                id = ?this.id(),
+                ptr = ?this.as_ptr(),
+                name = ?this.name().map(|name| name.to_string()),
+                "Clip event recursion limit exceeded; skipping event"
+            );
+            None
+        } else {
+            Some(Self)
+        }
+    }
+}
+
+impl Drop for ClipEventRecursionGuard {
+    fn drop(&mut self) {
+        CLIP_EVENT_RECURSION_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
 /// Find the lowest common ancestor between the display objects in `from` and
 /// `to`.
 ///
@@ -555,6 +595,12 @@ pub trait TInteractiveObject<'gc>:
         context: &mut UpdateContext<'gc>,
         event: ClipEvent<'gc>,
     ) -> ClipEventResult {
+        let Some(_clip_event_guard) =
+            ClipEventRecursionGuard::enter(event, self.as_displayobject())
+        else {
+            return ClipEventResult::NotHandled;
+        };
+
         if !self.mouse_enabled() {
             return ClipEventResult::NotHandled;
         }

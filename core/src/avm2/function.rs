@@ -200,6 +200,20 @@ pub fn exec<'gc>(
 
     let caller_dxns = activation.default_xml_namespace();
 
+    // Limit AVM2 call depth to prevent stack overflow on infinite recursion
+    const MAX_CALL_DEPTH: usize = 512;
+    if activation.context.avm2.call_depth() >= MAX_CALL_DEPTH {
+        let mut method_name = WString::new();
+        display_function(&mut method_name, method);
+        tracing::error!(
+            method = %method_name.to_utf8_lossy(),
+            depth = activation.context.avm2.call_depth(),
+            limit = MAX_CALL_DEPTH,
+            "AVM2 call depth limit exceeded; aborting call to prevent stack overflow"
+        );
+        return Ok(Value::Undefined);
+    }
+
     let ret = match method.method_kind() {
         MethodKind::Native { native_method, .. } => {
             let caller_domain = activation.caller_domain();

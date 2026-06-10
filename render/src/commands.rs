@@ -3,7 +3,45 @@ use crate::bitmap::{BitmapHandle, PixelSnapping};
 use crate::matrix::Matrix;
 use crate::pixel_bender::PixelBenderShaderHandle;
 use crate::transform::Transform;
+use std::{cell::Cell, mem};
 use swf::{BlendMode, Color};
+
+const MAX_COMMAND_EXECUTION_DEPTH: u32 = 64;
+
+thread_local! {
+    static COMMAND_EXECUTION_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+struct CommandExecutionGuard;
+
+impl CommandExecutionGuard {
+    fn enter(command_count: usize) -> Option<Self> {
+        let current_depth = COMMAND_EXECUTION_DEPTH.with(|depth| {
+            let current_depth = depth.get().saturating_add(1);
+            depth.set(current_depth);
+            current_depth
+        });
+
+        if current_depth > MAX_COMMAND_EXECUTION_DEPTH {
+            COMMAND_EXECUTION_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+            tracing::error!(
+                depth = current_depth,
+                limit = MAX_COMMAND_EXECUTION_DEPTH,
+                command_count,
+                "Render command recursion limit exceeded; skipping nested command list"
+            );
+            None
+        } else {
+            Some(Self)
+        }
+    }
+}
+
+impl Drop for CommandExecutionGuard {
+    fn drop(&mut self) {
+        COMMAND_EXECUTION_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
 
 pub trait CommandHandler {
     fn render_bitmap(
@@ -58,8 +96,13 @@ impl CommandList {
         self.commands.is_empty()
     }
 
-    pub fn execute(self, handler: &mut impl CommandHandler) {
-        for command in self.commands {
+    pub fn execute(mut self, handler: &mut impl CommandHandler) {
+        let Some(_command_execution_guard) = CommandExecutionGuard::enter(self.commands.len())
+        else {
+            return;
+        };
+
+        for command in mem::take(&mut self.commands) {
             match command {
                 Command::RenderBitmap {
                     bitmap,
@@ -89,6 +132,28 @@ impl CommandList {
 
     pub fn drawing_mask(&self) -> bool {
         self.maskers_in_progress > 0
+    }
+}
+
+impl Drop for CommandList {
+    fn drop(&mut self) {
+        let mut pending = mem::take(&mut self.commands);
+
+        while let Some(command) = pending.pop() {
+            match command {
+                Command::Blend(mut commands, _) => {
+                    pending.append(&mut commands.commands);
+                }
+                Command::RenderAlphaMask {
+                    mut maskee_commands,
+                    mut mask_commands,
+                } => {
+                    pending.append(&mut maskee_commands.commands);
+                    pending.append(&mut mask_commands.commands);
+                }
+                _ => {}
+            }
+        }
     }
 }
 

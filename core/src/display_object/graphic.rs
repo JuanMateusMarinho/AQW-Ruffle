@@ -21,6 +21,10 @@ use ruffle_render::commands::CommandHandler;
 use std::cell::{OnceCell, RefCell, RefMut};
 use std::sync::Arc;
 
+const MIN_TESSELLATION_SCALE: f32 = 0.01;
+const MAX_TESSELLATION_SCALE: f32 = 8.0;
+const MIN_RENDERABLE_GRAPHIC_SCALE: f32 = 0.02;
+
 #[derive(Clone, Collect, Copy)]
 #[collect(no_drop)]
 pub struct Graphic<'gc>(Gc<'gc, GraphicData<'gc>>);
@@ -47,6 +51,14 @@ pub struct GraphicData<'gc> {
 }
 
 impl<'gc> Graphic<'gc> {
+    fn sanitize_tessellation_scale(scale: f32) -> f32 {
+        if scale.is_finite() {
+            scale.clamp(MIN_TESSELLATION_SCALE, MAX_TESSELLATION_SCALE)
+        } else {
+            1.0
+        }
+    }
+
     /// Construct a `Graphic` from it's associated `Shape` tag.
     pub fn from_swf_tag(
         context: &mut UpdateContext<'gc>,
@@ -259,7 +271,13 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
             let scale_y = f32::abs(matrix.b + matrix.d);
             let current_scale = ((scale_x * scale_x + scale_y * scale_y) / 2.0).sqrt();
 
-            let handle = self.get_or_retessellate_handle(context, &base_handle, current_scale);
+            if !current_scale.is_finite() || current_scale < MIN_RENDERABLE_GRAPHIC_SCALE {
+                return;
+            }
+
+            let tessellation_scale = Self::sanitize_tessellation_scale(current_scale);
+
+            let handle = self.get_or_retessellate_handle(context, &base_handle, tessellation_scale);
 
             context.commands.render_shape(handle, transform)
         }

@@ -113,6 +113,10 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
     *context.frame_phase = FramePhase::Idle;
 }
 
+thread_local! {
+    static GOTO_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// Like `run_all_phases_avm2`, but specialized for the "nested frame" triggered
 /// by a goto. This is different enough to not be worth combining into a single
 /// method with extra parameters.
@@ -122,6 +126,26 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
 /// cause frame construction to get run for the *current frame* of other objects on the timeline
 /// (even if the goto was called from an enterFrame event handler).
 pub fn run_inner_goto_frame<'gc>(
+    context: &mut UpdateContext<'gc>,
+    removed_frame_scripts: &[DisplayObject<'gc>],
+    initial_clip: MovieClip<'gc>,
+) {
+    const MAX_GOTO_DEPTH: u32 = 64;
+    let depth = GOTO_DEPTH.with(|d| d.get());
+    if depth >= MAX_GOTO_DEPTH {
+        tracing::error!(
+            "run_inner_goto_frame: recursion limit exceeded, aborting to prevent stack overflow"
+        );
+        return;
+    }
+    GOTO_DEPTH.with(|d| d.set(depth + 1));
+
+    run_inner_goto_frame_impl(context, removed_frame_scripts, initial_clip);
+
+    GOTO_DEPTH.with(|d| d.set(d.get() - 1));
+}
+
+fn run_inner_goto_frame_impl<'gc>(
     context: &mut UpdateContext<'gc>,
     removed_frame_scripts: &[DisplayObject<'gc>],
     initial_clip: MovieClip<'gc>,

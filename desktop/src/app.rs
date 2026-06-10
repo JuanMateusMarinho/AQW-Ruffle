@@ -461,10 +461,12 @@ impl ApplicationHandler<RuffleEvent> for App {
             let preferred_height = self.preferences.cli.height;
             let start_fullscreen = self.preferences.cli.fullscreen;
 
+            let window_title = std::env::var("ARTIX_RUFFLE_WINDOW_TITLE")
+                .unwrap_or_else(|_| "Artix Entertainment - AdventureQuest Worlds V0.1".to_string());
             #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
             let mut window_attributes = WindowAttributes::default()
                 .with_visible(false)
-                .with_title("Ruffle")
+                .with_title(window_title)
                 .with_window_icon(Some(icon))
                 .with_min_inner_size(min_window_size);
 

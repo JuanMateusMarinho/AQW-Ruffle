@@ -38,6 +38,7 @@ members = [
     "tests/framework",
 
     "tools/asc",
+    "aqw_launcher",
 ]
 default-members = ["desktop"]
 resolver = "2"

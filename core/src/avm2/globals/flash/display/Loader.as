@@ -27,13 +27,15 @@ package flash.display {
 
         public native function loadBytes(data:ByteArray, context:LoaderContext = null):void;
 
-        public native function unload():void;
-
+        public function unload():void {
+            this._unload(false);
+        }
         [API("662")]
         public function unloadAndStop(gc:Boolean = true):void {
-            stub_method("flash.display.Loader", "unloadAndStop");
-            this.unload();
+            this._unload(true);
         }
+
+        private native function _unload(stop_sounds:Boolean):void;
 
         public function close():void {
             stub_method("flash.display.Loader", "close");

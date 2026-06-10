@@ -21,6 +21,16 @@ pub struct ShapeTessellator {
 }
 
 const TESSELLATION_EPSILON: f32 = 0.0000001;
+const MIN_TESSELLATION_SCALE: f32 = 0.01;
+const MAX_TESSELLATION_SCALE: f32 = 8.0;
+
+fn sanitize_tessellation_scale(scale: f32) -> f32 {
+    if scale.is_finite() {
+        scale.clamp(MIN_TESSELLATION_SCALE, MAX_TESSELLATION_SCALE)
+    } else {
+        1.0
+    }
+}
 
 impl ShapeTessellator {
     pub fn new() -> Self {
@@ -51,6 +61,8 @@ impl ShapeTessellator {
         bitmap_source: &dyn BitmapSource,
         scale: f32,
     ) -> Mesh {
+        let scale = sanitize_tessellation_scale(scale);
+
         self.mesh = Vec::new();
         self.gradients = IndexSet::new();
         self.lyon_mesh = VertexBuffers::new();
