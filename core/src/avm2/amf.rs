@@ -24,20 +24,11 @@ enum ObjectTableEntry {
     Complete(ObjectId, Rc<AmfValue>),
 }
 
+#[derive(Default)]
 pub struct ObjectTable<'gc> {
     entries: FnvHashMap<Object<'gc>, ObjectTableEntry>,
     next_object_id: i64,
     depth: usize,
-}
-
-impl Default for ObjectTable<'_> {
-    fn default() -> Self {
-        Self {
-            entries: Default::default(),
-            next_object_id: 0,
-            depth: 0,
-        }
-    }
 }
 
 impl ObjectTable<'_> {
@@ -366,7 +357,7 @@ fn get_or_create_value<'gc>(
                 if amf_version == AMFVersion::AMF3 && object_id != ObjectId::INVALID {
                     Some(Rc::new(AmfValue::Amf3ObjectReference(object_id)))
                 } else {
-                    Some(rc_val.clone())
+                    Some(rc_val)
                 }
             }
             None => {

@@ -2,6 +2,7 @@
 name = "aqw_launcher"
 version = "1.0.0"
 edition = "2021"
+license.workspace = true
 
 [dependencies]
 image = { workspace = true, features = ["png"] }
