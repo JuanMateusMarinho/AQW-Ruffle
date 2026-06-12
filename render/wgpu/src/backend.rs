@@ -33,10 +33,15 @@ use std::any::Any;
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use swf::Color;
 use tracing::instrument;
 use wgpu::SubmissionIndex;
+
+fn aqw_diagnostics_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
+}
 
 /// Creates a wgpu instance with Ruffle's required configuration.
 ///
@@ -528,6 +533,44 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 return;
             }
         };
+
+        if aqw_diagnostics_enabled() && !cache_entries.is_empty() {
+            let mut total_pixels = 0_u64;
+            let mut filtered_entries = 0_u32;
+            let mut largest_width = 0_u32;
+            let mut largest_height = 0_u32;
+            let mut largest_pixels = 0_u64;
+
+            for entry in &cache_entries {
+                let texture = as_texture(&entry.handle);
+                let width = texture.texture.width();
+                let height = texture.texture.height();
+                let pixels = u64::from(width) * u64::from(height);
+                total_pixels = total_pixels.saturating_add(pixels);
+                if !entry.filters.is_empty() {
+                    filtered_entries = filtered_entries.saturating_add(1);
+                }
+                if pixels > largest_pixels {
+                    largest_pixels = pixels;
+                    largest_width = width;
+                    largest_height = height;
+                }
+            }
+
+            let approx_rgba_mb = total_pixels as f64 * 4.0 / 1_048_576.0;
+            if cache_entries.len() > 4 || approx_rgba_mb > 16.0 {
+                tracing::info!(
+                    target: "aqw_diag",
+                    cache_entries = cache_entries.len(),
+                    filtered_entries,
+                    total_pixels,
+                    approx_rgba_mb,
+                    largest_width,
+                    largest_height,
+                    "Bitmap cache redraws queued this frame"
+                );
+            }
+        }
 
         for entry in cache_entries {
             let texture = as_texture(&entry.handle);

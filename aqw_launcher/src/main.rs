@@ -64,8 +64,11 @@ mod windows_launcher {
     const WM_MOUSELEAVE: u32 = 0x02A3;
     const AQW_SWF_URL: &str = "https://game.aq.com/game/gamefiles/Loader3.swf";
     const AQW_BASE_URL: &str = "https://game.aq.com/game/gamefiles/";
-    const AQW_WINDOW_TITLE: &str = "Artix Entertainment - AdventureQuest Worlds V0.1";
+    const AQW_WINDOW_TITLE: &str = "Artix Entertainment - AdventureQuest Worlds V0.2";
     const AQW_DESIGN_NOTES_URL: &str = "https://www.aq.com/gamedesignnotes/";
+    const FLASH_GRAPHICS_BACKEND: &str = "vulkan";
+    const FLASH_QUALITY: &str = "low";
+    const FLASH_FRAME_RATE: &str = "24";
     const DRAGON_FABLE_SWF_URL: &str = "https://play.dragonfable.com/game/DFLoader.swf";
     const DRAGON_FABLE_BASE_URL: &str = "https://play.dragonfable.com/game/";
     const DRAGON_FABLE_WINDOW_TITLE: &str = "Artix Entertainment -Dragon Fable";
@@ -1750,11 +1753,16 @@ mod windows_launcher {
         base_url: &str,
         window_title: &str,
     ) -> Result<String, String> {
+        let diagnostics = diagnostics_enabled();
         let mut temp_path = std::env::temp_dir();
         temp_path.push("aqw_ruffle");
         fs::create_dir_all(&temp_path).map_err(|error| error.to_string())?;
 
-        let ruffle_path = temp_path.join("AQW-Ruffle.exe");
+        let ruffle_path = temp_path.join(if diagnostics {
+            "AQW-Ruffle-debug.exe"
+        } else {
+            "AQW-Ruffle.exe"
+        });
         let should_write = if ruffle_path.exists() {
             fs::metadata(&ruffle_path)
                 .map(|metadata| metadata.len() != RUFFLE_EXE.len() as u64)
@@ -1770,19 +1778,28 @@ mod windows_launcher {
         let mut command = Command::new(&ruffle_path);
         command
             .env("ARTIX_RUFFLE_WINDOW_TITLE", window_title)
-            .env("RUST_LOG", "warn")
+            .env(
+                "RUST_LOG",
+                if diagnostics {
+                    "warn,ruffle=info,aqw_diag=info"
+                } else {
+                    "warn"
+                },
+            )
             .arg(swf_url)
             .arg("--spoof-url")
             .arg(swf_url)
             .arg("--base")
             .arg(base_url)
             .args([
+                "--graphics",
+                FLASH_GRAPHICS_BACKEND,
                 "--quality",
-                "high",
+                FLASH_QUALITY,
                 "--power",
                 "high",
                 "--frame-rate",
-                "24",
+                FLASH_FRAME_RATE,
                 "--scale",
                 "exact-fit",
                 "--force-scale",
@@ -1797,9 +1814,25 @@ mod windows_launcher {
             ])
             .creation_flags(CREATE_NO_WINDOW);
 
+        if diagnostics {
+            command.env("RUFFLE_AQW_DIAGNOSTICS", "1");
+        }
+
         command.spawn().map_err(|error| error.to_string())?;
 
         Ok(ruffle_path.display().to_string())
+    }
+
+    fn diagnostics_enabled() -> bool {
+        std::env::current_exe()
+            .ok()
+            .and_then(|path| path.file_stem().map(|stem| stem.to_owned()))
+            .map(|stem| {
+                stem.to_string_lossy()
+                    .to_ascii_lowercase()
+                    .contains("debug")
+            })
+            .unwrap_or(false)
     }
 
     pub fn run() {

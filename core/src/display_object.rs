@@ -25,7 +25,7 @@ use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::num::NonZero;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use swf::{ColorTransform, Fixed8};
 
 mod avm1_button;
@@ -115,6 +115,14 @@ pub struct BitmapCache {
     warned_for_oversize: bool,
 }
 
+const MAX_CACHE_BITMAP_DIMENSION: u32 = 4096;
+const MAX_CACHE_BITMAP_PIXELS: u32 = 2_500_000;
+
+fn aqw_diagnostics_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
+}
+
 impl BitmapCache {
     /// Forcefully make this BitmapCache invalid and require regeneration.
     /// This should be used for changes that aren't automatically detected, such as children.
@@ -160,12 +168,31 @@ impl BitmapCache {
         {
             return; // No need to resize it
         }
-        let acceptable_size = if swf_version > 9 {
-            let total = actual_width * actual_height;
-            actual_width < 8191 && actual_height < 8191 && total < 16777215
+        let total_pixels = actual_width.saturating_mul(actual_height);
+        let flash_acceptable_size = if swf_version > 9 {
+            actual_width < 8191 && actual_height < 8191 && total_pixels < 16777215
         } else {
             actual_width < 2880 && actual_height < 2880
         };
+        let practical_acceptable_size = actual_width <= MAX_CACHE_BITMAP_DIMENSION
+            && actual_height <= MAX_CACHE_BITMAP_DIMENSION
+            && total_pixels <= MAX_CACHE_BITMAP_PIXELS;
+        let acceptable_size = flash_acceptable_size && practical_acceptable_size;
+
+        if aqw_diagnostics_enabled() && !acceptable_size && !self.warned_for_oversize {
+            tracing::warn!(
+                target: "aqw_diag",
+                source_width,
+                source_height,
+                actual_width,
+                actual_height,
+                total_pixels,
+                flash_acceptable_size,
+                practical_acceptable_size,
+                "Skipping bitmap cache allocation"
+            );
+            self.warned_for_oversize = true;
+        }
 
         if renderer.is_offscreen_supported()
             && let Some(actual_width) = NonZero::new(actual_width)
