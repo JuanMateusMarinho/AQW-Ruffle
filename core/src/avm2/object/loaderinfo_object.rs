@@ -322,6 +322,14 @@ impl<'gc> LoaderInfoObject<'gc> {
     }
 
     pub fn unload(self, context: &mut UpdateContext<'gc>) {
+        let previous_content = {
+            let loader_stream = self.loader_stream();
+            match &*loader_stream {
+                LoaderStream::NotYetLoaded(_, content, _) => *content,
+                LoaderStream::Swf(_, content) => Some(*content),
+            }
+        };
+
         // Reset properties
         let movie = &context.root_swf;
         let empty_swf = Arc::new(SwfMovie::empty(movie.version(), Some(movie.url().into())));
@@ -332,18 +340,23 @@ impl<'gc> LoaderInfoObject<'gc> {
         // Reseta flag de loading ao fazer unload
         self.0.is_loading.set(false);
 
-        let mut loader = self
+        let loader_display_object = self
             .0
             .loader
             .expect("LoaderInfo must have been created by Loader")
-            .display_object()
-            .as_container()
-            .unwrap();
+            .display_object();
+        let mut loader = loader_display_object.as_container().unwrap();
 
-        // Remove the Loader's content element if it exists.
-        if let Some(child) = loader.child_by_index(0) {
-            loader.remove_child(context, child);
-            cleanup_unloaded_display_object_tree(context, child);
+        // Remove only the content tracked by LoaderInfo. User code can add
+        // auxiliary children to Loader, and Flash does not purge those here.
+        if let Some(content) = previous_content
+            && content
+                .parent()
+                .is_some_and(|parent| DisplayObject::ptr_eq(parent, loader_display_object))
+        {
+            context.load_manager.cancel_load_for_target(content);
+            loader.remove_child(context, content);
+            cleanup_unloaded_display_object_tree(context, content);
         }
     }
 }

@@ -3,12 +3,42 @@
 use crate::avm2::Error;
 use crate::avm2::activation::Activation;
 use crate::avm2::function::FunctionArgs;
+use crate::avm2::multiname::Multiname;
 use crate::avm2::object::script_object::ScriptObjectData;
 use crate::avm2::object::{ClassObject, TObject};
-use crate::display_object::DisplayObject;
+use crate::avm2::value::Value;
+use crate::display_object::{DisplayObject, TDisplayObject, TDisplayObjectContainer};
 use gc_arena::{Collect, Gc, GcWeak, Mutation};
 use ruffle_common::utils::HasPrefixField;
 use std::fmt::Debug;
+use std::sync::OnceLock;
+
+fn aqw_diagnostics_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
+}
+
+fn is_aqw_avatar_slot(name: &str) -> bool {
+    matches!(
+        name,
+        "head"
+            | "chest"
+            | "hip"
+            | "idlefoot"
+            | "frontfoot"
+            | "backfoot"
+            | "frontshoulder"
+            | "backshoulder"
+            | "fronthand"
+            | "backhand"
+            | "frontthigh"
+            | "backthigh"
+            | "frontshin"
+            | "backshin"
+            | "robe"
+            | "backrobe"
+    )
+}
 
 #[derive(Clone, Collect, Copy)]
 #[collect(no_drop)]
@@ -91,11 +121,84 @@ impl<'gc> StageObject<'gc> {
     pub fn display_object(self) -> DisplayObject<'gc> {
         self.0.display_object
     }
+
+    fn named_child_property(
+        self,
+        name: &Multiname<'gc>,
+        activation: &mut Activation<'_, 'gc>,
+    ) -> Option<Value<'gc>> {
+        if !name.contains_public_namespace() {
+            return None;
+        }
+
+        let local_name = name.local_name()?;
+        let slot_name = local_name.to_utf8_lossy();
+        let is_avatar_slot = is_aqw_avatar_slot(&slot_name);
+        let container = self.display_object().as_container()?;
+        let child = container.child_by_name(&local_name, true).or_else(|| {
+            if is_avatar_slot {
+                self.display_object().construct_frame(activation.context);
+                self.display_object()
+                    .as_container()?
+                    .child_by_name(&local_name, true)
+                    .or_else(|| {
+                        self.display_object()
+                            .as_container()?
+                            .child_by_name(&local_name, false)
+                    })
+            } else {
+                None
+            }
+        });
+
+        let Some(child) = child else {
+            if aqw_diagnostics_enabled() && is_avatar_slot {
+                let child_names = container
+                    .iter_render_list()
+                    .filter_map(|child| child.name().map(|name| name.to_utf8_lossy().into_owned()))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                tracing::warn!(
+                    target: "aqw_diag",
+                    receiver = ?self.display_object(),
+                    property = %slot_name,
+                    num_children = container.num_children(),
+                    child_names,
+                    "AQW avatar named child lookup missed"
+                );
+            }
+            return None;
+        };
+
+        if child.object2().is_none() {
+            child.construct_frame(activation.context);
+        }
+
+        child.object2().map(Value::from)
+    }
 }
 
 impl<'gc> TObject<'gc> for StageObject<'gc> {
     fn gc_base(&self) -> Gc<'gc, ScriptObjectData<'gc>> {
         HasPrefixField::as_prefix_gc(self.0)
+    }
+
+    fn get_property_local(
+        self,
+        name: &Multiname<'gc>,
+        activation: &mut Activation<'_, 'gc>,
+    ) -> Result<Value<'gc>, Error<'gc>> {
+        match self.base().get_property_local(name, activation) {
+            Ok(value @ (Value::Null | Value::Undefined)) => self
+                .named_child_property(name, activation)
+                .map(Ok)
+                .unwrap_or(Ok(value)),
+            Ok(value) => Ok(value),
+            Err(err) => self
+                .named_child_property(name, activation)
+                .map(Ok)
+                .unwrap_or(Err(err)),
+        }
     }
 }
 

@@ -134,6 +134,25 @@ pub fn get_concatenated_matrix<'gc>(
     }
 }
 
+pub fn get_concatenated_color_transform<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    this: Value<'gc>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    let this = this.as_object().unwrap();
+
+    let dobj = get_display_object(this);
+    let mut color_transform = dobj.base().color_transform();
+    let mut node = dobj.parent();
+
+    while let Some(display_object) = node {
+        color_transform = display_object.base().color_transform() * color_transform;
+        node = display_object.parent();
+    }
+
+    color_transform_to_object(&color_transform, activation)
+}
+
 pub fn has_matrix3d_from_transform_object(transform_object: Object<'_>) -> bool {
     get_display_object(transform_object)
         .base()

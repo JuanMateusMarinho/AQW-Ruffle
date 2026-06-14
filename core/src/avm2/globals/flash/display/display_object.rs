@@ -818,6 +818,7 @@ pub fn set_transform<'gc>(
     base.set_matrix(matrix);
     base.set_has_matrix3d_stub(has_matrix3d);
     base.set_color_transform(color_transform);
+    dobj.set_transformed_by_script(true);
     if let Some(parent) = dobj.parent() {
         // Self-transform changes are automatically handled,
         // we only want to inform ancestors to avoid unnecessary invalidations for tx/ty

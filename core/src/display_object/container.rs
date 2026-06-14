@@ -25,19 +25,22 @@ use std::ops::{Bound, RangeBounds};
 use std::rc::Rc;
 
 /// Dispatch the `removedFromStage` event on a child and all of it's
-/// grandchildren, recursively.
+/// grandchildren.
 pub fn dispatch_removed_from_stage_event<'gc>(
     child: DisplayObject<'gc>,
     context: &mut UpdateContext<'gc>,
 ) {
-    if let Some(object) = child.object2() {
-        let removed_evt = Avm2EventObject::bare_default_event(context, "removedFromStage");
-        Avm2::dispatch_event(context, removed_evt, object.into());
-    }
+    let mut stack = vec![child];
 
-    if let Some(child_container) = child.as_container() {
-        for grandchild in child_container.iter_render_list() {
-            dispatch_removed_from_stage_event(grandchild, context)
+    while let Some(child) = stack.pop() {
+        if let Some(object) = child.object2() {
+            let removed_evt = Avm2EventObject::bare_default_event(context, "removedFromStage");
+            Avm2::dispatch_event(context, removed_evt, object.into());
+        }
+
+        if let Some(child_container) = child.as_container() {
+            let grandchildren: Vec<_> = child_container.iter_render_list().collect();
+            stack.extend(grandchildren.into_iter().rev());
         }
     }
 }
@@ -66,23 +69,26 @@ pub fn dispatch_added_to_stage_event_only<'gc>(
     }
 }
 
-/// Dispatch the `addedToStage` event on a child and all of it's grandchildren,
-/// recursively.
+/// Dispatch the `addedToStage` event on a child and all of it's grandchildren.
 pub fn dispatch_added_to_stage_event<'gc>(
     child: DisplayObject<'gc>,
     context: &mut UpdateContext<'gc>,
 ) {
-    dispatch_added_to_stage_event_only(child, context);
+    let mut stack = vec![child];
 
-    if let Some(child_container) = child.as_container() {
-        for grandchild in child_container.iter_render_list() {
-            dispatch_added_to_stage_event(grandchild, context)
+    while let Some(child) = stack.pop() {
+        dispatch_added_to_stage_event_only(child, context);
+
+        if let Some(button) = child.as_avm2_button()
+            && let Some(child) = button.get_state_child(button.state().into())
+        {
+            stack.push(child);
         }
-    }
-    if let Some(button) = child.as_avm2_button()
-        && let Some(child) = button.get_state_child(button.state().into())
-    {
-        dispatch_added_to_stage_event(child, context);
+
+        if let Some(child_container) = child.as_container() {
+            let grandchildren: Vec<_> = child_container.iter_render_list().collect();
+            stack.extend(grandchildren.into_iter().rev());
+        }
     }
 }
 
@@ -775,7 +781,13 @@ impl<'gc> ChildContainer<'gc> {
                             // set it to `null`. This is observable:
                             // a setter method won't get called.
                         }
-                        Ok(_other) => {
+                        Ok(Avm2Value::Object(current_obj))
+                            if current_obj
+                                .as_display_object()
+                                .is_some_and(|current_child| {
+                                    DisplayObject::ptr_eq(current_child, child)
+                                }) =>
+                        {
                             let res = parent_obj.set_property(
                                 &multiname,
                                 Avm2Value::Null,
@@ -789,6 +801,11 @@ impl<'gc> ChildContainer<'gc> {
                                     &format!("Error setting AVM2 child named \"{}\" to null", name),
                                 );
                             }
+                        }
+                        Ok(_) => {
+                            // If the parent property has already been replaced
+                            // by another child or by script, removing this child
+                            // must not clobber the current value.
                         }
                         Err(_) => {
                             // In FP, errors when accessing the

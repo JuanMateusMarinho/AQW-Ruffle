@@ -23,7 +23,6 @@ use std::sync::Arc;
 
 const MIN_TESSELLATION_SCALE: f32 = 0.01;
 const MAX_TESSELLATION_SCALE: f32 = 8.0;
-const MIN_RENDERABLE_GRAPHIC_SCALE: f32 = 0.02;
 
 #[derive(Clone, Collect, Copy)]
 #[collect(no_drop)]
@@ -267,11 +266,14 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
             // Calculate the current scale from the transform, to determine if
             // we can reuse a cached tessellation or need to retessellate.
             let matrix = &transform.matrix;
-            let scale_x = f32::abs(matrix.a + matrix.c);
-            let scale_y = f32::abs(matrix.b + matrix.d);
-            let current_scale = ((scale_x * scale_x + scale_y * scale_y) / 2.0).sqrt();
+            let current_scale = ((matrix.a * matrix.a
+                + matrix.b * matrix.b
+                + matrix.c * matrix.c
+                + matrix.d * matrix.d)
+                / 2.0)
+                .sqrt();
 
-            if !current_scale.is_finite() || current_scale < MIN_RENDERABLE_GRAPHIC_SCALE {
+            if !current_scale.is_finite() || current_scale <= f32::EPSILON {
                 return;
             }
 

@@ -44,7 +44,7 @@ use ruffle_render::utils::{JpegTagFormat, determine_jpeg_tag_format};
 use slotmap::{SlotMap, new_key_type};
 use std::fmt;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 use swf::read::{extract_swz, read_compression_type};
 use thiserror::Error;
@@ -56,6 +56,12 @@ new_key_type! {
 
 /// The depth of AVM1 movies that AVM2 loads.
 const LOADER_INSERTED_AVM1_DEPTH: i32 = -0xF000;
+const IMMEDIATE_PRELOAD_BYTE_LIMIT: usize = 128 * 1024;
+
+fn aqw_diagnostics_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
+}
 
 /// How Ruffle should load movies.
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
@@ -246,6 +252,41 @@ impl<'gc> LoadManager<'gc> {
         self.0.remove(handle);
     }
 
+    /// Cancel any in-flight load targeting a display object.
+    pub fn cancel_load_for_target(&mut self, target: DisplayObject<'gc>) {
+        let handles: Vec<_> = self
+            .0
+            .iter()
+            .filter_map(|(handle, loader)| {
+                if DisplayObject::ptr_eq(loader.target_clip, target)
+                    && matches!(
+                        loader.loader_status,
+                        LoaderStatus::Pending | LoaderStatus::Parsing
+                    )
+                {
+                    Some(handle)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for handle in handles {
+            if aqw_diagnostics_enabled()
+                && let Some(loader) = self.0.get(handle)
+            {
+                tracing::info!(
+                    target: "aqw_diag",
+                    ?handle,
+                    target_clip = ?loader.target_clip,
+                    status = ?loader.loader_status,
+                    "Cancelling in-flight movie load for target"
+                );
+            }
+            self.0.remove(handle);
+        }
+    }
+
     /// Retrieve a loader by handle.
     pub fn get_loader(&self, handle: LoaderHandle) -> Option<&MovieLoader<'gc>> {
         self.0.get(handle)
@@ -309,6 +350,16 @@ impl<'gc> LoadManager<'gc> {
                 // Return a future that does nothing
                 return Box::pin(async move { Ok(()) });
             }
+        }
+
+        if aqw_diagnostics_enabled() {
+            tracing::info!(
+                target: "aqw_diag",
+                url = %request.url(),
+                ?target_clip,
+                from_avm2 = matches!(vm_data, MovieLoaderVMData::Avm2 { .. }),
+                "Starting movie load into clip"
+            );
         }
 
         let loader = MovieLoader {
@@ -398,6 +449,16 @@ impl<'gc> LoadManager<'gc> {
         bytes: Vec<u8>,
         vm_data: MovieLoaderVMData<'gc>,
     ) -> Result<(), Error> {
+        if aqw_diagnostics_enabled() {
+            tracing::info!(
+                target: "aqw_diag",
+                byte_len = bytes.len(),
+                ?target_clip,
+                from_avm2 = matches!(vm_data, MovieLoaderVMData::Avm2 { .. }),
+                "Starting movie loadBytes into clip"
+            );
+        }
+
         let loader = MovieLoader {
             self_handle: None,
             target_clip,
@@ -1606,6 +1667,20 @@ impl<'gc> MovieLoader<'gc> {
         let sniffed_type = ContentType::sniff(data);
         let length = data.len();
 
+        if aqw_diagnostics_enabled() {
+            tracing::info!(
+                target: "aqw_diag",
+                ?handle,
+                url = %url,
+                loader_url = ?loader_url,
+                ?sniffed_type,
+                length,
+                status,
+                redirected,
+                "Movie loader received data"
+            );
+        }
+
         if sniffed_type == ContentType::Unknown
             && let Ok(data) = extract_swz(data)
         {
@@ -1788,13 +1863,18 @@ impl<'gc> MovieLoader<'gc> {
 
                 // NOTE: Certain tests specifically expect small files to preload immediately
                 if !from_bytes {
-                    MovieLoader::preload_tick(
-                        handle,
-                        uc,
-                        &mut ExecutionLimit::with_max_ops_and_time(10000, Duration::from_millis(1)),
-                        status,
-                        redirected,
-                    )?;
+                    let mut immediate_limit;
+                    let mut bounded_limit;
+                    let preload_limit = if data.len() <= IMMEDIATE_PRELOAD_BYTE_LIMIT {
+                        immediate_limit = ExecutionLimit::none();
+                        &mut immediate_limit
+                    } else {
+                        bounded_limit =
+                            ExecutionLimit::with_max_ops_and_time(10000, Duration::from_millis(1));
+                        &mut bounded_limit
+                    };
+
+                    MovieLoader::preload_tick(handle, uc, preload_limit, status, redirected)?;
                 };
 
                 return Ok(());
@@ -2037,6 +2117,11 @@ impl<'gc> MovieLoader<'gc> {
             if mc.movie().is_action_script_3() {
                 mc.enter_frame(uc);
                 mc.construct_frame(uc);
+                // The first construct pass can allocate the loaded root's AVM2
+                // object and rely on Sprite.constructChildren for load-frame
+                // children. Run a follow-up pass before adding the root to the
+                // Loader so addedToStage observers see named timeline children.
+                mc.construct_frame(uc);
             }
 
             // Movie clips created from ActionScript (including from a Loader) skip the next enterFrame,
@@ -2168,6 +2253,18 @@ impl<'gc> MovieLoader<'gc> {
         redirected: bool,
         swf_url: String,
     ) -> Result<(), Error> {
+        if aqw_diagnostics_enabled() {
+            tracing::info!(
+                target: "aqw_diag",
+                ?handle,
+                status,
+                redirected,
+                url = %swf_url,
+                message = %msg,
+                "Movie load failed"
+            );
+        }
+
         //TODO: Inspect the fetch error.
         //This requires cooperation from the backend to send abstract
         //error types we can actually inspect.

@@ -25,6 +25,7 @@ use crate::avm2::stack::StackFrame;
 use crate::avm2::value::Value;
 use crate::avm2::{Avm2, Error};
 use crate::context::UpdateContext;
+use crate::display_object::{TDisplayObject, TDisplayObjectContainer};
 use crate::string::{AvmAtom, AvmString, HasStringContext, StringContext};
 use crate::tag_utils::SwfMovie;
 use gc_arena::Gc;
@@ -32,7 +33,35 @@ use ruffle_macros::istr;
 use std::cell::Cell;
 use std::cmp::{Ordering, min};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use swf::avm2::types::MethodFlags as AbcMethodFlags;
+
+fn aqw_diagnostics_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
+}
+
+fn is_aqw_avatar_slot(name: &str) -> bool {
+    matches!(
+        name,
+        "head"
+            | "chest"
+            | "hip"
+            | "idlefoot"
+            | "frontfoot"
+            | "backfoot"
+            | "frontshoulder"
+            | "backshoulder"
+            | "fronthand"
+            | "backhand"
+            | "frontthigh"
+            | "backthigh"
+            | "frontshin"
+            | "backshin"
+            | "robe"
+            | "backrobe"
+    )
+}
 
 /// Represents a single activation of a given AVM2 function or keyframe.
 pub struct Activation<'a, 'gc: 'a> {
@@ -653,6 +682,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let mut ip = 0;
 
         loop {
+            let current_ip = ip;
             let op = &opcodes[ip];
             ip += 1;
             avm_debug!(self.avm2(), "Opcode: {op:?}");
@@ -695,15 +725,21 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                 Op::CallPropVoid {
                     multiname,
                     num_args,
-                } => self.op_call_prop_void(*multiname, *num_args),
+                } => self.op_call_prop_void(method, current_ip, *multiname, *num_args),
                 Op::CallStatic { method, num_args } => self.op_call_static(*method, *num_args),
                 Op::CallSuper {
                     multiname,
                     num_args,
                 } => self.op_call_super(*multiname, *num_args),
-                Op::GetPropertyStatic { multiname } => self.op_get_property_static(*multiname),
-                Op::GetPropertyFast { multiname } => self.op_get_property_fast(*multiname),
-                Op::GetPropertySlow { multiname } => self.op_get_property_slow(*multiname),
+                Op::GetPropertyStatic { multiname } => {
+                    self.op_get_property_static(method, current_ip, *multiname)
+                }
+                Op::GetPropertyFast { multiname } => {
+                    self.op_get_property_fast(method, current_ip, *multiname)
+                }
+                Op::GetPropertySlow { multiname } => {
+                    self.op_get_property_slow(method, current_ip, *multiname)
+                }
                 Op::SetPropertyStatic { multiname } => self.op_set_property_static(*multiname),
                 Op::SetPropertyFast { multiname } => self.op_set_property_fast(*multiname),
                 Op::SetPropertySlow { multiname } => self.op_set_property_slow(*multiname),
@@ -1141,12 +1177,34 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
     fn op_call_prop_void(
         &mut self,
+        method: Method<'gc>,
+        ip: usize,
         multiname: Gc<'gc, Multiname<'gc>>,
         arg_count: u32,
     ) -> Result<(), Error<'gc>> {
         let args = self.get_args(arg_count);
         let multiname = multiname.fill_with_runtime_params(self)?;
-        let receiver = self.pop_stack().null_check(self, Some(&multiname))?;
+        let receiver = self.pop_stack();
+
+        if aqw_diagnostics_enabled()
+            && matches!(receiver, Value::Null | Value::Undefined)
+            && multiname
+                .local_name()
+                .is_some_and(|name| name.as_wstr() == b"removeChildAt")
+        {
+            tracing::warn!(
+                target: "aqw_diag",
+                abc_method = method.abc_method_index(),
+                method_name = %method.method_name(),
+                ip,
+                owner_url = %method.owner_movie().url(),
+                property = %multiname.to_qualified_name(self.gc()),
+                receiver = ?receiver,
+                "AQW null removeChildAt receiver"
+            );
+        }
+
+        let receiver = receiver.null_check(self, Some(&multiname))?;
 
         receiver.call_property(&multiname, args, self)?;
 
@@ -1231,14 +1289,149 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         }
     }
 
+    fn aqw_recover_avatar_child_property(
+        &mut self,
+        method: Method<'gc>,
+        ip: usize,
+        receiver: Value<'gc>,
+        multiname: &Multiname<'gc>,
+        value: Value<'gc>,
+    ) -> Value<'gc> {
+        if !matches!(value, Value::Null | Value::Undefined)
+            || !multiname.contains_public_namespace()
+        {
+            return value;
+        }
+
+        let Some(local_name) = multiname.local_name() else {
+            return value;
+        };
+        let slot_name = local_name.to_utf8_lossy();
+        if !is_aqw_avatar_slot(&slot_name) {
+            return value;
+        }
+
+        let Some(display_object) = receiver
+            .as_object()
+            .and_then(|object| object.as_display_object())
+        else {
+            if aqw_diagnostics_enabled() {
+                tracing::warn!(
+                    target: "aqw_diag",
+                    abc_method = method.abc_method_index(),
+                    method_name = %method.method_name(),
+                    ip,
+                    owner_url = %method.owner_movie().url(),
+                    property = %multiname.to_qualified_name(self.gc()),
+                    receiver = ?receiver,
+                    value = ?value,
+                    "AQW avatar property was null on non-display receiver"
+                );
+            }
+            return value;
+        };
+
+        let Some(container) = display_object.as_container() else {
+            if aqw_diagnostics_enabled() {
+                tracing::warn!(
+                    target: "aqw_diag",
+                    abc_method = method.abc_method_index(),
+                    method_name = %method.method_name(),
+                    ip,
+                    owner_url = %method.owner_movie().url(),
+                    receiver = ?display_object,
+                    property = %slot_name,
+                    value = ?value,
+                    "AQW avatar property was null on non-container display object"
+                );
+            }
+            return value;
+        };
+
+        let child = container.child_by_name(&local_name, true).or_else(|| {
+            display_object.construct_frame(self.context);
+            display_object
+                .as_container()?
+                .child_by_name(&local_name, true)
+                .or_else(|| {
+                    display_object
+                        .as_container()?
+                        .child_by_name(&local_name, false)
+                })
+        });
+
+        if let Some(child) = child {
+            if child.object2().is_none() {
+                child.construct_frame(self.context);
+            }
+
+            if let Some(child_object) = child.object2() {
+                if aqw_diagnostics_enabled() {
+                    tracing::info!(
+                        target: "aqw_diag",
+                        abc_method = method.abc_method_index(),
+                        method_name = %method.method_name(),
+                        ip,
+                        owner_url = %method.owner_movie().url(),
+                        receiver = ?display_object,
+                        property = %slot_name,
+                        "AQW recovered null avatar property from display child"
+                    );
+                }
+                return child_object.into();
+            }
+
+            if aqw_diagnostics_enabled() {
+                tracing::warn!(
+                    target: "aqw_diag",
+                    abc_method = method.abc_method_index(),
+                    method_name = %method.method_name(),
+                    ip,
+                    owner_url = %method.owner_movie().url(),
+                    receiver = ?display_object,
+                    child = ?child,
+                    property = %slot_name,
+                    "AQW found avatar display child without AVM2 object"
+                );
+            }
+            return value;
+        }
+
+        if aqw_diagnostics_enabled() {
+            let child_names = container
+                .iter_render_list()
+                .filter_map(|child| child.name().map(|name| name.to_utf8_lossy().into_owned()))
+                .collect::<Vec<_>>()
+                .join(",");
+            tracing::warn!(
+                target: "aqw_diag",
+                abc_method = method.abc_method_index(),
+                method_name = %method.method_name(),
+                ip,
+                owner_url = %method.owner_movie().url(),
+                receiver = ?display_object,
+                property = %slot_name,
+                value = ?value,
+                num_children = container.num_children(),
+                child_names,
+                "AQW null avatar property has no matching display child"
+            );
+        }
+
+        value
+    }
+
     fn op_get_property_static(
         &mut self,
+        method: Method<'gc>,
+        ip: usize,
         multiname: Gc<'gc, Multiname<'gc>>,
     ) -> Result<(), Error<'gc>> {
         // default path for static names
-        let object = self.pop_stack().null_check(self, Some(&multiname))?;
+        let receiver = self.pop_stack().null_check(self, Some(&multiname))?;
 
-        let value = object.get_property(&multiname, self)?;
+        let value = receiver.get_property(&multiname, self)?;
+        let value = self.aqw_recover_avatar_child_property(method, ip, receiver, &multiname, value);
         self.push_stack(value);
 
         Ok(())
@@ -1246,6 +1439,8 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
     fn op_get_property_fast(
         &mut self,
+        method: Method<'gc>,
+        ip: usize,
         multiname: Gc<'gc, Multiname<'gc>>,
     ) -> Result<(), Error<'gc>> {
         // (fast) side path for dictionary/array-likes
@@ -1285,18 +1480,21 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         }
 
         // If it wasn't actually a fast-path access, fall back to the slow version
-        self.op_get_property_slow(multiname)
+        self.op_get_property_slow(method, ip, multiname)
     }
 
     fn op_get_property_slow(
         &mut self,
+        method: Method<'gc>,
+        ip: usize,
         multiname: Gc<'gc, Multiname<'gc>>,
     ) -> Result<(), Error<'gc>> {
         // main path for dynamic names
         let multiname = multiname.fill_with_runtime_params(self)?;
-        let object = self.pop_stack().null_check(self, Some(&multiname))?;
+        let receiver = self.pop_stack().null_check(self, Some(&multiname))?;
 
-        let value = object.get_property(&multiname, self)?;
+        let value = receiver.get_property(&multiname, self)?;
+        let value = self.aqw_recover_avatar_child_property(method, ip, receiver, &multiname, value);
         self.push_stack(value);
 
         Ok(())

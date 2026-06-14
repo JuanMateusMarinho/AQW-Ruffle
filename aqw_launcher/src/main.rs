@@ -13,10 +13,11 @@ fn main() {
 #[cfg(target_os = "windows")]
 mod windows_launcher {
     use std::ffi::c_void;
-    use std::fs;
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
     use std::mem::{size_of, zeroed};
     use std::os::windows::process::CommandExt;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
     use std::ptr::{null, null_mut};
     use std::sync::Arc;
 
@@ -1754,6 +1755,13 @@ mod windows_launcher {
         window_title: &str,
     ) -> Result<String, String> {
         let diagnostics = diagnostics_enabled();
+        let debug_window_title;
+        let effective_window_title = if diagnostics {
+            debug_window_title = format!("{window_title} [DEBUG]");
+            debug_window_title.as_str()
+        } else {
+            window_title
+        };
         let mut temp_path = std::env::temp_dir();
         temp_path.push("aqw_ruffle");
         fs::create_dir_all(&temp_path).map_err(|error| error.to_string())?;
@@ -1763,13 +1771,9 @@ mod windows_launcher {
         } else {
             "AQW-Ruffle.exe"
         });
-        let should_write = if ruffle_path.exists() {
-            fs::metadata(&ruffle_path)
-                .map(|metadata| metadata.len() != RUFFLE_EXE.len() as u64)
-                .unwrap_or(true)
-        } else {
-            true
-        };
+        let should_write = fs::read(&ruffle_path)
+            .map(|existing| existing.as_slice() != RUFFLE_EXE)
+            .unwrap_or(true);
 
         if should_write {
             fs::write(&ruffle_path, RUFFLE_EXE).map_err(|error| error.to_string())?;
@@ -1777,7 +1781,7 @@ mod windows_launcher {
 
         let mut command = Command::new(&ruffle_path);
         command
-            .env("ARTIX_RUFFLE_WINDOW_TITLE", window_title)
+            .env("ARTIX_RUFFLE_WINDOW_TITLE", effective_window_title)
             .env(
                 "RUST_LOG",
                 if diagnostics {
@@ -1816,6 +1820,25 @@ mod windows_launcher {
 
         if diagnostics {
             command.env("RUFFLE_AQW_DIAGNOSTICS", "1");
+            command.env("RUST_BACKTRACE", "1");
+
+            let log_path = temp_path.join("ruffle-debug.log");
+            let mut log_file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .map_err(|error| error.to_string())?;
+
+            writeln!(
+                log_file,
+                "\n=== Launching {effective_window_title} with diagnostics: {} ===",
+                chrono_like_timestamp()
+            )
+            .map_err(|error| error.to_string())?;
+
+            let stderr_file = log_file.try_clone().map_err(|error| error.to_string())?;
+            command.stdout(Stdio::from(log_file));
+            command.stderr(Stdio::from(stderr_file));
         }
 
         command.spawn().map_err(|error| error.to_string())?;
@@ -1833,6 +1856,13 @@ mod windows_launcher {
                     .contains("debug")
             })
             .unwrap_or(false)
+    }
+
+    fn chrono_like_timestamp() -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        format!("unix_ms={}", now.as_millis())
     }
 
     pub fn run() {
