@@ -1,0 +1,38 @@
+{
+  "name": "aqw-ruffle-electron-launcher",
+  "version": "1.0.0",
+  "description": "Artix-style AQW launcher powered by Ruffle",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --win portable --x64",
+    "dist": "electron-builder --win nsis --x64"
+  },
+  "build": {
+    "appId": "com.aqwruffle.launcher",
+    "productName": "AELauncher",
+    "directories": {
+      "output": "../../release/electron"
+    },
+    "files": [
+      "**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "../../release/AQW.exe",
+        "to": "bin/AQW.exe"
+      }
+    ],
+    "win": {
+      "icon": "../icon.ico",
+      "target": [
+        "portable"
+      ]
+    }
+  },
+  "devDependencies": {
+    "electron": "^31.7.7",
+    "electron-builder": "^24.13.3"
+  }
+}

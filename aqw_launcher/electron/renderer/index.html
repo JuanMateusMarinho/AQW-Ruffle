@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self' https: data: blob:; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; frame-src https:; connect-src https:;"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Artix Games Launcher</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <aside class="sidebar">
+      <div class="brand">
+        <img src="../assets/artix_entertainment.png" alt="Artix Entertainment" />
+      </div>
+      <button class="side-item active" data-game="aqw">
+        <img src="../assets/aqw_badge.png" alt="" />
+        <span>AQWorlds</span>
+      </button>
+      <button class="side-item disabled" data-game="ed">
+        <img src="../assets/epic_duel.png" alt="" />
+        <span>EpicDuel</span>
+      </button>
+      <button class="side-item" data-game="df">
+        <img src="../assets/dragon_fable.png" alt="" />
+        <span>DragonFable</span>
+      </button>
+      <button class="side-item disabled" data-game="aq">
+        <img src="../assets/adventure_quest.png" alt="" />
+        <span>AdventureQuest</span>
+      </button>
+      <button class="side-item disabled" data-game="mq">
+        <img src="../assets/mech_quest.png" alt="" />
+        <span>MechQuest</span>
+      </button>
+    </aside>
+
+    <main class="shell">
+      <nav class="topnav">
+        <button class="top-tab active" data-tab="games">GAMES</button>
+        <button class="top-tab" data-tab="news">NEWS</button>
+        <button class="top-tab" data-tab="videos">VIDEOS</button>
+        <button class="top-tab live-tab" data-tab="live">
+          <span class="live-pulse" aria-hidden="true"></span>
+          <span>LIVE</span>
+        </button>
+      </nav>
+
+      <section class="tab-panel active" id="tab-games">
+        <section class="hero">
+          <div class="hero-shade"></div>
+          <div class="pixi-overlay" id="pixi-hero-layer" aria-hidden="true"></div>
+          <button class="play-button" id="play-aqw" aria-label="Play AdventureQuest Worlds"></button>
+          <p class="ruffle-note">Flash MMORPG running through the bundled Ruffle build.</p>
+        </section>
+        <section class="status-bar">
+          <strong>Status:</strong>
+          <span id="status">Ready to play.</span>
+        </section>
+        <section class="news-grid">
+          <header>
+            <strong>MMORPG - UPDATED WEEKLY!</strong>
+            <button data-open="https://www.aq.com/gamedesignnotes/">News</button>
+            <button data-open="https://support.artix.com/">Artix Support</button>
+            <button data-open="https://account.aq.com/">Manage Account</button>
+          </header>
+          <div class="news-card">
+            <h3>AdventureQuest Worlds Design Notes</h3>
+            <p>Official updates, weekly releases, and featured AQW news.</p>
+          </div>
+          <div class="news-card">
+            <h3>Videos and live pages</h3>
+            <p>Use the top tabs to open YouTube and Twitch externally, keeping this launcher focused.</p>
+          </div>
+        </section>
+      </section>
+
+      <section class="tab-panel web-panel" id="tab-news">
+        <webview
+          class="webview"
+          src="https://www.aq.com/gamedesignnotes/"
+          allowpopups
+          partition="persist:aqw-news"
+        ></webview>
+      </section>
+
+      <section class="tab-panel web-panel focused-web-panel" id="tab-videos">
+        <div class="web-toolbar">
+          <img src="../assets/youtube.png" alt="" />
+          <strong>YouTube Videos</strong>
+          <span>Videos open externally when selected.</span>
+          <div class="web-controls">
+            <button class="web-control" data-web-action="back" data-web-target="videos-webview">Back</button>
+            <button class="web-control" data-web-action="home" data-web-target="videos-webview">AQW Videos</button>
+          </div>
+        </div>
+        <webview
+          id="videos-webview"
+          class="webview external-click-webview"
+          data-home-url="https://www.youtube.com/channel/UC0vYUqgESNR3sqEPiJ4SpeA/recent"
+          src="https://www.youtube.com/channel/UC0vYUqgESNR3sqEPiJ4SpeA/recent"
+          allowpopups
+          partition="persist:aqw-youtube"
+        ></webview>
+      </section>
+
+      <section class="tab-panel web-panel" id="tab-live">
+        <div class="source-tabs">
+          <button class="source-tab active" data-live-source="youtube">
+            <img src="../assets/youtube.png" alt="" />
+            YouTube Live
+          </button>
+          <button class="source-tab" data-live-source="twitch">
+            <img src="../assets/twitch.png" alt="" />
+            Twitch Live
+          </button>
+          <span class="source-note">Streams open externally when selected.</span>
+          <div class="web-controls">
+            <button class="web-control" data-web-action="back" data-web-target="active-live">Back</button>
+            <button class="web-control" data-web-action="home" data-web-target="active-live">Live Home</button>
+          </div>
+        </div>
+        <webview
+          class="webview live-webview external-click-webview active"
+          id="live-youtube"
+          data-home-url="https://www.youtube.com/channel/UC0vYUqgESNR3sqEPiJ4SpeA/live"
+          src="https://www.youtube.com/channel/UC0vYUqgESNR3sqEPiJ4SpeA/live"
+          allowpopups
+          partition="persist:aqw-youtube-live"
+        ></webview>
+        <webview
+          class="webview live-webview external-click-webview"
+          id="live-twitch"
+          data-home-url="https://www.twitch.tv/directory/category/adventurequest-worlds"
+          src="https://www.twitch.tv/directory/category/adventurequest-worlds"
+          allowpopups
+          partition="persist:aqw-twitch"
+        ></webview>
+      </section>
+    </main>
+
+    <script src="../vendor/pixi.min.js"></script>
+    <script src="pixi-layer.js"></script>
+    <script src="renderer.js"></script>
+  </body>
+</html>

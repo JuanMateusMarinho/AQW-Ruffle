@@ -52,7 +52,7 @@ use std::borrow::Cow;
 use std::cell::{Cell, OnceCell, Ref, RefCell, RefMut};
 use std::cmp::max;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use swf::extensions::ReadSwfExt;
 use swf::{ClipEventFlag, DefineBitsLossless, FrameLabelData, TagCode, UTF_8};
 
@@ -60,6 +60,17 @@ use super::BitmapClass;
 use super::interactive::Avm2MousePick;
 
 type FrameNumber = u16;
+
+fn aqw_diagnostics_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
+}
+
+fn is_aqw_avatar_asset_movie_url(url: &str) -> bool {
+    url.contains("/gamefiles/items/")
+        || url.contains("/gamefiles/classes/")
+        || url.contains("/gamefiles/hair/")
+}
 
 /// Indication of what frame `run_frame` should jump to next.
 #[derive(PartialEq, Eq)]
@@ -972,9 +983,22 @@ impl<'gc> MovieClip<'gc> {
     ///
     /// In AVM1, no-op gotos have no effects, so this does nothing.
     fn no_op_goto(self, context: &mut UpdateContext<'gc>) {
-        if self.movie().is_action_script_3() {
+        let movie = self.movie();
+        if movie.is_action_script_3() {
             // Despite not running, the goto still overwrites the currently enqueued frame.
             self.0.queued_goto_frame.set(None);
+
+            if is_aqw_avatar_asset_movie_url(movie.url()) {
+                if aqw_diagnostics_enabled() {
+                    tracing::info!(
+                        target: "aqw_diag",
+                        url = %movie.url(),
+                        "AQW skipped nested frame lifecycle for no-op goto on avatar asset"
+                    );
+                }
+                return;
+            }
+
             // Pretend we actually did a goto, but don't do anything.
             run_inner_goto_frame(context, &[], self);
         }

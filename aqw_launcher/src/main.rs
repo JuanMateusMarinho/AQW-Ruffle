@@ -20,6 +20,7 @@ mod windows_launcher {
     use std::process::{Command, Stdio};
     use std::ptr::{null, null_mut};
     use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use image::ImageFormat;
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -51,12 +52,15 @@ mod windows_launcher {
     const HERO_IMAGE: &[u8] = include_bytes!("../assets/launcher_entry.png");
     const DRAGON_FABLE_BANNER: &[u8] = include_bytes!("../assets/dragon_fable_banner.png");
     const AQW_BADGE: &[u8] = include_bytes!("../assets/aqw_badge.png");
+    const AQW_PLAY_BUTTON: &[u8] = include_bytes!("../assets/aqw_play_button.png");
     const ARTIX_WORDMARK: &[u8] = include_bytes!("../assets/artix_entertainment.png");
     const DRAGON_FABLE_LOGO: &[u8] = include_bytes!("../assets/dragon_fable.png");
     const EPIC_DUEL_LOGO: &[u8] = include_bytes!("../assets/epic_duel.png");
     const ADVENTURE_QUEST_LOGO: &[u8] = include_bytes!("../assets/adventure_quest.png");
     const MECH_QUEST_LOGO: &[u8] = include_bytes!("../assets/mech_quest.png");
     const DRAGON_IMAGE: &[u8] = include_bytes!("../assets/dragon_window.png");
+    const YOUTUBE_LOGO: &[u8] = include_bytes!("../assets/youtube.png");
+    const TWITCH_LOGO: &[u8] = include_bytes!("../assets/twitch.png");
 
     const CREATE_NO_WINDOW: u32 = 0x08000000;
     const APPLICATION_ICON_ID: usize = 1;
@@ -67,6 +71,14 @@ mod windows_launcher {
     const AQW_BASE_URL: &str = "https://game.aq.com/game/gamefiles/";
     const AQW_WINDOW_TITLE: &str = "Artix Entertainment - AdventureQuest Worlds V0.2";
     const AQW_DESIGN_NOTES_URL: &str = "https://www.aq.com/gamedesignnotes/";
+    const AQW_YOUTUBE_RECENT_URL: &str =
+        "https://www.youtube.com/channel/UC0vYUqgESNR3sqEPiJ4SpeA/recent";
+    const AQW_YOUTUBE_LIVE_URL: &str =
+        "https://www.youtube.com/channel/UC0vYUqgESNR3sqEPiJ4SpeA/live";
+    const AQW_YOUTUBE_FEED_URL: &str =
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UC0vYUqgESNR3sqEPiJ4SpeA";
+    const AQW_TWITCH_DIRECTORY_URL: &str =
+        "https://www.twitch.tv/directory/category/adventurequest-worlds";
     const FLASH_GRAPHICS_BACKEND: &str = "vulkan";
     const FLASH_QUALITY: &str = "low";
     const FLASH_FRAME_RATE: &str = "24";
@@ -78,17 +90,23 @@ mod windows_launcher {
     enum Screen {
         Home,
         Games,
-        Help,
+        News,
+        Videos,
+        Live,
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum ElementId {
         NavHome,
         NavGames,
-        NavHelp,
+        TopGames,
+        TopNews,
+        TopVideos,
+        TopLive,
         PlayHome,
         PlayDragonFable,
         OpenDesignNotes,
+        OpenMedia(usize),
         FutureEpicDuel,
         FutureAdventureQuest,
         FutureMechQuest,
@@ -131,6 +149,29 @@ mod windows_launcher {
         rect: RectI,
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum MediaSource {
+        YouTube,
+        Twitch,
+    }
+
+    struct MediaEntry {
+        source: MediaSource,
+        title: String,
+        channel: String,
+        url: String,
+        thumbnail_url: Option<String>,
+    }
+
+    #[derive(Clone)]
+    struct MediaItem {
+        source: MediaSource,
+        title: String,
+        channel: String,
+        url: String,
+        thumbnail: Option<Arc<Bitmap>>,
+    }
+
     struct Bitmap {
         width: i32,
         height: i32,
@@ -149,6 +190,16 @@ mod windows_launcher {
                 rgba: image.into_raw(),
             }
         }
+
+        fn from_memory(bytes: &[u8]) -> Option<Self> {
+            let image = image::load_from_memory(bytes).ok()?.to_rgba8();
+            let (width, height) = image.dimensions();
+            Some(Self {
+                width: width as i32,
+                height: height as i32,
+                rgba: image.into_raw(),
+            })
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -164,6 +215,10 @@ mod windows_launcher {
         nav_home: RectI,
         nav_games: RectI,
         nav_help: RectI,
+        top_games: RectI,
+        top_news: RectI,
+        top_videos: RectI,
+        top_live: RectI,
         dragon: RectI,
         game_icon: RectI,
         dragon_fable_card: RectI,
@@ -180,12 +235,19 @@ mod windows_launcher {
         hero: Arc<Bitmap>,
         dragon_fable_banner: Arc<Bitmap>,
         badge: Arc<Bitmap>,
+        aqw_play_button: Arc<Bitmap>,
         wordmark: Arc<Bitmap>,
         dragon_fable: Arc<Bitmap>,
         epic_duel: Arc<Bitmap>,
         adventure_quest: Arc<Bitmap>,
         mech_quest: Arc<Bitmap>,
         dragon: Arc<Bitmap>,
+        youtube: Arc<Bitmap>,
+        twitch: Arc<Bitmap>,
+        youtube_videos: Vec<MediaItem>,
+        live_media: Vec<MediaItem>,
+        youtube_videos_loaded: bool,
+        live_media_loaded: bool,
         buffer: Vec<u8>,
         width: i32,
         height: i32,
@@ -199,16 +261,23 @@ mod windows_launcher {
                 screen: Screen::Home,
                 hovered: None,
                 focused: ElementId::PlayHome,
-                status: "Pronto para jogar.".to_string(),
+                status: "Ready to play.".to_string(),
                 hero: Arc::new(Bitmap::from_png(HERO_IMAGE)),
                 dragon_fable_banner: Arc::new(Bitmap::from_png(DRAGON_FABLE_BANNER)),
                 badge: Arc::new(Bitmap::from_png(AQW_BADGE)),
+                aqw_play_button: Arc::new(Bitmap::from_png(AQW_PLAY_BUTTON)),
                 wordmark: Arc::new(Bitmap::from_png(ARTIX_WORDMARK)),
                 dragon_fable: Arc::new(Bitmap::from_png(DRAGON_FABLE_LOGO)),
                 epic_duel: Arc::new(Bitmap::from_png(EPIC_DUEL_LOGO)),
                 adventure_quest: Arc::new(Bitmap::from_png(ADVENTURE_QUEST_LOGO)),
                 mech_quest: Arc::new(Bitmap::from_png(MECH_QUEST_LOGO)),
                 dragon: Arc::new(Bitmap::from_png(DRAGON_IMAGE)),
+                youtube: Arc::new(Bitmap::from_png(YOUTUBE_LOGO)),
+                twitch: Arc::new(Bitmap::from_png(TWITCH_LOGO)),
+                youtube_videos: Vec::new(),
+                live_media: Vec::new(),
+                youtube_videos_loaded: false,
+                live_media_loaded: false,
                 buffer: Vec::new(),
                 width: 0,
                 height: 0,
@@ -220,14 +289,40 @@ mod windows_launcher {
         fn layout(&self, width: i32, height: i32) -> Layout {
             let nav_width = if width < 1040 { 184 } else { 196 };
             let top_bar = RectI {
-                x: nav_width,
+                x: 0,
                 y: 0,
-                w: width - nav_width,
+                w: width,
                 h: 68,
+            };
+            let top_nav_y = 22;
+            let top_nav_h = 36;
+            let top_games = RectI {
+                x: nav_width + 20,
+                y: top_nav_y,
+                w: 74,
+                h: top_nav_h,
+            };
+            let top_news = RectI {
+                x: top_games.right() + 4,
+                y: top_nav_y,
+                w: 70,
+                h: top_nav_h,
+            };
+            let top_videos = RectI {
+                x: top_news.right() + 4,
+                y: top_nav_y,
+                w: 86,
+                h: top_nav_h,
+            };
+            let top_live = RectI {
+                x: top_videos.right() + 4,
+                y: top_nav_y,
+                w: 62,
+                h: top_nav_h,
             };
             let content_x = nav_width + 12;
             let content_w = width - nav_width - 24;
-            let hero_h = (height * 35 / 100).clamp(220, 360);
+            let hero_h = (height * 45 / 100).clamp(320, 420);
             let right_panel = RectI {
                 x: content_x,
                 y: top_bar.bottom() + hero_h + 8,
@@ -246,15 +341,17 @@ mod windows_launcher {
                 w: content_w,
                 h: height - right_panel.bottom() - 24,
             };
+            let play_home_w = if hero_card.w < 900 { 230 } else { 260 };
+            let play_home_h = play_home_w * 190 / 320;
             let play_home = RectI {
-                x: hero_card.x + 22,
-                y: hero_card.bottom() - 74,
-                w: 190,
-                h: 56,
+                x: hero_card.x + 34,
+                y: hero_card.bottom() - play_home_h - 18,
+                w: play_home_w,
+                h: play_home_h,
             };
             let play_aqw_games = RectI {
-                x: play_home.x,
-                y: play_home.y,
+                x: hero_card.x + 22,
+                y: hero_card.bottom() - 74,
                 w: 190,
                 h: 56,
             };
@@ -270,15 +367,15 @@ mod windows_launcher {
                 w: nav_width,
                 h: 48,
             };
-            let nav_games = RectI {
+            let nav_help = RectI {
                 x: 0,
                 y: nav_home.bottom(),
                 w: nav_width,
                 h: 48,
             };
-            let nav_help = RectI {
+            let nav_games = RectI {
                 x: 0,
-                y: nav_games.bottom(),
+                y: nav_help.bottom(),
                 w: nav_width,
                 h: 48,
             };
@@ -343,6 +440,10 @@ mod windows_launcher {
                 nav_home,
                 nav_games,
                 nav_help,
+                top_games,
+                top_news,
+                top_videos,
+                top_live,
                 dragon,
                 game_icon,
                 dragon_fable_card,
@@ -356,16 +457,28 @@ mod windows_launcher {
             let layout = self.layout(width, height);
             let mut hits = vec![
                 HitBox {
+                    id: ElementId::TopGames,
+                    rect: layout.top_games,
+                },
+                HitBox {
+                    id: ElementId::TopNews,
+                    rect: layout.top_news,
+                },
+                HitBox {
+                    id: ElementId::TopVideos,
+                    rect: layout.top_videos,
+                },
+                HitBox {
+                    id: ElementId::TopLive,
+                    rect: layout.top_live,
+                },
+                HitBox {
                     id: ElementId::NavHome,
                     rect: layout.nav_home,
                 },
                 HitBox {
                     id: ElementId::NavGames,
                     rect: layout.nav_games,
-                },
-                HitBox {
-                    id: ElementId::NavHelp,
-                    rect: layout.nav_help,
                 },
             ];
 
@@ -402,7 +515,36 @@ mod windows_launcher {
                         rect: layout.mech_quest_card,
                     });
                 }
-                Screen::Help => {}
+                Screen::News => {
+                    hits.push(HitBox {
+                        id: ElementId::OpenDesignNotes,
+                        rect: layout.design_notes_button,
+                    });
+                }
+                Screen::Videos => {
+                    for (index, rect) in self
+                        .media_card_rects(layout, self.media_items_for_screen().len().max(1))
+                        .into_iter()
+                        .enumerate()
+                    {
+                        hits.push(HitBox {
+                            id: ElementId::OpenMedia(index),
+                            rect,
+                        });
+                    }
+                }
+                Screen::Live => {
+                    for (index, rect) in self
+                        .media_card_rects(layout, self.media_items_for_screen().len().max(1))
+                        .into_iter()
+                        .enumerate()
+                    {
+                        hits.push(HitBox {
+                            id: ElementId::OpenMedia(index),
+                            rect,
+                        });
+                    }
+                }
             }
 
             self.hits = hits;
@@ -420,7 +562,9 @@ mod windows_launcher {
             self.fill(Color::rgb(14, 15, 23));
             let (hero, hero_focus_y) = match self.screen {
                 Screen::Games => (Arc::clone(&self.dragon_fable_banner), 0.16),
-                Screen::Home | Screen::Help => (Arc::clone(&self.hero), 0.42),
+                Screen::Home | Screen::News | Screen::Videos | Screen::Live => {
+                    (Arc::clone(&self.hero), 0.42)
+                }
             };
             self.draw_image_cover_focus(&hero, layout.hero_card, 255, hero_focus_y);
             self.fill_rect_alpha(
@@ -449,9 +593,9 @@ mod windows_launcher {
             self.fill_rect_alpha(layout.top_bar, Color::rgba(6, 7, 11, 238));
             self.fill_rect_alpha(
                 RectI {
-                    x: layout.nav_width,
+                    x: 0,
                     y: layout.top_bar.bottom() - 1,
-                    w: self.width - layout.nav_width,
+                    w: self.width,
                     h: 1,
                 },
                 Color::rgba(219, 120, 16, 210),
@@ -472,11 +616,32 @@ mod windows_launcher {
                 &wordmark,
                 RectI {
                     x: 10,
-                    y: 2,
+                    y: 6,
                     w: layout.nav_width - 20,
-                    h: 64,
+                    h: 58,
                 },
                 255,
+            );
+
+            self.draw_top_nav_button(
+                layout.top_games,
+                ElementId::TopGames,
+                matches!(self.screen, Screen::Home | Screen::Games),
+            );
+            self.draw_top_nav_button(
+                layout.top_news,
+                ElementId::TopNews,
+                self.screen == Screen::News,
+            );
+            self.draw_top_nav_button(
+                layout.top_videos,
+                ElementId::TopVideos,
+                self.screen == Screen::Videos,
+            );
+            self.draw_top_nav_button(
+                layout.top_live,
+                ElementId::TopLive,
+                self.screen == Screen::Live,
             );
 
             self.draw_nav_button(
@@ -489,11 +654,6 @@ mod windows_launcher {
                 ElementId::NavGames,
                 self.screen == Screen::Games,
             );
-            self.draw_nav_button(
-                layout.nav_help,
-                ElementId::NavHelp,
-                self.screen == Screen::Help,
-            );
             let badge = Arc::clone(&self.badge);
             let dragon_fable = Arc::clone(&self.dragon_fable);
             let adventure_quest = Arc::clone(&self.adventure_quest);
@@ -501,11 +661,10 @@ mod windows_launcher {
             let mech_quest = Arc::clone(&self.mech_quest);
             self.draw_sidebar_icon(layout.nav_home, &badge, 255);
             self.draw_sidebar_icon(layout.nav_games, &dragon_fable, 255);
-            self.draw_sidebar_icon(layout.nav_help, &adventure_quest, 230);
             self.draw_sidebar_static_item(
                 RectI {
                     x: 0,
-                    y: layout.nav_help.bottom(),
+                    y: layout.nav_help.y,
                     w: layout.nav_width,
                     h: 48,
                 },
@@ -514,7 +673,7 @@ mod windows_launcher {
             self.draw_sidebar_static_item(
                 RectI {
                     x: 0,
-                    y: layout.nav_help.bottom() + 48,
+                    y: layout.nav_games.bottom(),
                     w: layout.nav_width,
                     h: 48,
                 },
@@ -523,7 +682,7 @@ mod windows_launcher {
             self.draw_sidebar_static_item(
                 RectI {
                     x: 0,
-                    y: layout.nav_help.bottom() + 96,
+                    y: layout.nav_games.bottom() + 48,
                     w: layout.nav_width,
                     h: 48,
                 },
@@ -534,20 +693,15 @@ mod windows_launcher {
             match self.screen {
                 Screen::Home => self.draw_home(layout),
                 Screen::Games => self.draw_games(layout),
-                Screen::Help => self.draw_help(layout),
+                Screen::News => self.draw_news(layout),
+                Screen::Videos => self.draw_videos(layout),
+                Screen::Live => self.draw_live(layout),
             }
         }
 
         fn draw_home(&mut self, layout: Layout) {
-            let badge = Arc::clone(&self.badge);
-            self.draw_image_contain(&badge, layout.game_icon, 255);
-            self.draw_button(
-                layout.play_home,
-                ElementId::PlayHome,
-                true,
-                Color::rgba(128, 18, 14, 240),
-                Color::rgba(172, 35, 22, 250),
-            );
+            let play_button = Arc::clone(&self.aqw_play_button);
+            self.draw_aqw_play_button(layout.play_home, &play_button);
             self.draw_design_notes_page(layout);
         }
 
@@ -590,41 +744,30 @@ mod windows_launcher {
             );
         }
 
-        fn draw_help(&mut self, layout: Layout) {
+        fn draw_news(&mut self, layout: Layout) {
+            self.draw_design_notes_page(layout);
+        }
+
+        fn draw_videos(&mut self, layout: Layout) {
+            self.draw_media_panel(layout);
+        }
+
+        fn draw_live(&mut self, layout: Layout) {
+            self.draw_media_panel(layout);
+        }
+
+        fn draw_media_panel(&mut self, layout: Layout) {
             self.draw_panel(
                 layout.game_card,
                 Color::rgba(13, 15, 22, 226),
                 Color::rgba(55, 58, 72, 210),
             );
-            let guide_1 = RectI {
-                x: layout.game_card.x + 34,
-                y: layout.game_card.y + 44,
-                w: layout.game_card.w - 68,
-                h: 48,
-            };
-            let guide_2 = RectI {
-                y: guide_1.y + 64,
-                ..guide_1
-            };
-            let guide_3 = RectI {
-                y: guide_2.y + 64,
-                ..guide_1
-            };
-            self.draw_panel(
-                guide_1,
-                Color::rgba(18, 31, 48, 210),
-                Color::rgba(84, 130, 216, 120),
-            );
-            self.draw_panel(
-                guide_2,
-                Color::rgba(18, 31, 48, 210),
-                Color::rgba(84, 130, 216, 120),
-            );
-            self.draw_panel(
-                guide_3,
-                Color::rgba(18, 31, 48, 210),
-                Color::rgba(84, 130, 216, 120),
-            );
+            let items = self.media_items_for_screen().to_vec();
+            let count = items.len().max(1);
+            for (index, rect) in self.media_card_rects(layout, count).into_iter().enumerate() {
+                let item = items.get(index);
+                self.draw_media_card(rect, ElementId::OpenMedia(index), item);
+            }
         }
 
         fn draw_design_notes_page(&mut self, layout: Layout) {
@@ -749,6 +892,50 @@ mod windows_launcher {
             }
         }
 
+        fn draw_top_nav_button(&mut self, rect: RectI, id: ElementId, selected: bool) {
+            let active = selected || self.hovered == Some(id) || self.focused == id;
+            if active {
+                self.fill_round_rect(
+                    RectI {
+                        x: rect.x,
+                        y: rect.y + 4,
+                        w: rect.w,
+                        h: rect.h - 8,
+                    },
+                    5,
+                    if selected {
+                        Color::rgba(42, 19, 15, 210)
+                    } else {
+                        Color::rgba(24, 23, 30, 190)
+                    },
+                );
+            }
+
+            if selected {
+                self.fill_rect_alpha(
+                    RectI {
+                        x: rect.x + 10,
+                        y: rect.bottom() - 7,
+                        w: rect.w - 20,
+                        h: 3,
+                    },
+                    Color::rgba(255, 178, 20, 240),
+                );
+            }
+
+            if self.focused == id {
+                self.fill_rect_alpha(
+                    RectI {
+                        x: rect.x + 8,
+                        y: rect.y + 5,
+                        w: rect.w - 16,
+                        h: 1,
+                    },
+                    Color::rgba(255, 230, 132, 180),
+                );
+            }
+        }
+
         fn draw_sidebar_icon(&mut self, rect: RectI, image: &Bitmap, opacity: u8) {
             self.draw_image_contain(
                 image,
@@ -806,6 +993,48 @@ mod windows_launcher {
             );
         }
 
+        fn draw_aqw_play_button(&mut self, rect: RectI, image: &Bitmap) {
+            let hovered = self.hovered == Some(ElementId::PlayHome);
+            let button_rect = if hovered {
+                RectI {
+                    x: rect.x,
+                    y: rect.y - 2,
+                    w: rect.w,
+                    h: rect.h,
+                }
+            } else {
+                rect
+            };
+
+            if hovered {
+                for (pad, alpha) in [(22, 18), (14, 28), (7, 38)] {
+                    self.fill_round_rect(
+                        RectI {
+                            x: button_rect.x - pad,
+                            y: button_rect.y - pad / 2,
+                            w: button_rect.w + pad * 2,
+                            h: button_rect.h + pad,
+                        },
+                        16,
+                        Color::rgba(255, 190, 40, alpha),
+                    );
+                }
+            }
+
+            let source = RectI {
+                x: 0,
+                y: 0,
+                w: image.width / 2,
+                h: image.height,
+            };
+            self.draw_image_region_contain(
+                image,
+                source,
+                button_rect,
+                if hovered { 255 } else { 242 },
+            );
+        }
+
         fn draw_game_slot(&mut self, rect: RectI, id: ElementId, image: &Bitmap, playable: bool) {
             let active = self.hovered == Some(id) || self.focused == id;
             let border = if playable {
@@ -859,6 +1088,93 @@ mod windows_launcher {
             }
         }
 
+        fn media_items_for_screen(&self) -> &[MediaItem] {
+            match self.screen {
+                Screen::Videos => &self.youtube_videos,
+                Screen::Live => &self.live_media,
+                _ => &[],
+            }
+        }
+
+        fn media_card_rects(&self, layout: Layout, count: usize) -> Vec<RectI> {
+            let gap = 12;
+            let top = layout.game_card.y + 54;
+            let columns = if layout.game_card.w > 1180 {
+                4
+            } else if layout.game_card.w > 820 {
+                3
+            } else {
+                2
+            };
+            let card_w = ((layout.game_card.w - gap * (columns - 1)) / columns).max(220);
+            let card_h = (card_w * 9 / 16 + 92).clamp(198, 280);
+            let max_rows = ((layout.game_card.bottom() - top + gap) / (card_h + gap)).max(1);
+            let max_cards = (columns * max_rows) as usize;
+            let total = count.min(max_cards).max(1);
+            let mut rects = Vec::with_capacity(total);
+            for index in 0..total {
+                let column = index as i32 % columns;
+                let row = index as i32 / columns;
+                rects.push(RectI {
+                    x: layout.game_card.x + column * (card_w + gap),
+                    y: top + row * (card_h + gap),
+                    w: card_w,
+                    h: card_h,
+                });
+            }
+            rects
+        }
+
+        fn draw_media_card(&mut self, rect: RectI, id: ElementId, item: Option<&MediaItem>) {
+            let active = self.hovered == Some(id) || self.focused == id;
+            let source = item.map(|item| item.source).unwrap_or(match self.screen {
+                Screen::Live => MediaSource::YouTube,
+                _ => MediaSource::YouTube,
+            });
+            let border = if active {
+                Color::rgba(255, 238, 160, 255)
+            } else {
+                match source {
+                    MediaSource::YouTube => Color::rgba(229, 45, 39, 210),
+                    MediaSource::Twitch => Color::rgba(145, 71, 255, 210),
+                }
+            };
+            self.draw_panel(rect, Color::rgba(17, 18, 24, 238), border);
+
+            let thumb = RectI {
+                x: rect.x + 8,
+                y: rect.y + 8,
+                w: rect.w - 16,
+                h: ((rect.w - 16) * 9 / 16).min(rect.h - 96),
+            };
+            self.fill_rect_alpha(thumb, Color::rgba(0, 0, 0, 170));
+
+            if let Some(item) = item {
+                if let Some(thumbnail) = &item.thumbnail {
+                    self.draw_image_cover_focus(thumbnail, thumb, 255, 0.5);
+                } else {
+                    let logo = match item.source {
+                        MediaSource::YouTube => Arc::clone(&self.youtube),
+                        MediaSource::Twitch => Arc::clone(&self.twitch),
+                    };
+                    self.draw_image_contain(&logo, thumb.inset(18), 235);
+                }
+            } else {
+                let logo = Arc::clone(&self.youtube);
+                self.draw_image_contain(&logo, thumb.inset(18), 210);
+            }
+
+            self.fill_rect_alpha(
+                RectI {
+                    x: thumb.x,
+                    y: thumb.bottom() - 24,
+                    w: thumb.w,
+                    h: 24,
+                },
+                Color::rgba(0, 0, 0, 150),
+            );
+        }
+
         fn hit_test(&self, x: i32, y: i32) -> Option<ElementId> {
             self.hits
                 .iter()
@@ -868,10 +1184,13 @@ mod windows_launcher {
 
         fn set_screen(&mut self, screen: Screen) {
             self.screen = screen;
+            self.refresh_media_for_screen(screen);
             self.focused = match screen {
                 Screen::Home => ElementId::PlayHome,
                 Screen::Games => ElementId::PlayDragonFable,
-                Screen::Help => ElementId::NavHome,
+                Screen::News => ElementId::OpenDesignNotes,
+                Screen::Videos => ElementId::OpenMedia(0),
+                Screen::Live => ElementId::OpenMedia(0),
             };
         }
 
@@ -879,21 +1198,63 @@ mod windows_launcher {
             match self.screen {
                 Screen::Home => &[
                     ElementId::PlayHome,
+                    ElementId::TopGames,
+                    ElementId::TopNews,
+                    ElementId::TopVideos,
+                    ElementId::TopLive,
                     ElementId::OpenDesignNotes,
                     ElementId::NavHome,
                     ElementId::NavGames,
-                    ElementId::NavHelp,
                 ],
                 Screen::Games => &[
                     ElementId::PlayDragonFable,
                     ElementId::FutureEpicDuel,
                     ElementId::FutureAdventureQuest,
                     ElementId::FutureMechQuest,
+                    ElementId::TopGames,
+                    ElementId::TopNews,
+                    ElementId::TopVideos,
+                    ElementId::TopLive,
                     ElementId::NavHome,
                     ElementId::NavGames,
-                    ElementId::NavHelp,
                 ],
-                Screen::Help => &[ElementId::NavHome, ElementId::NavGames, ElementId::NavHelp],
+                Screen::News => &[
+                    ElementId::OpenDesignNotes,
+                    ElementId::TopGames,
+                    ElementId::TopNews,
+                    ElementId::TopVideos,
+                    ElementId::TopLive,
+                    ElementId::NavHome,
+                    ElementId::NavGames,
+                ],
+                Screen::Videos => &[
+                    ElementId::OpenMedia(0),
+                    ElementId::OpenMedia(1),
+                    ElementId::OpenMedia(2),
+                    ElementId::OpenMedia(3),
+                    ElementId::OpenMedia(4),
+                    ElementId::OpenMedia(5),
+                    ElementId::TopGames,
+                    ElementId::TopNews,
+                    ElementId::TopVideos,
+                    ElementId::TopLive,
+                    ElementId::NavHome,
+                    ElementId::NavGames,
+                ],
+                Screen::Live => &[
+                    ElementId::OpenMedia(0),
+                    ElementId::OpenMedia(1),
+                    ElementId::OpenMedia(2),
+                    ElementId::OpenMedia(3),
+                    ElementId::OpenMedia(4),
+                    ElementId::OpenMedia(5),
+                    ElementId::TopGames,
+                    ElementId::TopNews,
+                    ElementId::TopVideos,
+                    ElementId::TopLive,
+                    ElementId::NavHome,
+                    ElementId::NavGames,
+                ],
             }
         }
 
@@ -903,56 +1264,119 @@ mod windows_launcher {
             self.focused = order[(current + 1) % order.len()];
         }
 
+        fn refresh_media_for_screen(&mut self, screen: Screen) {
+            match screen {
+                Screen::Videos if !self.youtube_videos_loaded => {
+                    self.status = "Loading YouTube videos...".to_string();
+                    let entries = fetch_youtube_recent_entries(8).unwrap_or_else(|_| {
+                        vec![MediaEntry {
+                            source: MediaSource::YouTube,
+                            title: "Latest AdventureQuest Worlds videos".to_string(),
+                            channel: "YouTube".to_string(),
+                            url: AQW_YOUTUBE_RECENT_URL.to_string(),
+                            thumbnail_url: None,
+                        }]
+                    });
+                    self.youtube_videos = build_media_items(entries);
+                    self.youtube_videos_loaded = true;
+                    self.status = "YouTube videos loaded.".to_string();
+                }
+                Screen::Live if !self.live_media_loaded => {
+                    self.status = "Loading live channels...".to_string();
+                    let mut entries = fetch_youtube_live_entries().unwrap_or_default();
+                    entries.extend(fetch_twitch_live_entries(5).unwrap_or_default());
+                    if entries.is_empty() {
+                        entries = vec![
+                            MediaEntry {
+                                source: MediaSource::YouTube,
+                                title: "YouTube live channel".to_string(),
+                                channel: "AdventureQuest Worlds".to_string(),
+                                url: AQW_YOUTUBE_LIVE_URL.to_string(),
+                                thumbnail_url: None,
+                            },
+                            MediaEntry {
+                                source: MediaSource::Twitch,
+                                title: "AdventureQuest Worlds streams".to_string(),
+                                channel: "Twitch directory".to_string(),
+                                url: AQW_TWITCH_DIRECTORY_URL.to_string(),
+                                thumbnail_url: None,
+                            },
+                        ];
+                    }
+                    self.live_media = build_media_items(entries);
+                    self.live_media_loaded = true;
+                    self.status = "Live channels loaded.".to_string();
+                }
+                _ => {}
+            }
+        }
+
+        fn media_url(&self, index: usize) -> Option<&str> {
+            self.media_items_for_screen()
+                .get(index)
+                .map(|item| item.url.as_str())
+        }
+
         fn activate(&mut self, id: ElementId, hwnd: HWND) {
             match id {
                 ElementId::NavHome => self.set_screen(Screen::Home),
                 ElementId::NavGames => self.set_screen(Screen::Games),
-                ElementId::NavHelp => self.set_screen(Screen::Help),
+                ElementId::TopGames => self.set_screen(Screen::Home),
+                ElementId::TopNews => self.set_screen(Screen::News),
+                ElementId::TopVideos => self.set_screen(Screen::Videos),
+                ElementId::TopLive => self.set_screen(Screen::Live),
                 ElementId::PlayHome => match launch_aqw() {
                     Ok(_) => {
-                        self.status = "AdventureQuest Worlds iniciado pelo Ruffle.".to_string();
+                        self.status = "AdventureQuest Worlds started through Ruffle.".to_string();
                     }
                     Err(error) => {
-                        self.status = "Falha ao iniciar o jogo.".to_string();
-                        show_error(hwnd, &format!("Nao foi possivel iniciar o AQW.\n\n{error}"));
+                        self.status = "Failed to start the game.".to_string();
+                        show_error(hwnd, &format!("Could not start AQW.\n\n{error}"));
                     }
                 },
                 ElementId::PlayDragonFable => match launch_dragon_fable() {
                     Ok(_) => {
-                        self.status = "DragonFable iniciado pelo Ruffle.".to_string();
+                        self.status = "DragonFable started through Ruffle.".to_string();
                     }
                     Err(error) => {
-                        self.status = "Falha ao iniciar DragonFable.".to_string();
-                        show_error(
-                            hwnd,
-                            &format!("Nao foi possivel iniciar DragonFable.\n\n{error}"),
-                        );
+                        self.status = "Failed to start DragonFable.".to_string();
+                        show_error(hwnd, &format!("Could not start DragonFable.\n\n{error}"));
                     }
                 },
                 ElementId::OpenDesignNotes => match open_design_notes(hwnd) {
                     Ok(_) => {
-                        self.status = "Design Notes aberto no navegador.".to_string();
+                        self.status = "Design Notes opened in your browser.".to_string();
                     }
                     Err(error) => {
-                        self.status = "Falha ao abrir Design Notes.".to_string();
-                        show_error(
-                            hwnd,
-                            &format!("Nao foi possivel abrir as Design Notes.\n\n{error}"),
-                        );
+                        self.status = "Failed to open Design Notes.".to_string();
+                        show_error(hwnd, &format!("Could not open Design Notes.\n\n{error}"));
                     }
                 },
+                ElementId::OpenMedia(index) => {
+                    if let Some(url) = self.media_url(index).map(|url| url.to_string()) {
+                        match open_url(hwnd, &url) {
+                            Ok(_) => {
+                                self.status = "Media opened in your browser.".to_string();
+                            }
+                            Err(error) => {
+                                self.status = "Failed to open media.".to_string();
+                                show_error(hwnd, &format!("Could not open media.\n\n{error}"));
+                            }
+                        }
+                    }
+                }
                 ElementId::FutureEpicDuel => {
                     self.status =
-                        "EpicDuel reservado para futura funcao de abertura/instalacao.".to_string();
+                        "EpicDuel support is reserved for a future launcher update.".to_string();
                 }
                 ElementId::FutureAdventureQuest => {
                     self.status =
-                        "AdventureQuest reservado para futura funcao de abertura/instalacao."
+                        "AdventureQuest support is reserved for a future launcher update."
                             .to_string();
                 }
                 ElementId::FutureMechQuest => {
-                    self.status = "MechQuest reservado para futura funcao de abertura/instalacao."
-                        .to_string();
+                    self.status =
+                        "MechQuest support is reserved for a future launcher update.".to_string();
                 }
             }
         }
@@ -963,76 +1387,78 @@ mod windows_launcher {
             }
 
             let layout = self.layout(self.width, self.height);
-            draw_text(
+            self.draw_top_nav_text(
                 hdc,
+                layout.top_games,
+                ElementId::TopGames,
                 "GAMES",
-                RectI {
-                    x: layout.nav_width + 20,
-                    y: 21,
-                    w: 78,
-                    h: 24,
-                },
-                13,
-                FW_BOLD as i32,
-                Color::rgb(255, 255, 255),
-                DT_LEFT | DT_TOP | DT_SINGLELINE,
+                matches!(self.screen, Screen::Home | Screen::Games),
             );
-            draw_text(
+            self.draw_top_nav_text(
                 hdc,
+                layout.top_news,
+                ElementId::TopNews,
                 "NEWS",
-                RectI {
-                    x: layout.nav_width + 92,
-                    y: 21,
-                    w: 68,
-                    h: 24,
-                },
-                13,
-                FW_BOLD as i32,
-                Color::rgb(210, 214, 224),
-                DT_LEFT | DT_TOP | DT_SINGLELINE,
+                self.screen == Screen::News,
             );
-            draw_text(
+            self.draw_top_nav_text(
                 hdc,
+                layout.top_videos,
+                ElementId::TopVideos,
                 "VIDEOS",
-                RectI {
-                    x: layout.nav_width + 154,
-                    y: 21,
-                    w: 82,
-                    h: 24,
-                },
-                13,
-                FW_BOLD as i32,
-                Color::rgb(210, 214, 224),
-                DT_LEFT | DT_TOP | DT_SINGLELINE,
+                self.screen == Screen::Videos,
             );
-            draw_text(
+            self.draw_top_nav_text(
                 hdc,
-                "STREAM",
-                RectI {
-                    x: layout.nav_width + 236,
-                    y: 21,
-                    w: 90,
-                    h: 24,
-                },
-                13,
-                FW_BOLD as i32,
-                Color::rgb(210, 214, 224),
-                DT_LEFT | DT_TOP | DT_SINGLELINE,
+                layout.top_live,
+                ElementId::TopLive,
+                "LIVE",
+                self.screen == Screen::Live,
             );
             self.draw_nav_text(hdc, layout.nav_home, "AQWorlds");
             self.draw_nav_text(hdc, layout.nav_games, "DragonFable");
-            self.draw_nav_text(hdc, layout.nav_help, "Support");
-            self.draw_static_sidebar_text(hdc, layout.nav_help.bottom(), "EpicDuel");
-            self.draw_static_sidebar_text(hdc, layout.nav_help.bottom() + 48, "AdventureQuest");
-            self.draw_static_sidebar_text(hdc, layout.nav_help.bottom() + 96, "MechQuest");
+            self.draw_static_sidebar_text(hdc, layout.nav_help.y, "EpicDuel");
+            self.draw_static_sidebar_text(hdc, layout.nav_games.bottom(), "AdventureQuest");
+            self.draw_static_sidebar_text(hdc, layout.nav_games.bottom() + 48, "MechQuest");
 
             self.draw_status_text(hdc, layout.right_panel);
 
             match self.screen {
                 Screen::Home => self.draw_home_text(hdc, layout),
                 Screen::Games => self.draw_games_text(hdc, layout),
-                Screen::Help => self.draw_help_text(hdc, layout),
+                Screen::News => self.draw_news_text(hdc, layout),
+                Screen::Videos => self.draw_videos_text(hdc, layout),
+                Screen::Live => self.draw_live_text(hdc, layout),
             }
+        }
+
+        fn draw_top_nav_text(
+            &self,
+            hdc: windows_sys::Win32::Graphics::Gdi::HDC,
+            rect: RectI,
+            id: ElementId,
+            text: &str,
+            selected: bool,
+        ) {
+            let active = selected || self.hovered == Some(id) || self.focused == id;
+            draw_text(
+                hdc,
+                text,
+                RectI {
+                    x: rect.x,
+                    y: rect.y + 1,
+                    w: rect.w,
+                    h: rect.h - 5,
+                },
+                13,
+                FW_BOLD as i32,
+                if active {
+                    Color::rgb(255, 247, 218)
+                } else {
+                    Color::rgb(216, 222, 234)
+                },
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
         }
 
         fn draw_nav_text(
@@ -1083,40 +1509,17 @@ mod windows_launcher {
         fn draw_home_text(&self, hdc: windows_sys::Win32::Graphics::Gdi::HDC, layout: Layout) {
             draw_text(
                 hdc,
-                "AdventureQuest Worlds",
+                "Flash MMORPG running through the bundled Ruffle build.",
                 RectI {
-                    x: layout.hero_card.x + 154,
-                    y: layout.hero_card.y + 66,
-                    w: layout.hero_card.w - 210,
-                    h: 62,
+                    x: layout.play_home.right() + 20,
+                    y: layout.play_home.y + layout.play_home.h / 2 - 12,
+                    w: layout.hero_card.right() - layout.play_home.right() - 44,
+                    h: 28,
                 },
-                34,
-                FW_BOLD as i32,
-                Color::rgb(255, 238, 160),
-                DT_LEFT | DT_TOP | DT_SINGLELINE,
-            );
-            draw_text(
-                hdc,
-                "MMORPG em Flash rodando pelo Ruffle embutido.",
-                RectI {
-                    x: layout.hero_card.x + 156,
-                    y: layout.hero_card.y + 118,
-                    w: layout.hero_card.w - 230,
-                    h: 42,
-                },
-                16,
+                15,
                 FW_NORMAL as i32,
                 Color::rgb(216, 228, 245),
-                DT_LEFT | DT_TOP | DT_SINGLELINE,
-            );
-            draw_text(
-                hdc,
-                "Play",
-                layout.play_home,
-                26,
-                FW_BOLD as i32,
-                Color::rgb(255, 247, 218),
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE,
             );
             self.draw_design_notes_text(hdc, layout);
         }
@@ -1138,7 +1541,7 @@ mod windows_launcher {
             );
             draw_text(
                 hdc,
-                "Aventura classica da Artix pronta para jogar.",
+                "Classic Artix adventure ready to play.",
                 RectI {
                     x: layout.hero_card.x + 156,
                     y: layout.hero_card.y + 118,
@@ -1164,24 +1567,30 @@ mod windows_launcher {
                 hdc,
                 layout.dragon_fable_card,
                 "DragonFable",
-                "Jogar agora",
+                "Play now",
                 true,
             );
-            self.draw_game_slot_text(hdc, layout.epic_duel_card, "EpicDuel", "Em breve", false);
+            self.draw_game_slot_text(hdc, layout.epic_duel_card, "EpicDuel", "Coming soon", false);
             self.draw_game_slot_text(
                 hdc,
                 layout.adventure_quest_card,
                 "AdventureQuest",
-                "Em breve",
+                "Coming soon",
                 false,
             );
-            self.draw_game_slot_text(hdc, layout.mech_quest_card, "MechQuest", "Em breve", false);
+            self.draw_game_slot_text(
+                hdc,
+                layout.mech_quest_card,
+                "MechQuest",
+                "Coming soon",
+                false,
+            );
         }
 
-        fn draw_help_text(&self, hdc: windows_sys::Win32::Graphics::Gdi::HDC, layout: Layout) {
+        fn draw_news_text(&self, hdc: windows_sys::Win32::Graphics::Gdi::HDC, layout: Layout) {
             draw_text(
                 hdc,
-                "Como navegar",
+                "AQW News",
                 RectI {
                     x: layout.hero_card.x + 154,
                     y: layout.hero_card.y + 66,
@@ -1195,7 +1604,7 @@ mod windows_launcher {
             );
             draw_text(
                 hdc,
-                "Use mouse, Tab e Enter para navegar pelo launcher.",
+                "Official AdventureQuest Worlds updates and Design Notes.",
                 RectI {
                     x: layout.hero_card.x + 156,
                     y: layout.hero_card.y + 118,
@@ -1207,49 +1616,165 @@ mod windows_launcher {
                 Color::rgb(216, 228, 245),
                 DT_LEFT | DT_TOP | DT_SINGLELINE,
             );
-            let guide = [
-                (
-                    "1",
-                    "Inicio mostra o botao rapido para abrir o AdventureQuest Worlds.",
-                ),
-                (
-                    "2",
-                    "Jogos exibe AQW, DragonFable e espacos para outros titulos da Artix.",
-                ),
-                (
-                    "3",
-                    "Tab navega pelos cards; Enter ou Espaco ativa o item selecionado.",
-                ),
-            ];
-            for (index, (number, text)) in guide.iter().enumerate() {
-                let y = layout.game_card.y + 48 + index as i32 * 64;
+            self.draw_design_notes_text(hdc, layout);
+        }
+
+        fn draw_videos_text(&self, hdc: windows_sys::Win32::Graphics::Gdi::HDC, layout: Layout) {
+            draw_text(
+                hdc,
+                "AQW Videos",
+                RectI {
+                    x: layout.hero_card.x + 154,
+                    y: layout.hero_card.y + 66,
+                    w: layout.hero_card.w - 210,
+                    h: 62,
+                },
+                34,
+                FW_BOLD as i32,
+                Color::rgb(255, 238, 160),
+                DT_LEFT | DT_TOP | DT_SINGLELINE,
+            );
+            draw_text(
+                hdc,
+                "Watch the latest official AdventureQuest Worlds videos on YouTube.",
+                RectI {
+                    x: layout.hero_card.x + 156,
+                    y: layout.hero_card.y + 118,
+                    w: layout.hero_card.w - 230,
+                    h: 42,
+                },
+                16,
+                FW_NORMAL as i32,
+                Color::rgb(216, 228, 245),
+                DT_LEFT | DT_TOP | DT_SINGLELINE,
+            );
+            draw_text(
+                hdc,
+                "LATEST VIDEOS",
+                RectI {
+                    x: layout.game_card.x + 18,
+                    y: layout.game_card.y + 16,
+                    w: layout.game_card.w - 36,
+                    h: 28,
+                },
+                15,
+                FW_BOLD as i32,
+                Color::rgb(235, 242, 255),
+                DT_LEFT | DT_TOP | DT_SINGLELINE,
+            );
+            self.draw_media_card_texts(hdc, layout);
+        }
+
+        fn draw_live_text(&self, hdc: windows_sys::Win32::Graphics::Gdi::HDC, layout: Layout) {
+            draw_text(
+                hdc,
+                "AQW Live",
+                RectI {
+                    x: layout.hero_card.x + 154,
+                    y: layout.hero_card.y + 66,
+                    w: layout.hero_card.w - 210,
+                    h: 62,
+                },
+                34,
+                FW_BOLD as i32,
+                Color::rgb(255, 238, 160),
+                DT_LEFT | DT_TOP | DT_SINGLELINE,
+            );
+            draw_text(
+                hdc,
+                "Browse creators currently streaming AdventureQuest Worlds on Twitch.",
+                RectI {
+                    x: layout.hero_card.x + 156,
+                    y: layout.hero_card.y + 118,
+                    w: layout.hero_card.w - 230,
+                    h: 42,
+                },
+                16,
+                FW_NORMAL as i32,
+                Color::rgb(216, 228, 245),
+                DT_LEFT | DT_TOP | DT_SINGLELINE,
+            );
+            draw_text(
+                hdc,
+                "LIVE STREAMS",
+                RectI {
+                    x: layout.game_card.x + 18,
+                    y: layout.game_card.y + 16,
+                    w: layout.game_card.w - 36,
+                    h: 28,
+                },
+                15,
+                FW_BOLD as i32,
+                Color::rgb(235, 242, 255),
+                DT_LEFT | DT_TOP | DT_SINGLELINE,
+            );
+            self.draw_media_card_texts(hdc, layout);
+        }
+
+        fn draw_media_card_texts(
+            &self,
+            hdc: windows_sys::Win32::Graphics::Gdi::HDC,
+            layout: Layout,
+        ) {
+            let items = self.media_items_for_screen();
+            let cards = self.media_card_rects(layout, items.len().max(1));
+            for (index, rect) in cards.into_iter().enumerate() {
+                let item = items.get(index);
+                let thumb_h = ((rect.w - 16) * 9 / 16).min(rect.h - 96);
+                let label = match item.map(|item| item.source).unwrap_or(MediaSource::YouTube) {
+                    MediaSource::YouTube => "YOUTUBE",
+                    MediaSource::Twitch => "TWITCH",
+                };
                 draw_text(
                     hdc,
-                    number,
+                    label,
                     RectI {
-                        x: layout.game_card.x + 48,
-                        y,
-                        w: 36,
+                        x: rect.x + 18,
+                        y: rect.y + 8 + thumb_h - 21,
+                        w: rect.w - 36,
+                        h: 18,
+                    },
+                    10,
+                    FW_BOLD as i32,
+                    Color::rgb(255, 238, 174),
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                );
+
+                let (title, channel) = if let Some(item) = item {
+                    (item.title.as_str(), item.channel.as_str())
+                } else if self.screen == Screen::Live {
+                    ("Loading live channels...", "YouTube / Twitch")
+                } else {
+                    ("Loading latest videos...", "YouTube")
+                };
+
+                draw_text(
+                    hdc,
+                    title,
+                    RectI {
+                        x: rect.x + 14,
+                        y: rect.y + thumb_h + 18,
+                        w: rect.w - 28,
                         h: 44,
                     },
-                    24,
+                    15,
                     FW_BOLD as i32,
-                    Color::rgb(255, 216, 106),
-                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                    Color::rgb(255, 238, 174),
+                    DT_LEFT | DT_TOP | DT_WORDBREAK,
                 );
                 draw_text(
                     hdc,
-                    text,
+                    channel,
                     RectI {
-                        x: layout.game_card.x + 98,
-                        y: y + 4,
-                        w: layout.game_card.w - 132,
-                        h: 42,
+                        x: rect.x + 14,
+                        y: rect.bottom() - 30,
+                        w: rect.w - 28,
+                        h: 20,
                     },
-                    16,
+                    12,
                     FW_NORMAL as i32,
-                    Color::rgb(224, 234, 247),
-                    DT_LEFT | DT_VCENTER | DT_WORDBREAK,
+                    Color::rgb(198, 210, 230),
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE,
                 );
             }
         }
@@ -1421,7 +1946,7 @@ mod windows_launcher {
             );
             draw_text(
                 hdc,
-                "ABRIR PAGINA",
+                "OPEN PAGE",
                 layout.design_notes_button,
                 12,
                 FW_BOLD as i32,
@@ -1451,15 +1976,15 @@ mod windows_launcher {
             let items = [
                 (
                     "Latest Game Design Notes",
-                    "Novidades oficiais, eventos semanais e recompensas do AQW.",
+                    "Official AQW updates, weekly events, and reward notes.",
                 ),
                 (
                     "Updates, Events & Releases",
-                    "Esta area substitui os cards de outros jogos no AQWorlds.",
+                    "This area keeps AQWorlds news separate from the game cards.",
                 ),
                 (
                     "Official AQW News Page",
-                    "Abra o conteudo ao vivo diretamente no site oficial.",
+                    "Open the official news page directly in your browser.",
                 ),
             ];
             for (index, (title, body)) in items.iter().enumerate() {
@@ -1629,6 +2154,31 @@ mod windows_launcher {
             self.draw_image_scaled(image, dst, 0.0, 0.0, scale, opacity);
         }
 
+        fn draw_image_region_contain(
+            &mut self,
+            image: &Bitmap,
+            source: RectI,
+            rect: RectI,
+            opacity: u8,
+        ) {
+            if source.w <= 0 || source.h <= 0 {
+                return;
+            }
+
+            let scale = (rect.w as f32 / source.w as f32)
+                .min(rect.h as f32 / source.h as f32)
+                .max(0.01);
+            let draw_w = (source.w as f32 * scale) as i32;
+            let draw_h = (source.h as f32 * scale) as i32;
+            let dst = RectI {
+                x: rect.x + (rect.w - draw_w) / 2,
+                y: rect.y + (rect.h - draw_h) / 2,
+                w: draw_w,
+                h: draw_h,
+            };
+            self.draw_image_scaled(image, dst, source.x as f32, source.y as f32, scale, opacity);
+        }
+
         fn draw_image_scaled(
             &mut self,
             image: &Bitmap,
@@ -1729,9 +2279,271 @@ mod windows_launcher {
     }
 
     fn open_design_notes(hwnd: HWND) -> Result<(), String> {
+        open_url(hwnd, AQW_DESIGN_NOTES_URL)
+    }
+
+    fn build_media_items(entries: Vec<MediaEntry>) -> Vec<MediaItem> {
+        entries
+            .into_iter()
+            .map(|entry| {
+                let thumbnail = entry
+                    .thumbnail_url
+                    .as_deref()
+                    .and_then(|url| fetch_bitmap(url).ok())
+                    .map(Arc::new);
+                MediaItem {
+                    source: entry.source,
+                    title: entry.title,
+                    channel: entry.channel,
+                    url: entry.url,
+                    thumbnail,
+                }
+            })
+            .collect()
+    }
+
+    fn fetch_youtube_recent_entries(limit: usize) -> Result<Vec<MediaEntry>, String> {
+        let xml = fetch_text(AQW_YOUTUBE_FEED_URL)?;
+        let mut entries = Vec::new();
+        for chunk in xml.split("<entry>").skip(1).take(limit) {
+            let video_id = xml_tag(chunk, "yt:videoId").unwrap_or_default();
+            let title = xml_tag(chunk, "media:title")
+                .or_else(|| xml_tag(chunk, "title"))
+                .unwrap_or_else(|| "AdventureQuest Worlds video".to_string());
+            let channel =
+                xml_tag(chunk, "name").unwrap_or_else(|| "AdventureQuest Worlds".to_string());
+            let thumbnail_url = tag_attr(chunk, "media:thumbnail", "url").or_else(|| {
+                if video_id.is_empty() {
+                    None
+                } else {
+                    Some(format!("https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"))
+                }
+            });
+            let url = if video_id.is_empty() {
+                tag_attr(chunk, "link", "href")
+                    .unwrap_or_else(|| AQW_YOUTUBE_RECENT_URL.to_string())
+            } else {
+                format!("https://www.youtube.com/watch?v={video_id}")
+            };
+            entries.push(MediaEntry {
+                source: MediaSource::YouTube,
+                title,
+                channel,
+                url,
+                thumbnail_url,
+            });
+        }
+        if entries.is_empty() {
+            Err("YouTube feed did not return videos.".to_string())
+        } else {
+            Ok(entries)
+        }
+    }
+
+    fn fetch_youtube_live_entries() -> Result<Vec<MediaEntry>, String> {
+        let html = fetch_text(AQW_YOUTUBE_LIVE_URL)?;
+        let title = meta_content(&html, "og:title")
+            .or_else(|| json_string_field(&html, "title"))
+            .unwrap_or_else(|| "YouTube live channel".to_string());
+        let thumbnail_url =
+            meta_content(&html, "og:image").or_else(|| json_string_field(&html, "thumbnailUrl"));
+        let url = meta_content(&html, "og:url").unwrap_or_else(|| AQW_YOUTUBE_LIVE_URL.to_string());
+        let channel = json_string_field(&html, "ownerChannelName")
+            .or_else(|| json_string_field(&html, "author"))
+            .unwrap_or_else(|| "AdventureQuest Worlds".to_string());
+
+        Ok(vec![MediaEntry {
+            source: MediaSource::YouTube,
+            title,
+            channel,
+            url,
+            thumbnail_url,
+        }])
+    }
+
+    fn fetch_twitch_live_entries(limit: usize) -> Result<Vec<MediaEntry>, String> {
+        let html = fetch_text(AQW_TWITCH_DIRECTORY_URL)?;
+        let mut entries = Vec::new();
+        let mut rest = html.as_str();
+        while entries.len() < limit {
+            let Some(position) = rest
+                .find("previewImageURL")
+                .or_else(|| rest.find("thumbnailURL"))
+            else {
+                break;
+            };
+            let chunk_start = position.saturating_sub(2200);
+            let chunk_end = (position + 2600).min(rest.len());
+            let chunk = &rest[chunk_start..chunk_end];
+            let title = json_string_field(chunk, "title")
+                .or_else(|| json_string_field(chunk, "streamTitle"))
+                .unwrap_or_else(|| "AdventureQuest Worlds live stream".to_string());
+            let channel = json_string_field(chunk, "displayName")
+                .or_else(|| json_string_field(chunk, "login"))
+                .unwrap_or_else(|| "Twitch channel".to_string());
+            let thumbnail_url = json_string_field(chunk, "previewImageURL")
+                .or_else(|| json_string_field(chunk, "thumbnailURL"))
+                .map(|url| url.replace("{width}", "640").replace("{height}", "360"));
+            let login = json_string_field(chunk, "login").unwrap_or_else(|| channel.clone());
+            let url = format!("https://www.twitch.tv/{login}");
+            if !entries.iter().any(|entry: &MediaEntry| entry.url == url) {
+                entries.push(MediaEntry {
+                    source: MediaSource::Twitch,
+                    title,
+                    channel,
+                    url,
+                    thumbnail_url,
+                });
+            }
+            rest = &rest[position + 1..];
+        }
+        if entries.is_empty() {
+            Err("Twitch page did not expose stream cards.".to_string())
+        } else {
+            Ok(entries)
+        }
+    }
+
+    fn fetch_bitmap(url: &str) -> Result<Bitmap, String> {
+        let bytes = fetch_bytes(url)?;
+        Bitmap::from_memory(&bytes).ok_or_else(|| "Could not decode thumbnail.".to_string())
+    }
+
+    fn fetch_text(url: &str) -> Result<String, String> {
+        let script = format!(
+            "$ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; (Invoke-WebRequest -UseBasicParsing -TimeoutSec 10 -Uri {} -Headers @{{'User-Agent'='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AELauncher'}}).Content",
+            ps_quote(url)
+        );
+        let output = Command::new("powershell")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                &script,
+            ])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
+        let temp_dir = std::env::temp_dir().join("AELauncher-media");
+        fs::create_dir_all(&temp_dir).map_err(|error| error.to_string())?;
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_millis();
+        let path = temp_dir.join(format!("thumb-{stamp}.bin"));
+        let script = format!(
+            "$ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -UseBasicParsing -TimeoutSec 10 -Uri {} -OutFile {} -Headers @{{'User-Agent'='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AELauncher'}}",
+            ps_quote(url),
+            ps_quote(&path.to_string_lossy())
+        );
+        let output = Command::new("powershell")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                &script,
+            ])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+        let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+        let _ = fs::remove_file(path);
+        Ok(bytes)
+    }
+
+    fn xml_tag(content: &str, tag: &str) -> Option<String> {
+        extract_between(content, &format!("<{tag}>"), &format!("</{tag}>"))
+            .map(|value| html_decode(value.trim()))
+    }
+
+    fn tag_attr(content: &str, tag: &str, attr: &str) -> Option<String> {
+        let tag_position = content.find(tag)?;
+        let tag_end = content[tag_position..].find('>')? + tag_position;
+        attr_value(&content[tag_position..tag_end], attr).map(|value| html_decode(&value))
+    }
+
+    fn meta_content(content: &str, property: &str) -> Option<String> {
+        let marker = format!("property=\"{property}\"");
+        let position = content.find(&marker)?;
+        let start = position.saturating_sub(120);
+        let end = (position + 420).min(content.len());
+        attr_value(&content[start..end], "content").map(|value| html_decode(&value))
+    }
+
+    fn attr_value(content: &str, attr: &str) -> Option<String> {
+        let marker = format!("{attr}=\"");
+        let start = content.find(&marker)? + marker.len();
+        let end = content[start..].find('"')? + start;
+        Some(content[start..end].to_string())
+    }
+
+    fn extract_between<'a>(content: &'a str, start: &str, end: &str) -> Option<&'a str> {
+        let start_position = content.find(start)? + start.len();
+        let end_position = content[start_position..].find(end)? + start_position;
+        Some(&content[start_position..end_position])
+    }
+
+    fn json_string_field(content: &str, field: &str) -> Option<String> {
+        let marker = format!("\"{field}\":\"");
+        let start = content.find(&marker)? + marker.len();
+        let mut value = String::new();
+        let mut escaped = false;
+        for character in content[start..].chars() {
+            if escaped {
+                value.push(match character {
+                    'n' => '\n',
+                    't' => '\t',
+                    '"' => '"',
+                    '\\' => '\\',
+                    '/' => '/',
+                    other => other,
+                });
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                break;
+            } else {
+                value.push(character);
+            }
+        }
+        if value.is_empty() {
+            None
+        } else {
+            Some(html_decode(&value))
+        }
+    }
+
+    fn html_decode(value: &str) -> String {
+        value
+            .replace("&amp;", "&")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&apos;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+    }
+
+    fn ps_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+
+    fn open_url(hwnd: HWND, url: &str) -> Result<(), String> {
         unsafe {
             let operation = wide("open");
-            let url = wide(AQW_DESIGN_NOTES_URL);
+            let url = wide(url);
             let result = ShellExecuteW(
                 hwnd,
                 operation.as_ptr(),
@@ -1900,7 +2712,7 @@ mod windows_launcher {
             );
 
             if hwnd.is_null() {
-                show_error(null_mut(), "Nao foi possivel criar a janela do launcher.");
+                show_error(null_mut(), "Could not create the launcher window.");
                 return;
             }
 

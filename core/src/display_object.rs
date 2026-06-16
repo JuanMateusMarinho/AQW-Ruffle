@@ -117,10 +117,15 @@ pub struct BitmapCache {
 
 const MAX_CACHE_BITMAP_DIMENSION: u32 = 4096;
 const MAX_CACHE_BITMAP_PIXELS: u32 = 2_500_000;
+const MAX_AQW_CACHE_BITMAP_PIXELS: u32 = 8_000_000;
 
 fn aqw_diagnostics_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
+}
+
+fn is_aqw_movie_url(url: &str) -> bool {
+    url.contains("/game/gamefiles/")
 }
 
 impl BitmapCache {
@@ -154,6 +159,7 @@ impl BitmapCache {
         actual_height: u32,
         draw_offset: Point<i32>,
         swf_version: u8,
+        allow_aqw_large_cache: bool,
     ) {
         self.matrix_a = matrix.a;
         self.matrix_b = matrix.b;
@@ -177,7 +183,16 @@ impl BitmapCache {
         let practical_acceptable_size = actual_width <= MAX_CACHE_BITMAP_DIMENSION
             && actual_height <= MAX_CACHE_BITMAP_DIMENSION
             && total_pixels <= MAX_CACHE_BITMAP_PIXELS;
-        let acceptable_size = flash_acceptable_size && practical_acceptable_size;
+        let aqw_practical_acceptable_size = allow_aqw_large_cache
+            && actual_width <= MAX_CACHE_BITMAP_DIMENSION
+            && actual_height <= MAX_CACHE_BITMAP_DIMENSION
+            && total_pixels <= MAX_AQW_CACHE_BITMAP_PIXELS;
+        let aqw_flash_acceptable_size = allow_aqw_large_cache
+            && actual_width < 8191
+            && actual_height < 8191
+            && total_pixels < 16777215;
+        let acceptable_size = (flash_acceptable_size && practical_acceptable_size)
+            || (aqw_flash_acceptable_size && aqw_practical_acceptable_size);
 
         if aqw_diagnostics_enabled() && !acceptable_size && !self.warned_for_oversize {
             tracing::warn!(
@@ -189,9 +204,26 @@ impl BitmapCache {
                 total_pixels,
                 flash_acceptable_size,
                 practical_acceptable_size,
+                aqw_flash_acceptable_size,
+                aqw_practical_acceptable_size,
                 "Skipping bitmap cache allocation"
             );
             self.warned_for_oversize = true;
+        }
+
+        if aqw_diagnostics_enabled()
+            && acceptable_size
+            && !(flash_acceptable_size && practical_acceptable_size)
+        {
+            tracing::info!(
+                target: "aqw_diag",
+                source_width,
+                source_height,
+                actual_width,
+                actual_height,
+                total_pixels,
+                "Allowing larger AQW bitmap cache allocation"
+            );
         }
 
         if renderer.is_offscreen_supported()
@@ -1042,6 +1074,7 @@ pub fn render_base<'gc>(
     let cache_info = if context.use_bitmap_cache && this.is_bitmap_cached() {
         let mut cache_info: Option<DrawCacheInfo> = None;
         let base_transform = context.transform_stack.transform();
+        let allow_aqw_large_cache = is_aqw_movie_url(this.movie().url());
         let bounds: Rectangle<Twips> = this.render_bounds_with_transform(
             &base_transform.matrix,
             false, // we want to do the filter growth for this object ourselves, to know the offsets
@@ -1087,6 +1120,7 @@ pub fn render_base<'gc>(
                         filter_rect.height() as u32,
                         draw_offset,
                         swf_version,
+                        allow_aqw_large_cache,
                     );
                     cache_info = cache.handle().map(|handle| DrawCacheInfo {
                         handle,

@@ -63,6 +63,37 @@ fn aqw_diagnostics_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
 }
 
+fn is_aqw_empty_asset_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    if trimmed.eq_ignore_ascii_case("none") {
+        return true;
+    }
+
+    let Ok(parsed) = Url::parse(trimmed) else {
+        return false;
+    };
+
+    let host_matches = parsed
+        .host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("game.aq.com"));
+    let path_matches = parsed.path().contains("/game/gamefiles/")
+        && parsed
+            .path_segments()
+            .and_then(|segments| segments.filter(|segment| !segment.is_empty()).last())
+            .is_some_and(|segment| segment.eq_ignore_ascii_case("none"));
+
+    host_matches && path_matches
+}
+
+fn empty_placeholder_swf_bytes(version: u8) -> Result<Vec<u8>, Error> {
+    let mut header = swf::Header::default_with_swf_version(version);
+    header.num_frames = 1;
+
+    let mut bytes = Vec::new();
+    swf::write_swf(&header, &[swf::Tag::ShowFrame], &mut bytes)?;
+    Ok(bytes)
+}
+
 /// How Ruffle should load movies.
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -735,8 +766,18 @@ impl<'gc> MovieLoader<'gc> {
         Box::pin(async move {
             let request_url = request.url().to_string();
             let resolved_url = player.lock().unwrap().navigator().resolve_url(&request_url);
+            let empty_asset_url = resolved_url
+                .as_ref()
+                .ok()
+                .filter(|url| is_aqw_empty_asset_url(url.as_str()))
+                .map(|url| url.to_string())
+                .or_else(|| is_aqw_empty_asset_url(&request_url).then(|| request_url.clone()));
 
-            let fetch = player.lock().unwrap().fetch(request, FetchReason::LoadSwf);
+            let fetch = if empty_asset_url.is_none() {
+                Some(player.lock().unwrap().fetch(request, FetchReason::LoadSwf))
+            } else {
+                None
+            };
 
             let mut replacing_root_movie = false;
             player.lock().unwrap().update(|uc| -> Result<(), Error> {
@@ -786,7 +827,14 @@ impl<'gc> MovieLoader<'gc> {
                 MovieLoader::movie_loader_start(handle, uc)
             })?;
 
-            let response = wait_for_full_response(fetch).await;
+            if let Some(url) = empty_asset_url {
+                let player = player.lock().unwrap();
+                Self::on_empty_placeholder(player, handle, loader_url, url)?;
+                return Ok(());
+            }
+
+            let response =
+                wait_for_full_response(fetch.expect("fetch is set for non-empty loads")).await;
             let player = player.lock().unwrap();
             match response {
                 Ok((body, url, status, redirected)) if replacing_root_movie => {
@@ -798,7 +846,7 @@ impl<'gc> MovieLoader<'gc> {
                     Self::on_success(player, handle, loader_url, body, url, status, redirected)?;
                 }
                 Err(response) => {
-                    Self::on_error(player, handle, response)?;
+                    Self::on_error(player, handle, loader_url, response)?;
                 }
             }
 
@@ -888,9 +936,32 @@ impl<'gc> MovieLoader<'gc> {
         Ok(())
     }
 
+    fn on_empty_placeholder(
+        mut player: MutexGuard<'_, Player>,
+        handle: LoaderHandle,
+        loader_url: Option<String>,
+        url: String,
+    ) -> Result<(), Error> {
+        player.mutate_with_update_context(|uc| {
+            if aqw_diagnostics_enabled() {
+                tracing::info!(
+                    target: "aqw_diag",
+                    ?handle,
+                    url = %url,
+                    "Completing empty AQW asset load with placeholder SWF"
+                );
+            }
+
+            let body = empty_placeholder_swf_bytes(uc.root_swf.version())?;
+            MovieLoader::movie_loader_data(handle, uc, &body, url, 200, false, loader_url)
+        })?;
+        Ok(())
+    }
+
     fn on_error(
         mut player: MutexGuard<'_, Player>,
         handle: LoaderHandle,
+        loader_url: Option<String>,
         response: ErrorResponse,
     ) -> Result<(), Error> {
         tracing::error!(
@@ -898,6 +969,11 @@ impl<'gc> MovieLoader<'gc> {
             response.url,
             response.error
         );
+
+        if is_aqw_empty_asset_url(&response.url) {
+            return Self::on_empty_placeholder(player, handle, loader_url, response.url);
+        }
+
         player.update(|uc| -> Result<(), Error> {
             // FIXME - match Flash's error message
 
@@ -2306,6 +2382,7 @@ impl<'gc> MovieLoader<'gc> {
                 }
             }
             MovieLoaderVMData::Avm2 { loader_info, .. } => {
+                loader_info.set_is_loading(false);
                 let mut activation = Avm2Activation::from_nothing(uc);
 
                 let http_status_evt =

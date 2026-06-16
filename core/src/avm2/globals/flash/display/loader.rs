@@ -106,6 +106,7 @@ pub fn load<'gc>(
         ),
         activation.gc(),
     );
+    loader_info.set_is_loading(true);
 
     let request = request_from_url_request(activation, url_request)?;
 
@@ -272,6 +273,16 @@ pub fn load_bytes<'gc>(
         .caller_domain()
         .expect("Missing caller domain in Loader.loadBytes");
 
+    loader_info.set_loader_stream(
+        LoaderStream::NotYetLoaded(
+            Arc::new(SwfMovie::empty(movie.version(), Some(movie.url().into()))),
+            Some(content.into()),
+            false,
+        ),
+        activation.gc(),
+    );
+    loader_info.set_is_loading(true);
+
     if let Err(e) = LoadManager::load_movie_into_clip_bytes(
         activation.context,
         content.into(),
@@ -282,10 +293,48 @@ pub fn load_bytes<'gc>(
             default_domain,
         },
     ) {
+        loader_info.set_is_loading(false);
         return Err(Error::rust_error(
             format!("Error in Loader.loadBytes: {e:?}").into(),
         ));
     }
+
+    Ok(Value::Undefined)
+}
+
+pub fn close<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    this: Value<'gc>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    let this_obj = this.as_object().unwrap();
+
+    let loader_info_val = this_obj.get_slot(loader_slots::_CONTENT_LOADER_INFO);
+    let loader_info_obj = match loader_info_val.as_object() {
+        Some(obj) => obj,
+        None => return Ok(Value::Undefined),
+    };
+    let loader_info = match loader_info_obj.as_loader_info_object() {
+        Some(li) => li,
+        None => return Ok(Value::Undefined),
+    };
+
+    let current_content = {
+        let loader_stream = loader_info.loader_stream();
+        match &*loader_stream {
+            LoaderStream::NotYetLoaded(_, content, _) => *content,
+            LoaderStream::Swf(_, content) => Some(*content),
+        }
+    };
+
+    if let Some(content) = current_content {
+        activation
+            .context
+            .load_manager
+            .cancel_load_for_target(content);
+    }
+
+    loader_info.set_is_loading(false);
 
     Ok(Value::Undefined)
 }
