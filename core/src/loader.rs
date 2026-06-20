@@ -85,6 +85,17 @@ fn is_aqw_empty_asset_url(url: &str) -> bool {
     host_matches && path_matches
 }
 
+fn is_aqw_gamefile_url(url: &str) -> bool {
+    let Ok(parsed) = Url::parse(url.trim()) else {
+        return false;
+    };
+
+    parsed
+        .host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("game.aq.com"))
+        && parsed.path().contains("/game/gamefiles/")
+}
+
 fn empty_placeholder_swf_bytes(version: u8) -> Result<Vec<u8>, Error> {
     let mut header = swf::Header::default_with_swf_version(version);
     header.num_frames = 1;
@@ -1937,11 +1948,16 @@ impl<'gc> MovieLoader<'gc> {
                     }
                 }
 
-                // NOTE: Certain tests specifically expect small files to preload immediately
+                // NOTE: Certain tests specifically expect small files to preload immediately.
+                // AQW can enqueue many small player asset SWFs at once in crowded maps; letting
+                // every one of them preload without a budget from network task callbacks can
+                // monopolize the window thread until the burst finishes.
                 if !from_bytes {
                     let mut immediate_limit;
                     let mut bounded_limit;
-                    let preload_limit = if data.len() <= IMMEDIATE_PRELOAD_BYTE_LIMIT {
+                    let should_preload_immediately =
+                        data.len() <= IMMEDIATE_PRELOAD_BYTE_LIMIT && !is_aqw_gamefile_url(&url);
+                    let preload_limit = if should_preload_immediately {
                         immediate_limit = ExecutionLimit::none();
                         &mut immediate_limit
                     } else {
