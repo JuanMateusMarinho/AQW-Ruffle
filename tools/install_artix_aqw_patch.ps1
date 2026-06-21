@@ -17,13 +17,18 @@ if (-not $OutputDir) {
 
 $resourcesPath = Join-Path $ArtixLauncherPath "resources"
 $sourceAsar = Join-Path $resourcesPath "app.asar"
+$sourcePreload = Join-Path $resourcesPath "preload.js"
 $patchedAsar = Join-Path $OutputDir "app.asar"
+$patchedPreload = Join-Path $OutputDir "preload.js"
 
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
     throw "Node.js is required to patch app.asar."
 }
 if (-not (Test-Path -LiteralPath $sourceAsar)) {
     throw "Could not find Artix launcher app.asar at $sourceAsar"
+}
+if (-not (Test-Path -LiteralPath $sourcePreload)) {
+    throw "Could not find Artix launcher preload.js at $sourcePreload"
 }
 if (-not (Test-Path -LiteralPath $AqwExePath)) {
     throw "Could not find AQW.exe at $AqwExePath"
@@ -65,6 +70,198 @@ function readOriginalFile(entry) {
 const files = collectFiles({ files: header.files });
 const contents = new Map(files.map((file) => [file.path, readOriginalFile(file.entry)]));
 let main = contents.get("main.js").toString("utf8");
+
+let aqTubePatch = String.raw`
+app.openAqTubeWindow = () => {
+	const { BrowserView } = require('electron');
+	const channelUrl = 'https://www.youtube.com/channel/UC0vYUqgESNR3sqEPiJ4SpeA?hl=en&gl=US';
+	const toolbarHeight = 48;
+
+	if (app.aqTubeWindow && !app.aqTubeWindow.isDestroyed()) {
+		app.aqTubeWindow.show();
+		app.aqTubeWindow.focus();
+		app.aqTubeWindow.maximize();
+		return;
+	}
+
+	const html = [
+		'<!doctype html><html><head><meta charset="utf-8">',
+		'<title>AQTUBE</title>',
+		'<style>',
+		'html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#050505;color:#f5d09a;font-family:Arial,sans-serif;}',
+		'.toolbar{height:48px;display:flex;align-items:center;gap:8px;padding:0 12px;background:linear-gradient(#211208,#070402);border-bottom:1px solid #7f3908;box-sizing:border-box;}',
+		'.brand{font-weight:700;color:#fff;margin-right:8px;text-shadow:0 1px 2px #000;}',
+		'button{height:30px;padding:0 12px;border:1px solid #6e4214;background:linear-gradient(#4a2b12,#170c06);color:#ffd7a0;font-weight:700;font-size:12px;cursor:pointer;text-transform:uppercase;}',
+		'button:hover{border-color:#c56b16;color:#fff;}',
+		'.spacer{flex:1;}',
+		'</style></head><body>',
+		'<div class="toolbar"><span class="brand">AQTUBE</span><button id="back">Back</button><button id="home">Channel</button><span class="spacer"></span><button id="open">Open Window</button></div>',
+		'<script>',
+		'const app=require("electron").remote.app;',
+		'document.getElementById("back").addEventListener("click",()=>app.aqTubeGoBack());',
+		'document.getElementById("home").addEventListener("click",()=>app.aqTubeGoHome());',
+		'document.getElementById("open").addEventListener("click",()=>app.aqTubeOpenCurrent());',
+		'</script>',
+		'</body></html>'
+	].join('');
+
+	app.aqTubeWindow = new BrowserWindow({
+		title: 'AQTUBE',
+		width: 1280,
+		height: 820,
+		minWidth: 960,
+		minHeight: 640,
+		backgroundColor: '#000000',
+		show: false,
+		resizable: true,
+		useContentSize: true,
+		autoHideMenuBar: true,
+		webPreferences: {
+			nodeIntegration: true,
+			contextIsolation: false,
+			devTools: false
+		}
+	});
+
+	app.aqTubeView = new BrowserView({
+		webPreferences: {
+			nodeIntegration: false,
+			contextIsolation: true,
+			devTools: false,
+			partition: 'persist:artix-aqtube-window-en'
+		}
+	});
+
+	const layoutAqTubeView = () => {
+		if (!app.aqTubeWindow || app.aqTubeWindow.isDestroyed() || !app.aqTubeView) {
+			return;
+		}
+		const size = app.aqTubeWindow.getContentSize();
+		app.aqTubeView.setBounds({
+			x: 0,
+			y: toolbarHeight,
+			width: size[0],
+			height: Math.max(120, size[1] - toolbarHeight)
+		});
+		if (app.aqTubeView.setAutoResize) {
+			app.aqTubeView.setAutoResize({ width: true, height: true });
+		}
+	};
+
+	const loadAqTubeHome = () => {
+		if (app.aqTubeView && app.aqTubeView.webContents) {
+			app.aqTubeView.webContents.loadURL(channelUrl, {
+				extraHeaders: 'Accept-Language: en-US,en;q=0.9\n'
+			});
+		}
+	};
+
+	app.aqTubeWindow.setBrowserView(app.aqTubeView);
+	app.aqTubeWindow.on('resize', layoutAqTubeView);
+	app.aqTubeWindow.on('maximize', layoutAqTubeView);
+	app.aqTubeWindow.on('unmaximize', layoutAqTubeView);
+	app.aqTubeWindow.on('closed', () => {
+		app.aqTubeWindow = null;
+		app.aqTubeView = null;
+	});
+
+	app.aqTubeGoBack = () => {
+		if (app.aqTubeView && app.aqTubeView.webContents && app.aqTubeView.webContents.canGoBack()) {
+			app.aqTubeView.webContents.goBack();
+			return;
+		}
+		loadAqTubeHome();
+	};
+	app.aqTubeGoHome = loadAqTubeHome;
+	app.aqTubeOpenCurrent = () => {
+		const url = app.aqTubeView && app.aqTubeView.webContents ? app.aqTubeView.webContents.getURL() : channelUrl;
+		app.launchNewWindowURL(url || channelUrl, 1180, 760, true);
+	};
+
+	app.aqTubeView.webContents.on('new-window', (event, url) => {
+		if (!url) {
+			return;
+		}
+		event.preventDefault();
+		app.launchNewWindowURL(url, 1180, 760, true);
+	});
+
+	app.aqTubeWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
+	app.aqTubeWindow.once('ready-to-show', () => {
+		layoutAqTubeView();
+		app.aqTubeWindow.show();
+		app.aqTubeWindow.maximize();
+	});
+	loadAqTubeHome();
+};
+
+app.injectAqTubeTab = () => {
+	if (!mainWindow || !mainWindow.webContents || mainWindow.isDestroyed()) {
+		return;
+	}
+
+	const script = String.raw` + "`" + `
+(() => {
+	function findTopNav() {
+		return document.getElementById('topnav')
+			|| document.querySelector('ul.topnav')
+			|| document.querySelector('.topnav ul')
+			|| document.querySelector('nav ul')
+			|| document.querySelector('ul');
+	}
+
+	if (document.getElementById('aqtube-nav-item')) {
+		return;
+	}
+
+	const nav = findTopNav();
+	const navItem = document.createElement(nav && nav.tagName === 'UL' ? 'li' : 'span');
+	navItem.id = 'aqtube-nav-item';
+	navItem.style.cssText = 'display:inline-block;vertical-align:top;background:linear-gradient(#3d1f09,#140805);';
+
+	const link = document.createElement('a');
+	link.href = '#aqtube';
+	link.textContent = 'AQTUBE';
+	link.title = 'AQTubers';
+	link.style.cssText = [
+		'display:block',
+		'height:44px',
+		'line-height:44px',
+		'padding:0 13px',
+		'color:#f4e0bd',
+		'font:700 15px Georgia,serif',
+		'letter-spacing:0',
+		'text-decoration:none',
+		'text-shadow:0 1px 2px #000',
+		'box-shadow:inset 0 -2px 0 #f08219'
+	].join(';');
+
+	link.addEventListener('click', (event) => {
+		event.preventDefault();
+		event.stopPropagation();
+		if (window.interop && window.interop.openAqTubeWindow) {
+			window.interop.openAqTubeWindow();
+			return;
+		}
+		window.open('https://www.youtube.com/channel/UC0vYUqgESNR3sqEPiJ4SpeA', 'aqtube-window', 'top=90,left=80,width=1180,height=760');
+	});
+
+	navItem.appendChild(link);
+	if (nav) {
+		nav.appendChild(navItem);
+	} else {
+		navItem.style.cssText += 'position:fixed;z-index:2147483001;top:29px;left:442px;';
+		document.body.appendChild(navItem);
+	}
+})();
+` + "`" + `;
+
+	mainWindow.webContents.executeJavaScript(script).catch((error) => {
+		devToolsLog('AQTUBE injection failed: ' + error.message);
+	});
+};
+
+`;
 
 const insertBefore = "app.launchGameLocal = (gameName) => {";
 const aqwLauncher = String.raw`
@@ -121,6 +318,24 @@ if (!main.includes("app.launchAQWExe = () =>")) {
   main = main.replace(insertBefore, aqwLauncher + insertBefore);
 }
 
+if (!main.includes("app.injectAqTubeTab = () =>")) {
+  if (!main.includes(insertBefore)) {
+    throw new Error("Could not find AQTUBE insertion point");
+  }
+  main = main.replace(insertBefore, aqTubePatch + insertBefore);
+}
+
+if (!main.includes("app.injectAqTubeTab();")) {
+  main = main.replace(
+    "mainWindow = win;",
+    "mainWindow = win;\r\n\r\n\tmainWindow.webContents.on('dom-ready', () => {\r\n\t\tapp.injectAqTubeTab();\r\n\t});"
+  );
+  main = main.replace(
+    "mainWindow.show();\r\n\t});",
+    "mainWindow.show();\r\n\t\tapp.injectAqTubeTab();\r\n\t});"
+  );
+}
+
 if (!main.includes("if (gameName === 'aqw')")) {
   const localStartRegex = /app\.launchGameLocal = \(gameName\) => \{\r?\n\tif\(gameWindows\[gameName\] == undefined\)\{/;
   if (!localStartRegex.test(main)) {
@@ -164,7 +379,22 @@ $nodeScriptPath = Join-Path $OutputDir "patch-artix-asar.js"
 Set-Content -LiteralPath $nodeScriptPath -Value $nodeScript -Encoding UTF8
 node $nodeScriptPath $sourceAsar $patchedAsar
 
+$preload = Get-Content -LiteralPath $sourcePreload -Raw
+if ($preload -notmatch "openAqTubeWindow") {
+    $preload = $preload.TrimEnd() + @'
+
+if (window.interop) {
+    window.interop.openAqTubeWindow = function () {
+        const { remote } = require('electron');
+        remote.app.openAqTubeWindow();
+    };
+}
+'@
+}
+Set-Content -LiteralPath $patchedPreload -Value $preload -Encoding UTF8
+
 Write-Host "Patched ASAR written to $patchedAsar"
+Write-Host "Patched preload written to $patchedPreload"
 
 if ($Install) {
     $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -185,14 +415,18 @@ if ($Install) {
 
     $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
     $backupAsar = Join-Path $resourcesPath "app.asar.bak-aqw-test-$stamp"
+    $backupPreload = Join-Path $resourcesPath "preload.js.bak-aqw-test-$stamp"
     $binDir = Join-Path $resourcesPath "bin"
 
     Copy-Item -LiteralPath $sourceAsar -Destination $backupAsar -Force
+    Copy-Item -LiteralPath $sourcePreload -Destination $backupPreload -Force
     New-Item -ItemType Directory -Path $binDir -Force | Out-Null
     Copy-Item -LiteralPath $AqwExePath -Destination (Join-Path $binDir "AQW.exe") -Force
     Copy-Item -LiteralPath $patchedAsar -Destination $sourceAsar -Force
+    Copy-Item -LiteralPath $patchedPreload -Destination $sourcePreload -Force
 
     Write-Host "Installed patched ASAR."
     Write-Host "Backup: $backupAsar"
+    Write-Host "Preload backup: $backupPreload"
     Write-Host "AQW.exe: $(Join-Path $binDir 'AQW.exe')"
 }
