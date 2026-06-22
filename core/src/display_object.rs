@@ -1043,6 +1043,9 @@ struct DrawCacheInfo {
     filters: Vec<Filter>,
 }
 
+const AQW_OFFSCREEN_CACHE_CULL_MIN_PIXELS: f64 = 512.0 * 512.0;
+const AQW_OFFSCREEN_CACHE_CULL_MIN_SIDE: f64 = 1024.0;
+
 fn should_cull_offscreen_bitmap_cache<'gc>(
     this: DisplayObject<'gc>,
     context: &RenderContext<'_, 'gc>,
@@ -1068,7 +1071,16 @@ fn should_cull_offscreen_bitmap_cache<'gc>(
         return false;
     }
 
-    bounds.is_valid() && !bounds.intersects(&context.stage.view_bounds())
+    if !bounds.is_valid() || bounds.intersects(&context.stage.view_bounds()) {
+        return false;
+    }
+
+    let width = bounds.width().to_pixels().ceil().max(0.0);
+    let height = bounds.height().to_pixels().ceil().max(0.0);
+
+    width * height >= AQW_OFFSCREEN_CACHE_CULL_MIN_PIXELS
+        || width >= AQW_OFFSCREEN_CACHE_CULL_MIN_SIDE
+        || height >= AQW_OFFSCREEN_CACHE_CULL_MIN_SIDE
 }
 
 pub fn render_base<'gc>(
