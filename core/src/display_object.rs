@@ -1043,6 +1043,34 @@ struct DrawCacheInfo {
     filters: Vec<Filter>,
 }
 
+fn should_cull_offscreen_bitmap_cache<'gc>(
+    this: DisplayObject<'gc>,
+    context: &RenderContext<'_, 'gc>,
+    options: &RenderOptions,
+    bounds: &Rectangle<Twips>,
+    filters: &[Filter],
+) -> bool {
+    if context.is_offscreen
+        || context.commands.drawing_mask()
+        || !options.skip_masks
+        || this.is_root()
+        || this.clip_depth() > 0
+        || this.maskee().is_some()
+        || this.masker().is_some()
+        || this.scroll_rect().is_some()
+        || this.opaque_background().is_some()
+        || this.blend_mode() != ExtendedBlendMode::Normal
+    {
+        return false;
+    }
+
+    if !filters.is_empty() {
+        return false;
+    }
+
+    bounds.is_valid() && !bounds.intersects(&context.stage.view_bounds())
+}
+
 pub fn render_base<'gc>(
     this: DisplayObject<'gc>,
     context: &mut RenderContext<'_, 'gc>,
@@ -1084,6 +1112,13 @@ pub fn render_base<'gc>(
         let mut filters: Vec<Filter> = this.filters().to_owned();
         let swf_version = this.swf_version();
         filters.retain(|f| !f.impotent());
+
+        if should_cull_offscreen_bitmap_cache(this, context, &options, &bounds, &filters) {
+            if options.apply_transform {
+                context.transform_stack.pop();
+            }
+            return;
+        }
 
         if let Some(cache) = &mut *this.base().bitmap_cache_mut() {
             let width = bounds.width().to_pixels().ceil().max(0.0);

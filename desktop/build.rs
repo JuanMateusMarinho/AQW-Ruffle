@@ -69,8 +69,14 @@ fn set_windows_resource() -> Result<(), Box<dyn Error>> {
 
     // Set the application icon
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
-    let icon_path = format!("{manifest_dir}/assets/favicon.ico");
+    let icon_file = if env::var_os("ARTIX_AQW_WINDOW_ICON").is_some() {
+        "aqw-window.ico"
+    } else {
+        "favicon.ico"
+    };
+    let icon_path = format!("{manifest_dir}/assets/{icon_file}");
 
+    println!("cargo:rerun-if-env-changed=ARTIX_AQW_WINDOW_ICON");
     println!("cargo:rerun-if-changed={icon_path}");
 
     res.set_icon(&icon_path);

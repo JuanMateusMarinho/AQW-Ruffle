@@ -83,7 +83,7 @@ fn panic_hook(info: &PanicHookInfo) {
 
     let message = info.payload_as_str().unwrap_or("panic occurred");
     let window_title = std::env::var("ARTIX_RUFFLE_WINDOW_TITLE")
-        .unwrap_or_else(|_| "Artix Entertainment - AdventureQuest Worlds V0.1".to_string());
+        .unwrap_or_else(|_| "Artix Entertainment - AdventureQuest Worlds V0.3".to_string());
 
     if rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Error)

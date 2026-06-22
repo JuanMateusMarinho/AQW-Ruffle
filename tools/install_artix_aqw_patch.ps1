@@ -72,6 +72,30 @@ const contents = new Map(files.map((file) => [file.path, readOriginalFile(file.e
 let main = contents.get("main.js").toString("utf8");
 
 let aqTubePatch = String.raw`
+const aqTubeFs = require('fs');
+const aqTubePath = require('path');
+const aqTubeLegacyPartitions = [
+	'artix-aqtube',
+	'artix-aqtube-window',
+	'artix-aqtube-window-en'
+];
+
+app.clearAqTubeLegacyStorage = () => {
+	try {
+		const userDataPath = app.getPath('userData');
+		for (const partitionName of aqTubeLegacyPartitions) {
+			aqTubeFs.rmSync(aqTubePath.join(userDataPath, 'Partitions', partitionName), {
+				recursive: true,
+				force: true
+			});
+		}
+	} catch (error) {
+		devToolsLog('AQTUBE legacy storage clear failed: ' + error.message);
+	}
+};
+
+app.clearAqTubeLegacyStorage();
+
 app.openAqTubeWindow = () => {
 	const { BrowserView } = require('electron');
 	const channelUrl = 'https://www.youtube.com/channel/UC0vYUqgESNR3sqEPiJ4SpeA?hl=en&gl=US';
@@ -128,9 +152,35 @@ app.openAqTubeWindow = () => {
 			nodeIntegration: false,
 			contextIsolation: true,
 			devTools: false,
-			partition: 'persist:artix-aqtube-window-en'
+			partition: 'artix-aqtube-window'
 		}
 	});
+
+	const aqTubeStorageTypes = [
+		'cookies',
+		'localstorage',
+		'indexdb',
+		'websql',
+		'serviceworkers',
+		'cachestorage',
+		'filesystem',
+		'appcache'
+	];
+
+	const clearAqTubeSession = () => {
+		if (!app.aqTubeView || !app.aqTubeView.webContents) {
+			return Promise.resolve();
+		}
+		const aqTubeSession = app.aqTubeView.webContents.session;
+		if (!aqTubeSession) {
+			return Promise.resolve();
+		}
+		return aqTubeSession.clearStorageData({ storages: aqTubeStorageTypes })
+			.then(() => aqTubeSession.clearCache ? aqTubeSession.clearCache() : null)
+			.catch((error) => {
+				devToolsLog('AQTUBE storage clear failed: ' + error.message);
+			});
+	};
 
 	const layoutAqTubeView = () => {
 		if (!app.aqTubeWindow || app.aqTubeWindow.isDestroyed() || !app.aqTubeView) {
@@ -160,6 +210,9 @@ app.openAqTubeWindow = () => {
 	app.aqTubeWindow.on('resize', layoutAqTubeView);
 	app.aqTubeWindow.on('maximize', layoutAqTubeView);
 	app.aqTubeWindow.on('unmaximize', layoutAqTubeView);
+	app.aqTubeWindow.on('close', () => {
+		clearAqTubeSession();
+	});
 	app.aqTubeWindow.on('closed', () => {
 		app.aqTubeWindow = null;
 		app.aqTubeView = null;
@@ -192,7 +245,7 @@ app.openAqTubeWindow = () => {
 		app.aqTubeWindow.show();
 		app.aqTubeWindow.maximize();
 	});
-	loadAqTubeHome();
+	clearAqTubeSession().then(loadAqTubeHome);
 };
 
 app.injectAqTubeTab = () => {
@@ -298,7 +351,7 @@ app.launchAQWExe = () => {
 			stdio: 'ignore',
 			windowsHide: true,
 			env: Object.assign({}, process.env, {
-				ARTIX_RUFFLE_WINDOW_TITLE: 'Artix Entertainment - AdventureQuest Worlds V0.2',
+				ARTIX_RUFFLE_WINDOW_TITLE: 'Artix Entertainment - AdventureQuest Worlds V0.3',
 				RUST_LOG: 'warn'
 			})
 		});

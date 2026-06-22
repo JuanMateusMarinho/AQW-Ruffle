@@ -42,6 +42,41 @@ struct MainWindow {
     event_loop_proxy: EventLoopProxy<RuffleEvent>,
 }
 
+fn should_use_aqw_window_icon() -> bool {
+    if std::env::var("ARTIX_RUFFLE_WINDOW_TITLE")
+        .map(|title| {
+            let title = title.to_ascii_lowercase();
+            title.contains("adventurequest worlds") || title.contains("aqworlds")
+        })
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.file_stem()
+                .map(|stem| stem.to_string_lossy().to_string())
+        })
+        .map(|stem| {
+            stem.eq_ignore_ascii_case("aqw")
+                || stem.eq_ignore_ascii_case("aqw-ruffle")
+                || stem.eq_ignore_ascii_case("aqw-ruffle-debug")
+        })
+        .unwrap_or(false)
+}
+
+fn window_icon() -> Icon {
+    let icon_bytes = if should_use_aqw_window_icon() {
+        include_bytes!("../assets/aqw-window-32.rgba").as_slice()
+    } else {
+        include_bytes!("../assets/favicon-32.rgba").as_slice()
+    };
+
+    Icon::from_rgba(icon_bytes.to_vec(), 32, 32).expect("App icon should be correct")
+}
+
 impl MainWindow {
     pub fn window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         if matches!(event, WindowEvent::RedrawRequested) {
@@ -446,9 +481,7 @@ impl ApplicationHandler<RuffleEvent> for App {
 
         if cause == StartCause::Init {
             let movie_url = self.preferences.cli.movie_url.clone();
-            let icon_bytes = include_bytes!("../assets/favicon-32.rgba");
-            let icon =
-                Icon::from_rgba(icon_bytes.to_vec(), 32, 32).expect("App icon should be correct");
+            let icon = window_icon();
 
             let no_gui = self.preferences.cli.no_gui;
             let min_window_size = if no_gui {
@@ -462,7 +495,7 @@ impl ApplicationHandler<RuffleEvent> for App {
             let start_fullscreen = self.preferences.cli.fullscreen;
 
             let window_title = std::env::var("ARTIX_RUFFLE_WINDOW_TITLE")
-                .unwrap_or_else(|_| "Artix Entertainment - AdventureQuest Worlds V0.1".to_string());
+                .unwrap_or_else(|_| "Artix Entertainment - AdventureQuest Worlds V0.3".to_string());
             #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
             let mut window_attributes = WindowAttributes::default()
                 .with_visible(false)
