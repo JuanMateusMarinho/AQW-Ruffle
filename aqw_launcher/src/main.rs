@@ -48,7 +48,7 @@ mod windows_launcher {
         WM_PAINT, WM_SETICON, WM_SIZE, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
     };
 
-    const RUFFLE_EXE: &[u8] = include_bytes!("../../target/release/ruffle_desktop.exe");
+    const RUFFLE_EXE: &[u8] = include_bytes!("../../release/AQW.exe");
     const HERO_IMAGE: &[u8] = include_bytes!("../assets/launcher_entry.png");
     const DRAGON_FABLE_BANNER: &[u8] = include_bytes!("../assets/dragon_fable_banner.png");
     const AQW_BADGE: &[u8] = include_bytes!("../assets/aqw_badge.png");

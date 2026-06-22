@@ -69,13 +69,11 @@ fn set_windows_resource() -> Result<(), Box<dyn Error>> {
 
     // Set the application icon
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
-    let icon_file = if env::var_os("ARTIX_AQW_WINDOW_ICON").is_some() {
-        "aqw-window.ico"
-    } else {
-        "favicon.ico"
-    };
+    let icon_file = artix_icon_file();
     let icon_path = format!("{manifest_dir}/assets/{icon_file}");
 
+    println!("cargo:rerun-if-env-changed=ARTIX_RUFFLE_GAME_ICON");
+    println!("cargo:rerun-if-env-changed=ARTIX_RUFFLE_GAME");
     println!("cargo:rerun-if-env-changed=ARTIX_AQW_WINDOW_ICON");
     println!("cargo:rerun-if-changed={icon_path}");
 
@@ -94,4 +92,32 @@ fn set_windows_resource() -> Result<(), Box<dyn Error>> {
     res.compile()?;
 
     Ok(())
+}
+
+fn artix_icon_file() -> &'static str {
+    let normalized = env::var("ARTIX_RUFFLE_GAME_ICON")
+        .ok()
+        .or_else(|| env::var("ARTIX_RUFFLE_GAME").ok())
+        .map(|value| normalize(&value));
+
+    match normalized.as_deref() {
+        Some("aqw" | "aqworlds" | "adventurequestworlds" | "adventurequestworldsv03") => {
+            "aqw-window.ico"
+        }
+        Some("epicduel" | "ed") => "epicduel-window.ico",
+        Some("dragonfable" | "df") => "dragonfable-window.ico",
+        Some("adventurequest" | "aq") => "adventurequest-window.ico",
+        Some("mechquest" | "mq") => "mechquest-window.ico",
+        Some("oversoul" | "os") => "oversoul-window.ico",
+        _ if env::var_os("ARTIX_AQW_WINDOW_ICON").is_some() => "aqw-window.ico",
+        _ => "favicon.ico",
+    }
+}
+
+fn normalize(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }

@@ -42,38 +42,8 @@ struct MainWindow {
     event_loop_proxy: EventLoopProxy<RuffleEvent>,
 }
 
-fn should_use_aqw_window_icon() -> bool {
-    if std::env::var("ARTIX_RUFFLE_WINDOW_TITLE")
-        .map(|title| {
-            let title = title.to_ascii_lowercase();
-            title.contains("adventurequest worlds") || title.contains("aqworlds")
-        })
-        .unwrap_or(false)
-    {
-        return true;
-    }
-
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| {
-            path.file_stem()
-                .map(|stem| stem.to_string_lossy().to_string())
-        })
-        .map(|stem| {
-            stem.eq_ignore_ascii_case("aqw")
-                || stem.eq_ignore_ascii_case("aqw-ruffle")
-                || stem.eq_ignore_ascii_case("aqw-ruffle-debug")
-        })
-        .unwrap_or(false)
-}
-
 fn window_icon() -> Icon {
-    let icon_bytes = if should_use_aqw_window_icon() {
-        include_bytes!("../assets/aqw-window-32.rgba").as_slice()
-    } else {
-        include_bytes!("../assets/favicon-32.rgba").as_slice()
-    };
-
+    let icon_bytes = crate::artix::window_icon_rgba();
     Icon::from_rgba(icon_bytes.to_vec(), 32, 32).expect("App icon should be correct")
 }
 
@@ -494,8 +464,7 @@ impl ApplicationHandler<RuffleEvent> for App {
             let preferred_height = self.preferences.cli.height;
             let start_fullscreen = self.preferences.cli.fullscreen;
 
-            let window_title = std::env::var("ARTIX_RUFFLE_WINDOW_TITLE")
-                .unwrap_or_else(|_| "Artix Entertainment - AdventureQuest Worlds V0.3".to_string());
+            let window_title = crate::artix::window_title();
             #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
             let mut window_attributes = WindowAttributes::default()
                 .with_visible(false)

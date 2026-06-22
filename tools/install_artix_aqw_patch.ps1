@@ -15,11 +15,21 @@ if (-not $OutputDir) {
     $OutputDir = Join-Path $repoRoot "release\artix_official_patch"
 }
 
+$gameExePaths = [ordered]@{
+    "AQW.exe" = $AqwExePath
+    "EpicDuel.exe" = Join-Path $repoRoot "release\EpicDuel.exe"
+    "DragonFable.exe" = Join-Path $repoRoot "release\DragonFable.exe"
+    "AdventureQuest.exe" = Join-Path $repoRoot "release\AdventureQuest.exe"
+    "MechQuest.exe" = Join-Path $repoRoot "release\MechQuest.exe"
+    "OverSoul.exe" = Join-Path $repoRoot "release\OverSoul.exe"
+}
+
 $resourcesPath = Join-Path $ArtixLauncherPath "resources"
 $sourceAsar = Join-Path $resourcesPath "app.asar"
 $sourcePreload = Join-Path $resourcesPath "preload.js"
 $patchedAsar = Join-Path $OutputDir "app.asar"
 $patchedPreload = Join-Path $OutputDir "preload.js"
+$patchedBinDir = Join-Path $OutputDir "bin"
 
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
     throw "Node.js is required to patch app.asar."
@@ -30,11 +40,14 @@ if (-not (Test-Path -LiteralPath $sourceAsar)) {
 if (-not (Test-Path -LiteralPath $sourcePreload)) {
     throw "Could not find Artix launcher preload.js at $sourcePreload"
 }
-if (-not (Test-Path -LiteralPath $AqwExePath)) {
-    throw "Could not find AQW.exe at $AqwExePath"
+foreach ($entry in $gameExePaths.GetEnumerator()) {
+    if (-not (Test-Path -LiteralPath $entry.Value)) {
+        throw "Could not find $($entry.Key) at $($entry.Value)"
+    }
 }
 
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+New-Item -ItemType Directory -Path $patchedBinDir -Force | Out-Null
 
 $nodeScript = @'
 const fs = require("fs");
@@ -317,20 +330,94 @@ app.injectAqTubeTab = () => {
 `;
 
 const insertBefore = "app.launchGameLocal = (gameName) => {";
-const aqwLauncher = String.raw`
-app.launchAQWExe = () => {
-	const gameInfo = gameWindows.aqw;
-	const aqwExePath = path.join(process.resourcesPath || path.join(__dirname, '..'), 'bin', 'AQW.exe');
-	const swfURL = gameInfo.url;
-	const baseURL = 'https://game.aq.com/game/gamefiles/';
+const artixRuffleLauncher = String.raw`
+app.artixRuffleGames = {
+	aqw: {
+		exe: 'AQW.exe',
+		icon: 'aqw',
+		title: 'Artix Entertainment - AdventureQuest Worlds V0.3',
+		swfURL: 'https://game.aq.com/game/gamefiles/Loader3.swf',
+		baseURL: 'https://game.aq.com/game/gamefiles/',
+		width: '960',
+		height: '580',
+		graphics: 'vulkan'
+	},
+	ed: {
+		exe: 'EpicDuel.exe',
+		icon: 'epicduel',
+		title: 'Artix Entertainment - Epic Duel',
+		swfURL: 'https://epicduelstage.artix.com/omegaLoader14.swf',
+		baseURL: 'https://epicduelstage.artix.com/',
+		width: '1016',
+		height: '700',
+		graphics: 'vulkan'
+	},
+	df: {
+		exe: 'DragonFable.exe',
+		icon: 'dragonfable',
+		title: 'Artix Entertainment - Dragon Fable',
+		swfURL: 'https://play.dragonfable.com/game/dfloader.swf',
+		baseURL: 'https://play.dragonfable.com/game/',
+		width: '1016',
+		height: '700',
+		graphics: 'vulkan'
+	},
+	aq: {
+		exe: 'AdventureQuest.exe',
+		icon: 'adventurequest',
+		title: 'Artix Entertainment - AdventureQuest',
+		swfURL: 'https://aq.battleon.com/game/flash/Lore4652.swf',
+		baseURL: 'https://aq.battleon.com/game/flash/',
+		width: '800',
+		height: '600',
+		graphics: 'vulkan'
+	},
+	mq: {
+		exe: 'MechQuest.exe',
+		icon: 'mechquest',
+		title: 'Artix Entertainment - MechQuest',
+		swfURL: 'https://play.mechquest.com/game/gamefiles/MQLoader4.swf?isWeb=true',
+		baseURL: 'https://play.mechquest.com/game/gamefiles/',
+		width: '1016',
+		height: '700',
+		graphics: 'vulkan'
+	},
+	os: {
+		exe: 'OverSoul.exe',
+		icon: 'oversoul',
+		title: 'Artix Entertainment - OverSoul',
+		swfURL: 'https://oversoul.artix.com/game/OSWrapper0_5_00.swf',
+		baseURL: 'https://oversoul.artix.com/game/',
+		width: '960',
+		height: '580',
+		graphics: 'vulkan'
+	}
+};
+
+app.artixRuffleProcesses = app.artixRuffleProcesses || {};
+
+app.launchArtixRuffleGame = (gameName) => {
+	const gameInfo = app.artixRuffleGames[gameName];
+	if (!gameInfo) {
+		return false;
+	}
+
+	if (app.artixRuffleProcesses[gameName]) {
+		devToolsLog(gameInfo.exe + ' is already running for ' + gameName);
+		return true;
+	}
+
+	const exePath = path.join(process.resourcesPath || path.join(__dirname, '..'), 'bin', gameInfo.exe);
 	const args = [
-		swfURL,
-		'--spoof-url', swfURL,
-		'--base', baseURL,
-		'--graphics', 'vulkan',
+		gameInfo.swfURL,
+		'--spoof-url', gameInfo.swfURL,
+		'--base', gameInfo.baseURL,
+		'--graphics', gameInfo.graphics || 'vulkan',
 		'--quality', 'low',
 		'--power', 'high',
 		'--frame-rate', '24',
+		'--width', gameInfo.width,
+		'--height', gameInfo.height,
 		'--scale', 'exact-fit',
 		'--force-scale',
 		'--upgrade-to-https',
@@ -340,35 +427,51 @@ app.launchAQWExe = () => {
 		'--tcp-connections', 'allow'
 	];
 
-	if (!fs.existsSync(aqwExePath)) {
-		devToolsLog('AQW.exe not found at ' + aqwExePath);
-		return;
+	if (!fs.existsSync(exePath)) {
+		devToolsLog(gameInfo.exe + ' not found at ' + exePath);
+		return true;
 	}
 
 	try {
-		const aqwProcess = spawn(aqwExePath, args, {
+		const ruffleProcess = spawn(exePath, args, {
 			detached: true,
 			stdio: 'ignore',
 			windowsHide: true,
 			env: Object.assign({}, process.env, {
-				ARTIX_RUFFLE_WINDOW_TITLE: 'Artix Entertainment - AdventureQuest Worlds V0.3',
+				ARTIX_RUFFLE_WINDOW_TITLE: gameInfo.title,
+				ARTIX_RUFFLE_GAME: gameName,
+				ARTIX_RUFFLE_GAME_ICON: gameInfo.icon,
 				RUST_LOG: 'warn'
 			})
 		});
-		aqwProcess.unref();
-		devToolsLog('spawned AQW.exe for aqw');
+		app.artixRuffleProcesses[gameName] = ruffleProcess;
+		ruffleProcess.on('exit', () => {
+			app.artixRuffleProcesses[gameName] = null;
+		});
+		ruffleProcess.on('error', () => {
+			app.artixRuffleProcesses[gameName] = null;
+		});
+		ruffleProcess.unref();
+		devToolsLog('spawned ' + gameInfo.exe + ' for ' + gameName);
 	} catch (error) {
-		devToolsLog('Error spawning AQW.exe: ' + error.message);
+		app.artixRuffleProcesses[gameName] = null;
+		devToolsLog('Error spawning ' + gameInfo.exe + ': ' + error.message);
 	}
+
+	return true;
+};
+
+app.launchAQWExe = () => {
+	app.launchArtixRuffleGame('aqw');
 };
 
 `;
 
-if (!main.includes("app.launchAQWExe = () =>")) {
+if (!main.includes("app.launchArtixRuffleGame = (gameName) =>")) {
   if (!main.includes(insertBefore)) {
     throw new Error("Could not find launchGameLocal insertion point");
   }
-  main = main.replace(insertBefore, aqwLauncher + insertBefore);
+  main = main.replace(insertBefore, artixRuffleLauncher + insertBefore);
 }
 
 if (!main.includes("app.injectAqTubeTab = () =>")) {
@@ -389,14 +492,42 @@ if (!main.includes("app.injectAqTubeTab();")) {
   );
 }
 
-if (!main.includes("if (gameName === 'aqw')")) {
-  const localStartRegex = /app\.launchGameLocal = \(gameName\) => \{\r?\n\tif\(gameWindows\[gameName\] == undefined\)\{/;
+if (!main.includes("app.launchArtixRuffleGame(gameName)")) {
+  const localStartRegex = /app\.launchGameLocal = \(gameName\) => \{\r?\n\t(?:if \(gameName === 'aqw'\) \{\r?\n\t\tapp\.launchAQWExe\(\);\r?\n\t\treturn;\r?\n\t\}\r?\n\t)?if\(gameWindows\[gameName\] == undefined\)\{/;
   if (!localStartRegex.test(main)) {
     throw new Error("Could not find launchGameLocal body patch point");
   }
   main = main.replace(
     localStartRegex,
-    "app.launchGameLocal = (gameName) => {\r\n\tif (gameName === 'aqw') {\r\n\t\tapp.launchAQWExe();\r\n\t\treturn;\r\n\t}\r\n\tif(gameWindows[gameName] == undefined){"
+    "app.launchGameLocal = (gameName) => {\r\n\tif (app.launchArtixRuffleGame(gameName)) {\r\n\t\treturn;\r\n\t}\r\n\tif(gameWindows[gameName] == undefined){"
+  );
+
+  const ruffleStartRegex = /app\.launchRuffle = \(gameName\) => \{\r?\n\tif\(gameWindows\[gameName\] == undefined\)\{/;
+  if (!ruffleStartRegex.test(main)) {
+    throw new Error("Could not find launchRuffle body patch point");
+  }
+  main = main.replace(
+    ruffleStartRegex,
+    "app.launchRuffle = (gameName) => {\r\n\tif (app.launchArtixRuffleGame(gameName)) {\r\n\t\treturn;\r\n\t}\r\n\tif(gameWindows[gameName] == undefined){"
+  );
+}
+
+const launcherWindowTitle = 'GameLauncher on Artix Entertainment v.230';
+main = main.replaceAll("'Artix Game Launcher v.' + clientVersion", `'${launcherWindowTitle}'`);
+main = main.replaceAll("title: 'Loading Artix Games',", "title: '" + launcherWindowTitle + "',");
+main = main.replaceAll("mainWindow.once('page-title-updated', function (event) {", "mainWindow.on('page-title-updated', function (event) {");
+main = main.replaceAll("mainWindow.title = '" + launcherWindowTitle + "';", "mainWindow.setTitle('" + launcherWindowTitle + "');");
+main = main.replaceAll("appIcon.setToolTip('" + launcherWindowTitle + "');", "appIcon.setToolTip('" + launcherWindowTitle + "');");
+if (!main.includes("mainWindow.setTitle('" + launcherWindowTitle + "');\r\n\t\tclearTimeout(mainWinTimer);")) {
+  main = main.replace(
+    "mainWindow.on('page-title-updated', function (event) {\r\n\t\tclearTimeout(mainWinTimer);",
+    "mainWindow.on('page-title-updated', function (event) {\r\n\t\tevent.preventDefault();\r\n\t\tmainWindow.setTitle('" + launcherWindowTitle + "');\r\n\t\tclearTimeout(mainWinTimer);"
+  );
+}
+if (!main.includes("mainWindow.show();\r\n\t\tmainWindow.setTitle('" + launcherWindowTitle + "');")) {
+  main = main.replace(
+    "mainWindow.show();\r\n\t\tapp.injectAqTubeTab();",
+    "mainWindow.show();\r\n\t\tmainWindow.setTitle('" + launcherWindowTitle + "');\r\n\t\tapp.injectAqTubeTab();"
   );
 }
 
@@ -446,8 +577,13 @@ if (window.interop) {
 }
 Set-Content -LiteralPath $patchedPreload -Value $preload -Encoding UTF8
 
+foreach ($entry in $gameExePaths.GetEnumerator()) {
+    Copy-Item -LiteralPath $entry.Value -Destination (Join-Path $patchedBinDir $entry.Key) -Force
+}
+
 Write-Host "Patched ASAR written to $patchedAsar"
 Write-Host "Patched preload written to $patchedPreload"
+Write-Host "Ruffle executables written to $patchedBinDir"
 
 if ($Install) {
     $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -474,12 +610,14 @@ if ($Install) {
     Copy-Item -LiteralPath $sourceAsar -Destination $backupAsar -Force
     Copy-Item -LiteralPath $sourcePreload -Destination $backupPreload -Force
     New-Item -ItemType Directory -Path $binDir -Force | Out-Null
-    Copy-Item -LiteralPath $AqwExePath -Destination (Join-Path $binDir "AQW.exe") -Force
+    foreach ($entry in $gameExePaths.GetEnumerator()) {
+        Copy-Item -LiteralPath $entry.Value -Destination (Join-Path $binDir $entry.Key) -Force
+    }
     Copy-Item -LiteralPath $patchedAsar -Destination $sourceAsar -Force
     Copy-Item -LiteralPath $patchedPreload -Destination $sourcePreload -Force
 
     Write-Host "Installed patched ASAR."
     Write-Host "Backup: $backupAsar"
     Write-Host "Preload backup: $backupPreload"
-    Write-Host "AQW.exe: $(Join-Path $binDir 'AQW.exe')"
+    Write-Host "Ruffle executables: $binDir"
 }
