@@ -3546,13 +3546,7 @@ impl<'gc, 'a> MovieClipShared<'gc> {
     ) -> Result<(), Error> {
         let id = reader.read_u16()?;
         let rect = reader.read_rectangle()?;
-        if let Some(character) = self.library_mut(context).character_by_id(id) {
-            if let Character::MovieClip(clip) = character {
-                clip.set_scaling_grid(rect);
-            } else {
-                tracing::warn!("DefineScalingGrid for invalid ID {}", id);
-            }
-        }
+        self.library_mut(context).set_scaling_grid(id, rect);
         Ok(())
     }
 

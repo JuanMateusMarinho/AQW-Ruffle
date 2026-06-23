@@ -53,7 +53,7 @@ function launchFlashGame({ swfUrl, baseUrl, title }) {
       "--graphics",
       "vulkan",
       "--quality",
-      "low",
+      "best",
       "--power",
       "high",
       "--frame-rate",

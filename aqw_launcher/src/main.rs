@@ -80,7 +80,7 @@ mod windows_launcher {
     const AQW_TWITCH_DIRECTORY_URL: &str =
         "https://www.twitch.tv/directory/category/adventurequest-worlds";
     const FLASH_GRAPHICS_BACKEND: &str = "vulkan";
-    const FLASH_QUALITY: &str = "low";
+    const FLASH_QUALITY: &str = "best";
     const FLASH_FRAME_RATE: &str = "24";
     const DRAGON_FABLE_SWF_URL: &str = "https://play.dragonfable.com/game/DFLoader.swf";
     const DRAGON_FABLE_BASE_URL: &str = "https://play.dragonfable.com/game/";

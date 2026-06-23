@@ -254,7 +254,7 @@ impl BitmapCache {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct RenderOptions {
     /// Whether to skip rendering masks.
     ///
@@ -280,6 +280,12 @@ pub struct RenderOptions {
     ///
     /// Matrix is applied by default.
     pub apply_matrix: bool,
+
+    /// Whether to apply 9-slice scaling from `scale9Grid`/`DefineScalingGrid`.
+    ///
+    /// This is disabled only while recursively drawing the individual 9-slice
+    /// regions of the object that owns the scaling grid.
+    pub apply_scaling_grid: bool,
 }
 
 impl Default for RenderOptions {
@@ -288,6 +294,7 @@ impl Default for RenderOptions {
             apply_transform: true,
             skip_masks: true,
             apply_matrix: true,
+            apply_scaling_grid: true,
         }
     }
 }
@@ -1043,44 +1050,181 @@ struct DrawCacheInfo {
     filters: Vec<Filter>,
 }
 
-const AQW_OFFSCREEN_CACHE_CULL_MIN_PIXELS: f64 = 512.0 * 512.0;
-const AQW_OFFSCREEN_CACHE_CULL_MIN_SIDE: f64 = 1024.0;
+const SCALING_GRID_EPSILON: f32 = 0.0001;
+const AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_PIXELS: u64 = 16_384;
+const AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_SIDE: u32 = 128;
 
-fn should_cull_offscreen_bitmap_cache<'gc>(
+fn scale_twips(value: Twips, scale: f32) -> Twips {
+    Twips::new((value.get() as f32 * scale).round_ties_even() as i32)
+}
+
+fn slice_matrix(
+    src_x0: Twips,
+    src_x1: Twips,
+    dst_x0: Twips,
+    dst_x1: Twips,
+    src_y0: Twips,
+    src_y1: Twips,
+    dst_y0: Twips,
+    dst_y1: Twips,
+) -> Option<Matrix> {
+    let src_w = src_x1 - src_x0;
+    let src_h = src_y1 - src_y0;
+    let dst_w = dst_x1 - dst_x0;
+    let dst_h = dst_y1 - dst_y0;
+
+    if src_w <= Twips::ZERO || src_h <= Twips::ZERO || dst_w <= Twips::ZERO || dst_h <= Twips::ZERO
+    {
+        return None;
+    }
+
+    let scale_x = dst_w.get() as f32 / src_w.get() as f32;
+    let scale_y = dst_h.get() as f32 / src_h.get() as f32;
+
+    Some(Matrix {
+        a: scale_x,
+        b: 0.0,
+        c: 0.0,
+        d: scale_y,
+        tx: dst_x0 - scale_twips(src_x0, scale_x),
+        ty: dst_y0 - scale_twips(src_y0, scale_y),
+    })
+}
+
+fn render_scaling_grid<'gc>(
     this: DisplayObject<'gc>,
-    context: &RenderContext<'_, 'gc>,
-    options: &RenderOptions,
-    bounds: &Rectangle<Twips>,
-    filters: &[Filter],
+    context: &mut RenderContext<'_, 'gc>,
+    options: RenderOptions,
 ) -> bool {
-    if context.is_offscreen
-        || context.commands.drawing_mask()
-        || !options.skip_masks
-        || this.is_root()
-        || this.clip_depth() > 0
-        || this.maskee().is_some()
-        || this.masker().is_some()
-        || this.scroll_rect().is_some()
-        || this.opaque_background().is_some()
-        || this.blend_mode() != ExtendedBlendMode::Normal
+    if !options.apply_transform || !options.apply_matrix || !options.apply_scaling_grid {
+        return false;
+    }
+
+    let mut grid = this.scaling_grid();
+    if !grid.is_valid()
+        && let Some(library) = context.library.library_for_movie(this.movie())
+        && let Some(library_grid) = library.scaling_grid_for_id(this.id())
+    {
+        grid = library_grid;
+    }
+
+    if !grid.is_valid() {
+        return false;
+    }
+
+    let base_transform = this.base().transform(true);
+    let parent_transform = context.transform_stack.transform();
+    let parent_matrix = parent_transform.matrix;
+    let object_matrix = base_transform.matrix;
+
+    // This handles the AQW-style window panels: object-local scale + translation.
+    // Rotated/skewed 9-slice content falls back to the existing render path.
+    if object_matrix.b.abs() > SCALING_GRID_EPSILON
+        || object_matrix.c.abs() > SCALING_GRID_EPSILON
+        || object_matrix.a <= SCALING_GRID_EPSILON
+        || object_matrix.d <= SCALING_GRID_EPSILON
     {
         return false;
     }
 
-    if !filters.is_empty() {
+    if (object_matrix.a - 1.0).abs() <= SCALING_GRID_EPSILON
+        && (object_matrix.d - 1.0).abs() <= SCALING_GRID_EPSILON
+    {
         return false;
     }
 
-    if !bounds.is_valid() || bounds.intersects(&context.stage.view_bounds()) {
+    let bounds = this.bounds(BoundsMode::Engine).union(&grid);
+    if !bounds.is_valid()
+        || bounds.width() <= Twips::ZERO
+        || bounds.height() <= Twips::ZERO
+        || grid.x_min >= grid.x_max
+        || grid.y_min >= grid.y_max
+    {
         return false;
     }
 
-    let width = bounds.width().to_pixels().ceil().max(0.0);
-    let height = bounds.height().to_pixels().ceil().max(0.0);
+    let dst_bounds = object_matrix * bounds;
+    if !dst_bounds.is_valid()
+        || dst_bounds.width() <= Twips::ZERO
+        || dst_bounds.height() <= Twips::ZERO
+    {
+        return false;
+    }
 
-    width * height >= AQW_OFFSCREEN_CACHE_CULL_MIN_PIXELS
-        || width >= AQW_OFFSCREEN_CACHE_CULL_MIN_SIDE
-        || height >= AQW_OFFSCREEN_CACHE_CULL_MIN_SIDE
+    let left_width = grid.x_min - bounds.x_min;
+    let right_width = bounds.x_max - grid.x_max;
+    let top_height = grid.y_min - bounds.y_min;
+    let bottom_height = bounds.y_max - grid.y_max;
+
+    let dst_x = [
+        dst_bounds.x_min,
+        dst_bounds.x_min + left_width,
+        dst_bounds.x_max - right_width,
+        dst_bounds.x_max,
+    ];
+    let dst_y = [
+        dst_bounds.y_min,
+        dst_bounds.y_min + top_height,
+        dst_bounds.y_max - bottom_height,
+        dst_bounds.y_max,
+    ];
+
+    if dst_x[1] >= dst_x[2] || dst_y[1] >= dst_y[2] {
+        return false;
+    }
+
+    let src_x = [bounds.x_min, grid.x_min, grid.x_max, bounds.x_max];
+    let src_y = [bounds.y_min, grid.y_min, grid.y_max, bounds.y_max];
+    let old_use_bitmap_cache = context.use_bitmap_cache;
+    context.use_bitmap_cache = false;
+
+    let mut slice_options = options;
+    slice_options.apply_transform = false;
+    slice_options.apply_scaling_grid = false;
+
+    for y in 0..3 {
+        for x in 0..3 {
+            let Some(matrix) = slice_matrix(
+                src_x[x],
+                src_x[x + 1],
+                dst_x[x],
+                dst_x[x + 1],
+                src_y[y],
+                src_y[y + 1],
+                dst_y[y],
+                dst_y[y + 1],
+            ) else {
+                continue;
+            };
+
+            let mask_rect = Rectangle {
+                x_min: dst_x[x],
+                x_max: dst_x[x + 1],
+                y_min: dst_y[y],
+                y_max: dst_y[y + 1],
+            };
+            let mask_matrix = parent_matrix * Matrix::create_box_from_rectangle(&mask_rect);
+
+            context.commands.push_mask();
+            context.commands.draw_rect(Color::WHITE, mask_matrix);
+            context.commands.activate_mask();
+
+            context.transform_stack.push(&Transform {
+                matrix,
+                color_transform: base_transform.color_transform,
+                perspective_projection: base_transform.perspective_projection,
+            });
+            this.render_with_options(context, slice_options);
+            context.transform_stack.pop();
+
+            context.commands.deactivate_mask();
+            context.commands.draw_rect(Color::WHITE, mask_matrix);
+            context.commands.pop_mask();
+        }
+    }
+
+    context.use_bitmap_cache = old_use_bitmap_cache;
+    true
 }
 
 pub fn render_base<'gc>(
@@ -1098,6 +1242,10 @@ pub fn render_base<'gc>(
     else {
         return;
     };
+
+    if render_scaling_grid(this, context, options) {
+        return;
+    }
 
     if options.apply_transform {
         let transform = this.base().transform(options.apply_matrix);
@@ -1125,13 +1273,6 @@ pub fn render_base<'gc>(
         let swf_version = this.swf_version();
         filters.retain(|f| !f.impotent());
 
-        if should_cull_offscreen_bitmap_cache(this, context, &options, &bounds, &filters) {
-            if options.apply_transform {
-                context.transform_stack.pop();
-            }
-            return;
-        }
-
         if let Some(cache) = &mut *this.base().bitmap_cache_mut() {
             let width = bounds.width().to_pixels().ceil().max(0.0);
             let height = bounds.height().to_pixels().ceil().max(0.0);
@@ -1157,26 +1298,60 @@ pub fn render_base<'gc>(
                     y_max: filter_rect.y_max.to_pixels().ceil() as i32,
                 };
                 let draw_offset = Point::new(filter_rect.x_min, filter_rect.y_min);
+                let actual_width = filter_rect.width().max(0) as u32;
+                let actual_height = filter_rect.height().max(0) as u32;
                 if cache.is_dirty(&base_transform.matrix, width, height) {
-                    cache.update(
-                        context.renderer,
-                        base_transform.matrix,
-                        width,
-                        height,
-                        filter_rect.width() as u32,
-                        filter_rect.height() as u32,
-                        draw_offset,
-                        swf_version,
-                        allow_aqw_large_cache,
-                    );
-                    cache_info = cache.handle().map(|handle| DrawCacheInfo {
-                        handle,
-                        dirty: true,
-                        base_transform,
-                        bounds,
-                        draw_offset,
-                        filters,
-                    });
+                    let redraw_pixels = u64::from(actual_width) * u64::from(actual_height);
+                    let should_budget_redraw = allow_aqw_large_cache
+                        && redraw_pixels >= AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_PIXELS
+                        && (actual_width >= AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_SIDE
+                            || actual_height >= AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_SIDE);
+                    let can_redraw_cache = !should_budget_redraw
+                        || context.try_reserve_dirty_cache_redraw(redraw_pixels);
+
+                    if can_redraw_cache {
+                        cache.update(
+                            context.renderer,
+                            base_transform.matrix,
+                            width,
+                            height,
+                            actual_width,
+                            actual_height,
+                            draw_offset,
+                            swf_version,
+                            allow_aqw_large_cache,
+                        );
+                        cache_info = cache.handle().map(|handle| DrawCacheInfo {
+                            handle,
+                            dirty: true,
+                            base_transform,
+                            bounds,
+                            draw_offset,
+                            filters,
+                        });
+                    } else {
+                        cache_info = cache.handle().map(|handle| DrawCacheInfo {
+                            handle,
+                            dirty: false,
+                            base_transform,
+                            bounds,
+                            draw_offset,
+                            filters,
+                        });
+
+                        if aqw_diagnostics_enabled() {
+                            tracing::info!(
+                                target: "aqw_diag",
+                                width,
+                                height,
+                                actual_width,
+                                actual_height,
+                                redraw_pixels,
+                                has_stale_cache = cache_info.is_some(),
+                                "Deferring dirty AQW bitmap cache redraw"
+                            );
+                        }
+                    }
                 } else {
                     cache_info = cache.handle().map(|handle| DrawCacheInfo {
                         handle,
@@ -1233,7 +1408,10 @@ pub fn render_base<'gc>(
                 library: context.library,
                 transform_stack: &mut transform_stack,
                 is_offscreen: true,
-                use_bitmap_cache: true,
+                use_bitmap_cache: false,
+                dirty_cache_redraws_remaining: 0,
+                dirty_cache_redraws_reserved: 0,
+                dirty_cache_redraw_pixels_remaining: 0,
                 stage: context.stage,
             };
             this.render_self(&mut offscreen_context);

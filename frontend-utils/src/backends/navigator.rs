@@ -367,6 +367,15 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
                     return;
                 }
                 Ok(stream) => {
+                    if let Err(err) = stream.set_nodelay(true) {
+                        tracing::warn!(
+                            "Failed to enable TCP_NODELAY for {}:{}: {}",
+                            host2,
+                            port,
+                            err
+                        );
+                    }
+
                     let action = SocketAction::Connect(handle, ConnectionState::Connected);
                     if !send_action(&sender, action).await {
                         return;

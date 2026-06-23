@@ -249,15 +249,6 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
     }
 
     fn render_self(self, context: &mut RenderContext) {
-        if !context.is_offscreen
-            && !self
-                .world_bounds(BoundsMode::Engine)
-                .intersects(&context.stage.view_bounds())
-        {
-            // Off-screen; culled
-            return;
-        }
-
         if let Some(drawing) = self.0.drawing.get() {
             drawing.borrow().render(context);
         } else if let Some(base_handle) = self.0.shared.get().render_handle.clone() {

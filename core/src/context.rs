@@ -568,6 +568,19 @@ pub struct RenderContext<'a, 'gc> {
     /// Whether to use cacheAsBitmap, vs drawing everything explicitly
     pub use_bitmap_cache: bool,
 
+    /// Maximum number of dirty bitmap caches that can be redrawn during this frame.
+    ///
+    /// Clean caches are still used freely. This only spreads expensive cache
+    /// regeneration work across frames to avoid a single crowded AQW room spawn
+    /// monopolizing the renderer.
+    pub dirty_cache_redraws_remaining: u32,
+
+    /// Number of dirty bitmap cache redraws already reserved during this frame.
+    pub dirty_cache_redraws_reserved: u32,
+
+    /// Approximate remaining pixel budget for dirty bitmap cache redraws this frame.
+    pub dirty_cache_redraw_pixels_remaining: u64,
+
     /// The current player's stage (including all loaded levels)
     pub stage: Stage<'gc>,
 }
@@ -578,6 +591,25 @@ impl<'gc> RenderContext<'_, 'gc> {
     #[inline(always)]
     pub fn gc(&self) -> &'gc Mutation<'gc> {
         self.gc_context
+    }
+
+    pub fn try_reserve_dirty_cache_redraw(&mut self, pixels: u64) -> bool {
+        if self.dirty_cache_redraws_remaining == 0 {
+            return false;
+        }
+
+        if pixels > self.dirty_cache_redraw_pixels_remaining
+            && self.dirty_cache_redraws_reserved > 0
+        {
+            return false;
+        }
+
+        self.dirty_cache_redraws_remaining -= 1;
+        self.dirty_cache_redraws_reserved += 1;
+        self.dirty_cache_redraw_pixels_remaining = self
+            .dirty_cache_redraw_pixels_remaining
+            .saturating_sub(pixels);
+        true
     }
 
     /// Draw a rectangle outline.
