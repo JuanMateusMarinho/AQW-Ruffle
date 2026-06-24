@@ -45,6 +45,7 @@ pub struct LoaderDisplayData<'gc> {
     avm2_object: Lock<Option<Avm2StageObject<'gc>>>,
     movie: Arc<SwfMovie>,
     aqw_was_detached: Cell<bool>,
+    aqw_detach_pending: Cell<bool>,
 }
 
 impl<'gc> LoaderDisplay<'gc> {
@@ -57,6 +58,7 @@ impl<'gc> LoaderDisplay<'gc> {
                 avm2_object: Lock::new(None),
                 movie,
                 aqw_was_detached: Cell::new(false),
+                aqw_detach_pending: Cell::new(false),
             },
         ));
 
@@ -146,6 +148,14 @@ impl<'gc> TDisplayObject<'gc> for LoaderDisplay<'gc> {
     }
 
     fn enter_frame(self, context: &mut UpdateContext<'gc>) {
+        if self.parent().is_none() && self.0.aqw_detach_pending.replace(false) {
+            if self.contains_aqw_avatar_asset() {
+                self.0.aqw_was_detached.set(true);
+                self.set_aqw_tree_suspended(context, true);
+                return;
+            }
+        }
+
         let skip_frame = self.base().should_skip_next_enter_frame();
         for child in self.iter_render_list() {
             // See MovieClip::enter_frame for an explanation of this.
@@ -178,6 +188,10 @@ impl<'gc> TDisplayObject<'gc> for LoaderDisplay<'gc> {
     }
 
     fn on_parent_added(self, context: &mut UpdateContext<'gc>) {
+        if self.0.aqw_detach_pending.replace(false) {
+            return;
+        }
+
         if self.0.aqw_was_detached.replace(false) {
             self.set_aqw_tree_suspended(context, false);
         }
@@ -186,8 +200,11 @@ impl<'gc> TDisplayObject<'gc> for LoaderDisplay<'gc> {
     fn on_parent_removed(self, context: &mut UpdateContext<'gc>) {
         if self.movie().is_action_script_3() {
             if self.contains_aqw_avatar_asset() {
-                self.0.aqw_was_detached.set(true);
-                self.set_aqw_tree_suspended(context, true);
+                // AQW frequently removes and re-adds Loaders in the same frame
+                // while reordering players, monsters, rooms, and UI. Wait until
+                // the next frame before treating the removal as persistent.
+                self.0.aqw_detach_pending.set(true);
+                context.orphan_manager.add_orphan_obj(self.into());
             } else {
                 context.orphan_manager.add_orphan_obj(self.into())
             }

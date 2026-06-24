@@ -146,6 +146,13 @@ impl Drop for Avm2EventRecursionGuard {
 const BROADCAST_WHITELIST: [&[u8]; 4] =
     [b"enterFrame", b"exitFrame", b"frameConstructed", b"render"];
 
+#[derive(Clone, Copy, Collect)]
+#[collect(no_drop)]
+struct BroadcastListener<'gc> {
+    object: WeakObject<'gc>,
+    order: u64,
+}
+
 /// The state of an AVM2 interpreter.
 #[derive(Collect)]
 #[collect(no_drop)]
@@ -206,11 +213,13 @@ pub struct Avm2<'gc> {
     /// Certain types of events are "broadcast events" that are emitted on all
     /// constructed objects in order of their creation, whether or not they are
     /// currently present on the display list. This list keeps track of that.
-    broadcast_list: FnvHashMap<AvmString<'gc>, Vec<WeakObject<'gc>>>,
+    broadcast_list: FnvHashMap<AvmString<'gc>, Vec<BroadcastListener<'gc>>>,
 
     /// AQW player asset listeners temporarily removed from the active broadcast
     /// lists while their Loader is detached from the display list.
-    broadcast_list_suspended: FnvHashMap<AvmString<'gc>, Vec<WeakObject<'gc>>>,
+    broadcast_list_suspended: FnvHashMap<AvmString<'gc>, Vec<BroadcastListener<'gc>>>,
+
+    next_broadcast_listener_order: u64,
 
     alias_to_class_map: FnvHashMap<AvmString<'gc>, ClassObject<'gc>>,
     class_to_alias_map: FnvHashMap<Class<'gc>, AvmString<'gc>>,
@@ -269,6 +278,7 @@ impl<'gc> Avm2<'gc> {
             native_fast_call_list: Default::default(),
             broadcast_list: Default::default(),
             broadcast_list_suspended: Default::default(),
+            next_broadcast_listener_order: 0,
 
             alias_to_class_map: Default::default(),
             class_to_alias_map: Default::default(),
@@ -430,10 +440,10 @@ impl<'gc> Avm2<'gc> {
         object_ptr: *const crate::avm2::object::ObjectPtr,
     ) {
         for bucket in self.broadcast_list.values_mut() {
-            bucket.retain(|weak| !std::ptr::eq(weak.as_ptr(), object_ptr));
+            bucket.retain(|listener| !std::ptr::eq(listener.object.as_ptr(), object_ptr));
         }
         for bucket in self.broadcast_list_suspended.values_mut() {
-            bucket.retain(|weak| !std::ptr::eq(weak.as_ptr(), object_ptr));
+            bucket.retain(|listener| !std::ptr::eq(listener.object.as_ptr(), object_ptr));
         }
     }
 
@@ -445,21 +455,21 @@ impl<'gc> Avm2<'gc> {
         let mut suspended = Vec::new();
 
         for (event_name, bucket) in &mut self.broadcast_list {
-            let mut index = 0;
-            while index < bucket.len() {
-                if object_ptrs.contains(&bucket[index].as_ptr()) {
-                    suspended.push((*event_name, bucket.swap_remove(index)));
+            bucket.retain(|listener| {
+                if object_ptrs.contains(&listener.object.as_ptr()) {
+                    suspended.push((*event_name, *listener));
+                    false
                 } else {
-                    index += 1;
+                    true
                 }
-            }
+            });
         }
 
         for (event_name, listener) in suspended {
             let bucket = self.broadcast_list_suspended.entry(event_name).or_default();
             if bucket
                 .iter()
-                .all(|entry| !std::ptr::eq(entry.as_ptr(), listener.as_ptr()))
+                .all(|entry| !std::ptr::eq(entry.object.as_ptr(), listener.object.as_ptr()))
             {
                 bucket.push(listener);
             }
@@ -474,23 +484,24 @@ impl<'gc> Avm2<'gc> {
         let mut restored = Vec::new();
 
         for (event_name, bucket) in &mut self.broadcast_list_suspended {
-            let mut index = 0;
-            while index < bucket.len() {
-                if object_ptrs.contains(&bucket[index].as_ptr()) {
-                    restored.push((*event_name, bucket.swap_remove(index)));
+            bucket.retain(|listener| {
+                if object_ptrs.contains(&listener.object.as_ptr()) {
+                    restored.push((*event_name, *listener));
+                    false
                 } else {
-                    index += 1;
+                    true
                 }
-            }
+            });
         }
 
         for (event_name, listener) in restored {
             let bucket = self.broadcast_list.entry(event_name).or_default();
             if bucket
                 .iter()
-                .all(|entry| !std::ptr::eq(entry.as_ptr(), listener.as_ptr()))
+                .all(|entry| !std::ptr::eq(entry.object.as_ptr(), listener.object.as_ptr()))
             {
                 bucket.push(listener);
+                bucket.sort_unstable_by_key(|entry| entry.order);
             }
         }
     }
@@ -524,12 +535,18 @@ impl<'gc> Avm2<'gc> {
         for entry in bucket.iter() {
             // Note: comparing pointers is correct because GcWeak keeps its allocation alive,
             // so the pointers can't overlap by accident.
-            if std::ptr::eq(entry.as_ptr(), object.as_ptr()) {
+            if std::ptr::eq(entry.object.as_ptr(), object.as_ptr()) {
                 return;
             }
         }
 
-        bucket.push(object.downgrade());
+        let order = context.avm2.next_broadcast_listener_order;
+        context.avm2.next_broadcast_listener_order =
+            context.avm2.next_broadcast_listener_order.saturating_add(1);
+        bucket.push(BroadcastListener {
+            object: object.downgrade(),
+            order,
+        });
     }
 
     /// Dispatch an event on all objects in the current execution list.
@@ -573,7 +590,7 @@ impl<'gc> Avm2<'gc> {
                 .get(&event_name)
                 .unwrap()
                 .get(i)
-                .copied();
+                .map(|listener| listener.object);
 
             if let Some(object) = object.and_then(|obj| obj.upgrade(context.gc()))
                 && object.is_of_type(on_type.inner_class_definition())
@@ -589,7 +606,7 @@ impl<'gc> Avm2<'gc> {
             .broadcast_list
             .entry(event_name)
             .or_default()
-            .retain(|x| x.upgrade(context.gc_context).is_some());
+            .retain(|listener| listener.object.upgrade(context.gc_context).is_some());
     }
 
     pub fn lookup_class_for_character(
