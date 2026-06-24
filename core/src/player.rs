@@ -337,6 +337,9 @@ pub struct Player {
     /// and compensate for small lags by "catching up" (up to MAX_FRAMES_PER_TICK).
     frame_accumulator: FloatDuration,
     recent_run_frame_timings: VecDeque<f64>,
+    aqw_avatar_asset_roots: u32,
+    aqw_avatar_asset_roots_previous: u32,
+    aqw_nested_goto: bool,
 
     /// Faked time passage for fooling hand-written busy-loop FPS limiters.
     time_offset: u32,
@@ -486,7 +489,7 @@ impl Player {
     /// This logic is far from perfect, as it doesn't take into account
     /// that things like rendering also take time. But for now it's good enough.
     fn max_frames_per_tick(&self) -> u32 {
-        const MAX_FRAMES_PER_TICK: u32 = 1;
+        const MAX_FRAMES_PER_TICK: u32 = 2;
 
         if self.recent_run_frame_timings.is_empty() {
             MAX_FRAMES_PER_TICK
@@ -533,7 +536,7 @@ impl Player {
         while frame < max_frames_per_tick && self.frame_accumulator >= frame_duration {
             let timer = Instant::now();
             self.run_frame();
-            let elapsed = timer.elapsed().as_millis() as f64;
+            let elapsed = timer.elapsed().as_secs_f64() * 1000.0;
 
             self.add_frame_timing(elapsed);
 
@@ -563,14 +566,8 @@ impl Player {
         // so timer callbacks won't get cancelled/delayed.
         self.time_offset = 0;
 
-        // When catch-up is disabled, prefer stable pacing over scheduling an
-        // almost-immediate follow-up frame after a delay.
-        if frame > 0 && max_frames_per_tick == 1 {
-            self.frame_accumulator = FloatDuration::ZERO;
-        } else if self.frame_accumulator >= frame_duration {
-            // Sanity: If we had too many frames to tick, just reset the accumulator
-            // to prevent running at turbo speed.
-            self.frame_accumulator = FloatDuration::ZERO;
+        if self.frame_accumulator > frame_duration {
+            self.frame_accumulator = frame_duration;
         }
 
         // Adjust playback speed for next frame to stay in sync with timeline audio tracks ("stream" sounds).
@@ -2309,6 +2306,9 @@ impl Player {
                 forced_frame_rate: this.forced_frame_rate,
                 actions_since_timeout_check: &mut this.actions_since_timeout_check,
                 frame_phase: &mut this.frame_phase,
+                aqw_avatar_asset_roots: &mut this.aqw_avatar_asset_roots,
+                aqw_avatar_asset_roots_previous: &mut this.aqw_avatar_asset_roots_previous,
+                aqw_nested_goto: &mut this.aqw_nested_goto,
                 stub_tracker: &mut this.stub_tracker,
                 stream_manager,
                 sockets,
@@ -3014,6 +3014,9 @@ impl PlayerBuilder {
                 frame_phase: Default::default(),
                 frame_accumulator: FloatDuration::ZERO,
                 recent_run_frame_timings: VecDeque::with_capacity(10),
+                aqw_avatar_asset_roots: 0,
+                aqw_avatar_asset_roots_previous: 0,
+                aqw_nested_goto: false,
                 start_time: Instant::now(),
                 time_offset: 0,
                 time_til_next_timer: None,

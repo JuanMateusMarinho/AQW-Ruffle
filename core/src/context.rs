@@ -209,6 +209,10 @@ pub struct UpdateContext<'gc> {
     /// If we are not doing frame processing, then this is `FramePhase::Enter`.
     pub frame_phase: &'gc mut FramePhase,
 
+    pub aqw_avatar_asset_roots: &'gc mut u32,
+    pub aqw_avatar_asset_roots_previous: &'gc mut u32,
+    pub aqw_nested_goto: &'gc mut bool,
+
     /// Manager of in-progress media streams.
     pub stream_manager: &'gc mut StreamManager<'gc>,
 

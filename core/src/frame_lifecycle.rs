@@ -77,6 +77,8 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
         return;
     }
 
+    *context.aqw_avatar_asset_roots = 0;
+
     *context.frame_phase = FramePhase::Enter;
     OrphanManager::each_orphan_obj(context, |orphan, context| {
         orphan.enter_frame(context);
@@ -110,6 +112,7 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
     // a result of a RemoveObject tag - see `cleanup_dead_orphans` for details.
     context.orphan_manager.cleanup_dead_orphans(context.gc());
 
+    *context.aqw_avatar_asset_roots_previous = *context.aqw_avatar_asset_roots;
     *context.frame_phase = FramePhase::Idle;
 }
 
@@ -160,6 +163,8 @@ fn run_inner_goto_frame_impl<'gc>(
 
     let stage = context.stage;
     let old_phase = *context.frame_phase;
+    let old_aqw_nested_goto = *context.aqw_nested_goto;
+    *context.aqw_nested_goto = true;
 
     // When performing goto, frame scripts behave the same as when entering a new frame
     // so no separate cleanup is performed on ones registered during frame script phase
@@ -194,6 +199,7 @@ fn run_inner_goto_frame_impl<'gc>(
     // a result of a RemoveObject tag - see `cleanup_dead_orphans` for details.
     context.orphan_manager.cleanup_dead_orphans(context.gc());
 
+    *context.aqw_nested_goto = old_aqw_nested_goto;
     *context.frame_phase = old_phase;
 }
 

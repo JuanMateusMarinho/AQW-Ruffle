@@ -61,6 +61,9 @@ use super::interactive::Avm2MousePick;
 
 type FrameNumber = u16;
 
+const AQW_AVATAR_THROTTLE_ROOTS: u32 = 24;
+const AQW_AVATAR_HEAVY_THROTTLE_ROOTS: u32 = 48;
+
 fn aqw_diagnostics_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
@@ -222,6 +225,8 @@ pub struct MovieClipData<'gc> {
     clip_event_flags: Cell<ClipEventFlag>,
 
     has_pending_script: Cell<bool>,
+    aqw_timeline_counter: Cell<u8>,
+    aqw_skip_timeline_frame: Cell<bool>,
 
     /// Force enable button mode, which causes all mouse-related events to
     /// trigger on this clip rather than any input-eligible children.
@@ -267,6 +272,8 @@ impl<'gc> MovieClipData<'gc> {
             last_queued_script_frame: Cell::new(None),
             queued_script_frame: Cell::new(0),
             has_pending_script: Cell::new(false),
+            aqw_timeline_counter: Cell::new(0),
+            aqw_skip_timeline_frame: Cell::new(false),
             queued_goto_frame: Cell::new(None),
             drop_target: Lock::new(None),
             queued_tags: Default::default(),
@@ -2578,6 +2585,44 @@ impl<'gc> MovieClip<'gc> {
         let has_pending_script = self.has_frame_script(self.0.current_frame.get());
         self.set_has_pending_script(has_pending_script);
     }
+
+    fn is_aqw_avatar_asset_root(self) -> bool {
+        self.is_root() && is_aqw_avatar_asset_movie_url(self.movie().url())
+    }
+
+    fn update_aqw_timeline_throttle(
+        self,
+        context: &mut UpdateContext<'gc>,
+        can_throttle: bool,
+    ) -> bool {
+        if !self.is_aqw_avatar_asset_root() {
+            return false;
+        }
+
+        *context.aqw_avatar_asset_roots = context.aqw_avatar_asset_roots.saturating_add(1);
+        self.0.aqw_skip_timeline_frame.set(false);
+
+        if !can_throttle || self.current_frame() == 0 {
+            self.0.aqw_timeline_counter.set(0);
+            return false;
+        }
+
+        let divisor = if *context.aqw_avatar_asset_roots_previous >= AQW_AVATAR_HEAVY_THROTTLE_ROOTS
+        {
+            3
+        } else if *context.aqw_avatar_asset_roots_previous >= AQW_AVATAR_THROTTLE_ROOTS {
+            2
+        } else {
+            self.0.aqw_timeline_counter.set(0);
+            return false;
+        };
+
+        let counter = (self.0.aqw_timeline_counter.get() + 1) % divisor;
+        self.0.aqw_timeline_counter.set(counter);
+        let skip = counter != 0;
+        self.0.aqw_skip_timeline_frame.set(skip);
+        skip
+    }
 }
 
 impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
@@ -2599,6 +2644,10 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
 
     fn enter_frame(self, context: &mut UpdateContext<'gc>) {
         let skip_frame = self.base().should_skip_next_enter_frame();
+        if self.update_aqw_timeline_throttle(context, !skip_frame) {
+            return;
+        }
+
         //Child removals from looping gotos appear to resolve in reverse order.
         for child in self.iter_render_list().rev() {
             if skip_frame {
@@ -2651,6 +2700,13 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
 
     /// Construct objects placed on this frame.
     fn construct_frame(self, context: &mut UpdateContext<'gc>) {
+        if !*context.aqw_nested_goto
+            && self.is_aqw_avatar_asset_root()
+            && self.0.aqw_skip_timeline_frame.get()
+        {
+            return;
+        }
+
         // AVM1 code expects to execute in line with timeline instructions, so
         // it's exempted from frame construction.
         if self.movie().is_action_script_3()
@@ -2715,6 +2771,13 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     }
 
     fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
+        if !*context.aqw_nested_goto
+            && self.is_aqw_avatar_asset_root()
+            && self.0.aqw_skip_timeline_frame.get()
+        {
+            return;
+        }
+
         let Some(_frame_script_guard) = super::DisplayObjectRecursionGuard::enter(
             &super::FRAME_SCRIPT_RECURSION_DEPTH,
             "movie_clip_frame_scripts",
