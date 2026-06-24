@@ -361,7 +361,7 @@ app.launchArtixRuffleGame = (gameName) => {
 		'--spoof-url', gameInfo.swfURL,
 		'--base', gameInfo.baseURL,
 		'--graphics', gameInfo.graphics || 'vulkan',
-		'--quality', 'best',
+		'--quality', 'low',
 		'--power', 'high',
 		'--frame-rate', '24',
 		'--width', gameInfo.width,
@@ -421,9 +421,6 @@ if (!main.includes("app.launchArtixRuffleGame = (gameName) =>")) {
   }
   main = main.replace(insertBefore, artixRuffleLauncher + insertBefore);
 }
-
-main = main.replaceAll("'--quality', 'low'", "'--quality', 'best'");
-main = main.replaceAll('"--quality", "low"', '"--quality", "best"');
 
 if (!main.includes("app.injectAqTubeTab = () =>")) {
   if (!main.includes(insertBefore)) {

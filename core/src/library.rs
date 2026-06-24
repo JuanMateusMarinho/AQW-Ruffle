@@ -121,8 +121,6 @@ impl<'gc> Avm2ClassRegistry<'gc> {
 pub struct MovieLibrary<'gc> {
     swf: Arc<SwfMovie>,
     characters: HashMap<CharacterId, Character<'gc>>,
-    #[collect(require_static)]
-    pending_scaling_grids: HashMap<CharacterId, Rectangle<Twips>>,
     export_characters: Avm1PropertyMap<'gc, CharacterId>,
     imported_assets: HashMap<AvmString<'gc>, CharacterId>,
     jpeg_tables: Option<Vec<u8>>,
@@ -135,7 +133,6 @@ impl<'gc> MovieLibrary<'gc> {
         Self {
             swf,
             characters: HashMap::new(),
-            pending_scaling_grids: HashMap::new(),
             imported_assets: HashMap::new(),
             export_characters: Avm1PropertyMap::new(),
             jpeg_tables: None,
@@ -153,11 +150,6 @@ impl<'gc> MovieLibrary<'gc> {
                 if let Character::Font(font) = character {
                     self.fonts.register(font);
                 }
-                if let Some(rect) = self.pending_scaling_grids.remove(&id)
-                    && !Self::apply_scaling_grid(character, rect)
-                {
-                    tracing::warn!("DefineScalingGrid for invalid ID {}", id);
-                }
                 e.insert(character);
                 true
             }
@@ -166,51 +158,6 @@ impl<'gc> MovieLibrary<'gc> {
                 false
             }
         }
-    }
-
-    fn apply_scaling_grid(character: Character<'gc>, rect: Rectangle<Twips>) -> bool {
-        match character {
-            Character::EditText(edit_text) => edit_text.set_scaling_grid(rect),
-            Character::Graphic(graphic) => graphic.set_scaling_grid(rect),
-            Character::MorphShape(morph_shape) => morph_shape.set_scaling_grid(rect),
-            Character::MovieClip(movie_clip) => movie_clip.set_scaling_grid(rect),
-            Character::Bitmap(bitmap) => bitmap.set_scaling_grid(rect),
-            Character::Avm1Button(button) => button.set_scaling_grid(rect),
-            Character::Avm2Button(button) => button.set_scaling_grid(rect),
-            Character::Text(text) => text.set_scaling_grid(rect),
-            Character::Video(video) => video.set_scaling_grid(rect),
-            _ => return false,
-        }
-
-        true
-    }
-
-    pub fn set_scaling_grid(&mut self, id: CharacterId, rect: Rectangle<Twips>) {
-        if let Some(character) = self.character_by_id(id) {
-            if !Self::apply_scaling_grid(character, rect) {
-                tracing::warn!("DefineScalingGrid for invalid ID {}", id);
-            }
-        } else {
-            self.pending_scaling_grids.insert(id, rect);
-        }
-    }
-
-    pub fn scaling_grid_for_id(&self, id: CharacterId) -> Option<Rectangle<Twips>> {
-        let character = self.character_by_id(id)?;
-        let rect = match character {
-            Character::EditText(edit_text) => edit_text.scaling_grid(),
-            Character::Graphic(graphic) => graphic.scaling_grid(),
-            Character::MorphShape(morph_shape) => morph_shape.scaling_grid(),
-            Character::MovieClip(movie_clip) => movie_clip.scaling_grid(),
-            Character::Bitmap(bitmap) => bitmap.scaling_grid(),
-            Character::Avm1Button(button) => button.scaling_grid(),
-            Character::Avm2Button(button) => button.scaling_grid(),
-            Character::Text(text) => text.scaling_grid(),
-            Character::Video(video) => video.scaling_grid(),
-            _ => return None,
-        };
-
-        rect.is_valid().then_some(rect)
     }
 
     /// Registers an export name for a given character ID.
@@ -306,13 +253,11 @@ impl<'gc> MovieLibrary<'gc> {
         mc: &Mutation<'gc>,
     ) -> Option<DisplayObject<'gc>> {
         match character {
-            Character::Bitmap(bitmap_character) => {
-                let avm2_class = bitmap_character.avm2_class();
-                let scaling_grid = bitmap_character.scaling_grid();
-                let bitmap = bitmap_character.compressed().decode().unwrap();
+            Character::Bitmap(bitmap) => {
+                let avm2_class = bitmap.avm2_class();
+                let bitmap = bitmap.compressed().decode().unwrap();
                 let bitmap = Bitmap::new(mc, id, bitmap, self.swf.clone());
                 bitmap.set_avm2_bitmapdata_class(mc, avm2_class);
-                bitmap.set_scaling_grid(scaling_grid);
                 Some(bitmap.instantiate(mc))
             }
             Character::EditText(edit_text) => Some(edit_text.instantiate(mc)),

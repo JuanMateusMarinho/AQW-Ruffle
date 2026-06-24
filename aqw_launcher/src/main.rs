@@ -12,18 +12,14 @@ fn main() {
 
 #[cfg(target_os = "windows")]
 mod windows_launcher {
-    use std::cell::RefCell;
     use std::ffi::c_void;
     use std::fs::{self, OpenOptions};
     use std::io::Write;
     use std::mem::{size_of, zeroed};
     use std::os::windows::process::CommandExt;
-    use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::ptr::{null, null_mut};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex};
-    use std::thread;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use image::ImageFormat;
@@ -33,8 +29,8 @@ mod windows_launcher {
         SelectObject, SetBkMode, SetTextColor, StretchDIBits, UpdateWindow, BITMAPINFO,
         BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
         DEFAULT_PITCH, DIB_RGB_COLORS, DT_CENTER, DT_LEFT, DT_SINGLELINE, DT_TOP, DT_VCENTER,
-        DT_WORDBREAK, FW_BOLD, FW_NORMAL, HFONT, LOGPIXELSY, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
-        RGBQUAD, SRCCOPY, TRANSPARENT,
+        DT_WORDBREAK, FW_BOLD, FW_NORMAL, LOGPIXELSY, OUT_DEFAULT_PRECIS, PAINTSTRUCT, RGBQUAD,
+        SRCCOPY, TRANSPARENT,
     };
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -44,13 +40,12 @@ mod windows_launcher {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-        GetMessageW, GetWindowLongPtrW, LoadCursorW, LoadIconW, MessageBoxW, PostMessageW,
-        PostQuitMessage, RegisterClassW, SendMessageW, SetWindowLongPtrW, ShowWindow,
-        TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA,
-        ICON_BIG, ICON_SMALL, IDC_ARROW, MB_ICONERROR, MB_OK, MINMAXINFO, MSG, SW_SHOW,
-        SW_SHOWNORMAL, WM_DESTROY, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE,
-        WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETICON, WM_SIZE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
-        WS_VISIBLE,
+        GetMessageW, GetWindowLongPtrW, LoadCursorW, LoadIconW, MessageBoxW, PostQuitMessage,
+        RegisterClassW, SendMessageW, SetWindowLongPtrW, ShowWindow, TranslateMessage,
+        CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, ICON_BIG, ICON_SMALL,
+        IDC_ARROW, MB_ICONERROR, MB_OK, MINMAXINFO, MSG, SW_SHOW, SW_SHOWNORMAL, WM_DESTROY,
+        WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY,
+        WM_PAINT, WM_SETICON, WM_SIZE, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
     };
 
     const RUFFLE_EXE: &[u8] = include_bytes!("../../release/AQW.exe");
@@ -72,7 +67,6 @@ mod windows_launcher {
     const MIN_WINDOW_WIDTH: i32 = 960;
     const MIN_WINDOW_HEIGHT: i32 = 620;
     const WM_MOUSELEAVE: u32 = 0x02A3;
-    const WM_MEDIA_LOADED: u32 = 0x8000 + 1;
     const AQW_SWF_URL: &str = "https://game.aq.com/game/gamefiles/Loader3.swf";
     const AQW_BASE_URL: &str = "https://game.aq.com/game/gamefiles/";
     const AQW_WINDOW_TITLE: &str = "Artix Entertainment - AdventureQuest Worlds V0.3";
@@ -86,14 +80,11 @@ mod windows_launcher {
     const AQW_TWITCH_DIRECTORY_URL: &str =
         "https://www.twitch.tv/directory/category/adventurequest-worlds";
     const FLASH_GRAPHICS_BACKEND: &str = "vulkan";
-    const FLASH_QUALITY: &str = "best";
+    const FLASH_QUALITY: &str = "low";
     const FLASH_FRAME_RATE: &str = "24";
-    const POWERSHELL_FETCH_TEXT_SCRIPT: &str = "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; (Invoke-WebRequest -UseBasicParsing -TimeoutSec 10 -Uri $env:AELAUNCHER_FETCH_URI -Headers @{'User-Agent'='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AELauncher'}).Content";
-    const POWERSHELL_FETCH_FILE_SCRIPT: &str = "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -UseBasicParsing -TimeoutSec 10 -Uri $env:AELAUNCHER_FETCH_URI -OutFile $env:AELAUNCHER_FETCH_OUTFILE -Headers @{'User-Agent'='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AELauncher'}";
     const DRAGON_FABLE_SWF_URL: &str = "https://play.dragonfable.com/game/DFLoader.swf";
     const DRAGON_FABLE_BASE_URL: &str = "https://play.dragonfable.com/game/";
     const DRAGON_FABLE_WINDOW_TITLE: &str = "Artix Entertainment -Dragon Fable";
-    static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Screen {
@@ -164,12 +155,6 @@ mod windows_launcher {
         Twitch,
     }
 
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum MediaLoadKind {
-        Videos,
-        Live,
-    }
-
     struct MediaEntry {
         source: MediaSource,
         title: String,
@@ -185,12 +170,6 @@ mod windows_launcher {
         channel: String,
         url: String,
         thumbnail: Option<Arc<Bitmap>>,
-    }
-
-    struct MediaLoadResult {
-        kind: MediaLoadKind,
-        items: Vec<MediaItem>,
-        used_fallback: bool,
     }
 
     struct Bitmap {
@@ -268,15 +247,11 @@ mod windows_launcher {
         youtube_videos: Vec<MediaItem>,
         live_media: Vec<MediaItem>,
         youtube_videos_loaded: bool,
-        youtube_videos_loading: bool,
         live_media_loaded: bool,
-        live_media_loading: bool,
-        media_results: Arc<Mutex<Vec<MediaLoadResult>>>,
         buffer: Vec<u8>,
         width: i32,
         height: i32,
         hits: Vec<HitBox>,
-        hits_dirty: bool,
         tracking_mouse: bool,
     }
 
@@ -302,15 +277,11 @@ mod windows_launcher {
                 youtube_videos: Vec::new(),
                 live_media: Vec::new(),
                 youtube_videos_loaded: false,
-                youtube_videos_loading: false,
                 live_media_loaded: false,
-                live_media_loading: false,
-                media_results: Arc::new(Mutex::new(Vec::new())),
                 buffer: Vec::new(),
                 width: 0,
                 height: 0,
                 hits: Vec::new(),
-                hits_dirty: true,
                 tracking_mouse: false,
             }
         }
@@ -579,36 +550,14 @@ mod windows_launcher {
             self.hits = hits;
         }
 
-        fn mark_hits_dirty(&mut self) {
-            self.hits_dirty = true;
-        }
-
-        fn ensure_hits(&mut self, width: i32, height: i32) {
-            if self.hits_dirty
-                || self.hits.is_empty()
-                || self.width != width
-                || self.height != height
-            {
-                self.width = width.max(1);
-                self.height = height.max(1);
-                self.update_hits(self.width, self.height);
-                self.hits_dirty = false;
-            }
-        }
-
         fn render(&mut self, width: i32, height: i32) {
-            let width = width.max(1);
-            let height = height.max(1);
-            if self.width != width || self.height != height {
-                self.hits_dirty = true;
-            }
-            self.width = width;
-            self.height = height;
+            self.width = width.max(1);
+            self.height = height.max(1);
             self.buffer
                 .resize((self.width * self.height * 4) as usize, 0);
 
             let layout = self.layout(self.width, self.height);
-            self.ensure_hits(self.width, self.height);
+            self.update_hits(self.width, self.height);
 
             self.fill(Color::rgb(14, 15, 23));
             let (hero, hero_focus_y) = match self.screen {
@@ -1178,7 +1127,10 @@ mod windows_launcher {
 
         fn draw_media_card(&mut self, rect: RectI, id: ElementId, item: Option<&MediaItem>) {
             let active = self.hovered == Some(id) || self.focused == id;
-            let source = item.map(|item| item.source).unwrap_or(MediaSource::YouTube);
+            let source = item.map(|item| item.source).unwrap_or(match self.screen {
+                Screen::Live => MediaSource::YouTube,
+                _ => MediaSource::YouTube,
+            });
             let border = if active {
                 Color::rgba(255, 238, 160, 255)
             } else {
@@ -1230,10 +1182,9 @@ mod windows_launcher {
                 .map(|hit| hit.id)
         }
 
-        fn set_screen(&mut self, screen: Screen, hwnd: HWND) {
+        fn set_screen(&mut self, screen: Screen) {
             self.screen = screen;
-            self.mark_hits_dirty();
-            self.refresh_media_for_screen(screen, hwnd);
+            self.refresh_media_for_screen(screen);
             self.focused = match screen {
                 Screen::Home => ElementId::PlayHome,
                 Screen::Games => ElementId::PlayDragonFable,
@@ -1243,9 +1194,9 @@ mod windows_launcher {
             };
         }
 
-        fn focus_order(&self) -> Vec<ElementId> {
+        fn focus_order(&self) -> &'static [ElementId] {
             match self.screen {
-                Screen::Home => vec![
+                Screen::Home => &[
                     ElementId::PlayHome,
                     ElementId::TopGames,
                     ElementId::TopNews,
@@ -1255,7 +1206,7 @@ mod windows_launcher {
                     ElementId::NavHome,
                     ElementId::NavGames,
                 ],
-                Screen::Games => vec![
+                Screen::Games => &[
                     ElementId::PlayDragonFable,
                     ElementId::FutureEpicDuel,
                     ElementId::FutureAdventureQuest,
@@ -1267,7 +1218,7 @@ mod windows_launcher {
                     ElementId::NavHome,
                     ElementId::NavGames,
                 ],
-                Screen::News => vec![
+                Screen::News => &[
                     ElementId::OpenDesignNotes,
                     ElementId::TopGames,
                     ElementId::TopNews,
@@ -1276,113 +1227,88 @@ mod windows_launcher {
                     ElementId::NavHome,
                     ElementId::NavGames,
                 ],
-                Screen::Videos | Screen::Live => {
-                    let visible_media_count = self
-                        .hits
-                        .iter()
-                        .filter_map(|hit| match hit.id {
-                            ElementId::OpenMedia(index) => Some(index + 1),
-                            _ => None,
-                        })
-                        .max()
-                        .unwrap_or_else(|| self.media_items_for_screen().len().max(1));
-                    let mut order = (0..visible_media_count)
-                        .map(ElementId::OpenMedia)
-                        .collect::<Vec<_>>();
-                    order.extend([
-                        ElementId::TopGames,
-                        ElementId::TopNews,
-                        ElementId::TopVideos,
-                        ElementId::TopLive,
-                        ElementId::NavHome,
-                        ElementId::NavGames,
-                    ]);
-                    order
-                }
+                Screen::Videos => &[
+                    ElementId::OpenMedia(0),
+                    ElementId::OpenMedia(1),
+                    ElementId::OpenMedia(2),
+                    ElementId::OpenMedia(3),
+                    ElementId::OpenMedia(4),
+                    ElementId::OpenMedia(5),
+                    ElementId::TopGames,
+                    ElementId::TopNews,
+                    ElementId::TopVideos,
+                    ElementId::TopLive,
+                    ElementId::NavHome,
+                    ElementId::NavGames,
+                ],
+                Screen::Live => &[
+                    ElementId::OpenMedia(0),
+                    ElementId::OpenMedia(1),
+                    ElementId::OpenMedia(2),
+                    ElementId::OpenMedia(3),
+                    ElementId::OpenMedia(4),
+                    ElementId::OpenMedia(5),
+                    ElementId::TopGames,
+                    ElementId::TopNews,
+                    ElementId::TopVideos,
+                    ElementId::TopLive,
+                    ElementId::NavHome,
+                    ElementId::NavGames,
+                ],
             }
         }
 
         fn focus_next(&mut self) {
             let order = self.focus_order();
-            if order.is_empty() {
-                return;
-            }
             let current = order.iter().position(|id| *id == self.focused).unwrap_or(0);
             self.focused = order[(current + 1) % order.len()];
         }
 
-        fn refresh_media_for_screen(&mut self, screen: Screen, hwnd: HWND) {
+        fn refresh_media_for_screen(&mut self, screen: Screen) {
             match screen {
-                Screen::Videos if !self.youtube_videos_loaded && !self.youtube_videos_loading => {
-                    self.youtube_videos_loading = true;
+                Screen::Videos if !self.youtube_videos_loaded => {
                     self.status = "Loading YouTube videos...".to_string();
-                    spawn_media_load(MediaLoadKind::Videos, hwnd, Arc::clone(&self.media_results));
+                    let entries = fetch_youtube_recent_entries(8).unwrap_or_else(|_| {
+                        vec![MediaEntry {
+                            source: MediaSource::YouTube,
+                            title: "Latest AdventureQuest Worlds videos".to_string(),
+                            channel: "YouTube".to_string(),
+                            url: AQW_YOUTUBE_RECENT_URL.to_string(),
+                            thumbnail_url: None,
+                        }]
+                    });
+                    self.youtube_videos = build_media_items(entries);
+                    self.youtube_videos_loaded = true;
+                    self.status = "YouTube videos loaded.".to_string();
                 }
-                Screen::Videos if self.youtube_videos_loading => {
-                    self.status = "Loading YouTube videos...".to_string();
-                }
-                Screen::Live if !self.live_media_loaded && !self.live_media_loading => {
-                    self.live_media_loading = true;
+                Screen::Live if !self.live_media_loaded => {
                     self.status = "Loading live channels...".to_string();
-                    spawn_media_load(MediaLoadKind::Live, hwnd, Arc::clone(&self.media_results));
-                }
-                Screen::Live if self.live_media_loading => {
-                    self.status = "Loading live channels...".to_string();
+                    let mut entries = fetch_youtube_live_entries().unwrap_or_default();
+                    entries.extend(fetch_twitch_live_entries(5).unwrap_or_default());
+                    if entries.is_empty() {
+                        entries = vec![
+                            MediaEntry {
+                                source: MediaSource::YouTube,
+                                title: "YouTube live channel".to_string(),
+                                channel: "AdventureQuest Worlds".to_string(),
+                                url: AQW_YOUTUBE_LIVE_URL.to_string(),
+                                thumbnail_url: None,
+                            },
+                            MediaEntry {
+                                source: MediaSource::Twitch,
+                                title: "AdventureQuest Worlds streams".to_string(),
+                                channel: "Twitch directory".to_string(),
+                                url: AQW_TWITCH_DIRECTORY_URL.to_string(),
+                                thumbnail_url: None,
+                            },
+                        ];
+                    }
+                    self.live_media = build_media_items(entries);
+                    self.live_media_loaded = true;
+                    self.status = "Live channels loaded.".to_string();
                 }
                 _ => {}
             }
-        }
-
-        fn drain_media_load_results(&mut self) {
-            let results = self
-                .media_results
-                .lock()
-                .map(|mut results| results.drain(..).collect::<Vec<_>>())
-                .unwrap_or_default();
-
-            for result in results {
-                self.apply_media_load_result(result);
-            }
-        }
-
-        fn apply_media_load_result(&mut self, result: MediaLoadResult) {
-            let MediaLoadResult {
-                kind,
-                items,
-                used_fallback,
-            } = result;
-            let is_current_screen = matches!(
-                (self.screen, kind),
-                (Screen::Videos, MediaLoadKind::Videos) | (Screen::Live, MediaLoadKind::Live)
-            );
-
-            match kind {
-                MediaLoadKind::Videos => {
-                    self.youtube_videos = items;
-                    self.youtube_videos_loaded = true;
-                    self.youtube_videos_loading = false;
-                    if is_current_screen {
-                        self.status = if used_fallback {
-                            "Could not load YouTube feed; showing fallback.".to_string()
-                        } else {
-                            "YouTube videos loaded.".to_string()
-                        };
-                    }
-                }
-                MediaLoadKind::Live => {
-                    self.live_media = items;
-                    self.live_media_loaded = true;
-                    self.live_media_loading = false;
-                    if is_current_screen {
-                        self.status = if used_fallback {
-                            "Could not load live channels; showing fallback.".to_string()
-                        } else {
-                            "Live channels loaded.".to_string()
-                        };
-                    }
-                }
-            }
-            self.mark_hits_dirty();
         }
 
         fn media_url(&self, index: usize) -> Option<&str> {
@@ -1393,12 +1319,12 @@ mod windows_launcher {
 
         fn activate(&mut self, id: ElementId, hwnd: HWND) {
             match id {
-                ElementId::NavHome => self.set_screen(Screen::Home, hwnd),
-                ElementId::NavGames => self.set_screen(Screen::Games, hwnd),
-                ElementId::TopGames => self.set_screen(Screen::Home, hwnd),
-                ElementId::TopNews => self.set_screen(Screen::News, hwnd),
-                ElementId::TopVideos => self.set_screen(Screen::Videos, hwnd),
-                ElementId::TopLive => self.set_screen(Screen::Live, hwnd),
+                ElementId::NavHome => self.set_screen(Screen::Home),
+                ElementId::NavGames => self.set_screen(Screen::Games),
+                ElementId::TopGames => self.set_screen(Screen::Home),
+                ElementId::TopNews => self.set_screen(Screen::News),
+                ElementId::TopVideos => self.set_screen(Screen::Videos),
+                ElementId::TopLive => self.set_screen(Screen::Live),
                 ElementId::PlayHome => match launch_aqw() {
                     Ok(_) => {
                         self.status = "AdventureQuest Worlds started through Ruffle.".to_string();
@@ -2356,86 +2282,6 @@ mod windows_launcher {
         open_url(hwnd, AQW_DESIGN_NOTES_URL)
     }
 
-    fn spawn_media_load(
-        kind: MediaLoadKind,
-        hwnd: HWND,
-        results: Arc<Mutex<Vec<MediaLoadResult>>>,
-    ) {
-        let hwnd_value = hwnd as isize;
-        thread::spawn(move || {
-            let result = load_media_items(kind);
-            if let Ok(mut results) = results.lock() {
-                results.push(result);
-                unsafe {
-                    PostMessageW(hwnd_value as HWND, WM_MEDIA_LOADED, 0, 0);
-                }
-            }
-        });
-    }
-
-    fn load_media_items(kind: MediaLoadKind) -> MediaLoadResult {
-        let (entries, used_fallback) = match kind {
-            MediaLoadKind::Videos => match fetch_youtube_recent_entries(8) {
-                Ok(entries) => (entries, false),
-                Err(_) => (fallback_youtube_entries(), true),
-            },
-            MediaLoadKind::Live => {
-                let mut used_fallback = false;
-                let mut entries = match fetch_youtube_live_entries() {
-                    Ok(entries) => entries,
-                    Err(_) => {
-                        used_fallback = true;
-                        Vec::new()
-                    }
-                };
-                match fetch_twitch_live_entries(5) {
-                    Ok(twitch_entries) => entries.extend(twitch_entries),
-                    Err(_) => used_fallback = true,
-                }
-                if entries.is_empty() {
-                    (fallback_live_entries(), true)
-                } else {
-                    (entries, used_fallback)
-                }
-            }
-        };
-
-        MediaLoadResult {
-            kind,
-            items: build_media_items(entries),
-            used_fallback,
-        }
-    }
-
-    fn fallback_youtube_entries() -> Vec<MediaEntry> {
-        vec![MediaEntry {
-            source: MediaSource::YouTube,
-            title: "Latest AdventureQuest Worlds videos".to_string(),
-            channel: "YouTube".to_string(),
-            url: AQW_YOUTUBE_RECENT_URL.to_string(),
-            thumbnail_url: None,
-        }]
-    }
-
-    fn fallback_live_entries() -> Vec<MediaEntry> {
-        vec![
-            MediaEntry {
-                source: MediaSource::YouTube,
-                title: "YouTube live channel".to_string(),
-                channel: "AdventureQuest Worlds".to_string(),
-                url: AQW_YOUTUBE_LIVE_URL.to_string(),
-                thumbnail_url: None,
-            },
-            MediaEntry {
-                source: MediaSource::Twitch,
-                title: "AdventureQuest Worlds streams".to_string(),
-                channel: "Twitch directory".to_string(),
-                url: AQW_TWITCH_DIRECTORY_URL.to_string(),
-                thumbnail_url: None,
-            },
-        ]
-    }
-
     fn build_media_items(entries: Vec<MediaEntry>) -> Vec<MediaItem> {
         entries
             .into_iter()
@@ -2564,15 +2410,18 @@ mod windows_launcher {
     }
 
     fn fetch_text(url: &str) -> Result<String, String> {
+        let script = format!(
+            "$ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; (Invoke-WebRequest -UseBasicParsing -TimeoutSec 10 -Uri {} -Headers @{{'User-Agent'='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AELauncher'}}).Content",
+            ps_quote(url)
+        );
         let output = Command::new("powershell")
             .creation_flags(CREATE_NO_WINDOW)
-            .env("AELAUNCHER_FETCH_URI", url)
             .args([
                 "-NoProfile",
                 "-ExecutionPolicy",
                 "Bypass",
                 "-Command",
-                POWERSHELL_FETCH_TEXT_SCRIPT,
+                &script,
             ])
             .output()
             .map_err(|error| error.to_string())?;
@@ -2589,46 +2438,29 @@ mod windows_launcher {
             .duration_since(UNIX_EPOCH)
             .map_err(|error| error.to_string())?
             .as_millis();
-        let nonce = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = temp_dir.join(format!("thumb-{}-{stamp}-{nonce}.bin", std::process::id()));
-        let temp_file = TempFileGuard::new(path);
+        let path = temp_dir.join(format!("thumb-{stamp}.bin"));
+        let script = format!(
+            "$ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -UseBasicParsing -TimeoutSec 10 -Uri {} -OutFile {} -Headers @{{'User-Agent'='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AELauncher'}}",
+            ps_quote(url),
+            ps_quote(&path.to_string_lossy())
+        );
         let output = Command::new("powershell")
             .creation_flags(CREATE_NO_WINDOW)
-            .env("AELAUNCHER_FETCH_URI", url)
-            .env("AELAUNCHER_FETCH_OUTFILE", temp_file.path())
             .args([
                 "-NoProfile",
                 "-ExecutionPolicy",
                 "Bypass",
                 "-Command",
-                POWERSHELL_FETCH_FILE_SCRIPT,
+                &script,
             ])
             .output()
             .map_err(|error| error.to_string())?;
         if !output.status.success() {
             return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
         }
-        fs::read(temp_file.path()).map_err(|error| error.to_string())
-    }
-
-    struct TempFileGuard {
-        path: PathBuf,
-    }
-
-    impl TempFileGuard {
-        fn new(path: PathBuf) -> Self {
-            Self { path }
-        }
-
-        fn path(&self) -> &Path {
-            &self.path
-        }
-    }
-
-    impl Drop for TempFileGuard {
-        fn drop(&mut self) {
-            let _ = fs::remove_file(&self.path);
-        }
+        let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+        let _ = fs::remove_file(path);
+        Ok(bytes)
     }
 
     fn xml_tag(content: &str, tag: &str) -> Option<String> {
@@ -2704,6 +2536,10 @@ mod windows_launcher {
             .replace("&gt;", ">")
     }
 
+    fn ps_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+
     fn open_url(hwnd: HWND, url: &str) -> Result<(), String> {
         unsafe {
             let operation = wide("open");
@@ -2743,9 +2579,9 @@ mod windows_launcher {
         fs::create_dir_all(&temp_path).map_err(|error| error.to_string())?;
 
         let ruffle_path = temp_path.join(if diagnostics {
-            format!("AQW-Ruffle-debug-{}.exe", std::process::id())
+            "AQW-Ruffle-debug.exe"
         } else {
-            format!("AQW-Ruffle-{}.exe", std::process::id())
+            "AQW-Ruffle.exe"
         });
         let should_write = fs::read(&ruffle_path)
             .map(|existing| existing.as_slice() != RUFFLE_EXE)
@@ -2920,16 +2756,10 @@ mod windows_launcher {
                 paint(hwnd);
                 0
             }
-            WM_MEDIA_LOADED => {
-                if let Some(app) = app_mut(hwnd) {
-                    app.drain_media_load_results();
-                    InvalidateRect(hwnd, null(), 0);
-                }
-                0
-            }
             WM_SIZE => {
                 if let Some(app) = app_mut(hwnd) {
-                    app.mark_hits_dirty();
+                    let (width, height) = client_size(hwnd);
+                    app.update_hits(width, height);
                 }
                 InvalidateRect(hwnd, null(), 0);
                 0
@@ -2938,10 +2768,8 @@ mod windows_launcher {
                 let x = loword_signed(lparam);
                 let y = hiword_signed(lparam);
                 if let Some(app) = app_mut(hwnd) {
-                    if app.hits_dirty || app.hits.is_empty() {
-                        let (width, height) = client_size(hwnd);
-                        app.ensure_hits(width, height);
-                    }
+                    let (width, height) = client_size(hwnd);
+                    app.update_hits(width, height);
                     let hovered = app.hit_test(x, y);
                     if app.hovered != hovered {
                         app.hovered = hovered;
@@ -2973,10 +2801,8 @@ mod windows_launcher {
                 let x = loword_signed(lparam);
                 let y = hiword_signed(lparam);
                 if let Some(app) = app_mut(hwnd) {
-                    if app.hits_dirty || app.hits.is_empty() {
-                        let (width, height) = client_size(hwnd);
-                        app.ensure_hits(width, height);
-                    }
+                    let (width, height) = client_size(hwnd);
+                    app.update_hits(width, height);
                     if let Some(id) = app.hit_test(x, y) {
                         app.focused = id;
                         app.activate(id, hwnd);
@@ -3079,77 +2905,6 @@ mod windows_launcher {
         )
     }
 
-    thread_local! {
-        static FONT_CACHE: RefCell<FontCache> = RefCell::new(FontCache::new());
-    }
-
-    struct CachedFont {
-        dpi: i32,
-        size: i32,
-        weight: i32,
-        handle: HFONT,
-    }
-
-    struct FontCache {
-        fonts: Vec<CachedFont>,
-    }
-
-    impl FontCache {
-        fn new() -> Self {
-            Self { fonts: Vec::new() }
-        }
-
-        fn get(&mut self, dpi: i32, size: i32, weight: i32) -> HFONT {
-            if let Some(font) = self
-                .fonts
-                .iter()
-                .find(|font| font.dpi == dpi && font.size == size && font.weight == weight)
-            {
-                return font.handle;
-            }
-
-            let font_name = wide("Segoe UI");
-            let font_height = -((size * dpi) / 72);
-            let handle = unsafe {
-                CreateFontW(
-                    font_height,
-                    0,
-                    0,
-                    0,
-                    weight,
-                    0,
-                    0,
-                    0,
-                    DEFAULT_CHARSET as u32,
-                    OUT_DEFAULT_PRECIS as u32,
-                    CLIP_DEFAULT_PRECIS as u32,
-                    CLEARTYPE_QUALITY as u32,
-                    DEFAULT_PITCH as u32,
-                    font_name.as_ptr(),
-                )
-            };
-            self.fonts.push(CachedFont {
-                dpi,
-                size,
-                weight,
-                handle,
-            });
-            handle
-        }
-    }
-
-    impl Drop for FontCache {
-        fn drop(&mut self) {
-            for font in &self.fonts {
-                if !font.handle.is_null() {
-                    unsafe {
-                        DeleteObject(font.handle);
-                    }
-                }
-            }
-        }
-    }
-
     fn draw_text(
         hdc: windows_sys::Win32::Graphics::Gdi::HDC,
         text: &str,
@@ -3160,13 +2915,26 @@ mod windows_launcher {
         flags: u32,
     ) {
         unsafe {
+            let font_name = wide("Segoe UI");
             let dpi = GetDeviceCaps(hdc, LOGPIXELSY as i32).max(96);
-            let font = FONT_CACHE.with(|cache| cache.borrow_mut().get(dpi, size, weight));
-            let previous = if font.is_null() {
-                null_mut()
-            } else {
-                SelectObject(hdc, font)
-            };
+            let font_height = -((size * dpi) / 72);
+            let font = CreateFontW(
+                font_height,
+                0,
+                0,
+                0,
+                weight,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET as u32,
+                OUT_DEFAULT_PRECIS as u32,
+                CLIP_DEFAULT_PRECIS as u32,
+                CLEARTYPE_QUALITY as u32,
+                DEFAULT_PITCH as u32,
+                font_name.as_ptr(),
+            );
+            let previous = SelectObject(hdc, font);
             SetTextColor(hdc, color.color_ref());
             SetBkMode(hdc, TRANSPARENT as i32);
             let wide_text = wide(text);
@@ -3183,9 +2951,8 @@ mod windows_launcher {
                 &mut win_rect,
                 flags,
             );
-            if !font.is_null() {
-                SelectObject(hdc, previous);
-            }
+            SelectObject(hdc, previous);
+            DeleteObject(font);
         }
     }
 

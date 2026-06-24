@@ -1,4 +1,4 @@
-use std::cell::{Cell, OnceCell};
+use std::cell::OnceCell;
 
 use crate::backend::audio::SoundHandle;
 use crate::binary_data::BinaryData;
@@ -12,7 +12,7 @@ use gc_arena::{Collect, Gc, Mutation};
 use ruffle_render::backend::RenderBackend;
 use ruffle_render::bitmap::{Bitmap as RenderBitmap, BitmapHandle, BitmapSize};
 use ruffle_render::error::Error as RenderError;
-use swf::{DefineBitsLossless, Rectangle, Twips};
+use swf::DefineBitsLossless;
 
 #[derive(Copy, Clone, Collect, Debug)]
 #[collect(no_drop)]
@@ -42,8 +42,6 @@ pub struct BitmapCharacter<'gc> {
     /// The bitmap class set by `SymbolClass` - this is used when we instantaite
     /// a `Bitmap` displayobject.
     avm2_class: Lock<BitmapClass<'gc>>,
-    /// Rectangle used for 9-slice scaling (`DefineScalingGrid`).
-    scaling_grid: Cell<Rectangle<Twips>>,
 }
 
 impl<'gc> BitmapCharacter<'gc> {
@@ -52,7 +50,6 @@ impl<'gc> BitmapCharacter<'gc> {
             compressed,
             handle: OnceCell::default(),
             avm2_class: Lock::new(BitmapClass::NoSubclass),
-            scaling_grid: Default::default(),
         }
     }
 
@@ -62,14 +59,6 @@ impl<'gc> BitmapCharacter<'gc> {
 
     pub fn avm2_class(&self) -> BitmapClass<'gc> {
         self.avm2_class.get()
-    }
-
-    pub fn scaling_grid(&self) -> Rectangle<Twips> {
-        self.scaling_grid.get()
-    }
-
-    pub fn set_scaling_grid(&self, rect: Rectangle<Twips>) {
-        self.scaling_grid.set(rect);
     }
 
     pub fn set_avm2_class(this: Gc<'gc, Self>, bitmap_class: BitmapClass<'gc>, mc: &Mutation<'gc>) {

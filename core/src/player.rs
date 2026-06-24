@@ -82,9 +82,6 @@ use web_time::Instant;
 #[cfg(feature = "default_font")]
 pub const FALLBACK_DEVICE_FONT: &[u8] = include_bytes!("../assets/notosans.subset.ttf.gz");
 
-const AQW_DIRTY_CACHE_REDRAWS_PER_FRAME: u32 = 8;
-const AQW_DIRTY_CACHE_REDRAW_PIXELS_PER_FRAME: u64 = 6_000_000;
-
 #[derive(Collect)]
 #[collect(no_drop)]
 struct GcRoot<'gc> {
@@ -2066,9 +2063,6 @@ impl Player {
                 transform_stack: &mut this.transform_stack,
                 is_offscreen: false,
                 use_bitmap_cache: true,
-                dirty_cache_redraws_remaining: AQW_DIRTY_CACHE_REDRAWS_PER_FRAME,
-                dirty_cache_redraws_reserved: 0,
-                dirty_cache_redraw_pixels_remaining: AQW_DIRTY_CACHE_REDRAW_PIXELS_PER_FRAME,
                 stage,
             };
 
