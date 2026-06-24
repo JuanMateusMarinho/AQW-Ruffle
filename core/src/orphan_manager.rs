@@ -118,5 +118,6 @@ fn valid_orphan<'gc>(
     dobj: DisplayObjectWeak<'gc>,
     mc: &Mutation<'gc>,
 ) -> Option<DisplayObject<'gc>> {
-    dobj.upgrade(mc).filter(|dobj| dobj.parent().is_none())
+    dobj.upgrade(mc)
+        .filter(|dobj| dobj.parent().is_none() && !dobj.is_in_detached_aqw_avatar_loader())
 }

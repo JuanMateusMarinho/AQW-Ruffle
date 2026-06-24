@@ -497,9 +497,18 @@ impl<'gc> Avm2<'gc> {
                 .get(i)
                 .copied();
 
-            if let Some(object) = object.and_then(|obj| obj.upgrade(context.gc()))
-                && object.is_of_type(on_type.inner_class_definition())
-            {
+            if let Some(object) = object.and_then(|obj| obj.upgrade(context.gc())) {
+                if object
+                    .as_display_object()
+                    .is_some_and(|display_object| display_object.is_in_detached_aqw_avatar_loader())
+                {
+                    continue;
+                }
+
+                if !object.is_of_type(on_type.inner_class_definition()) {
+                    continue;
+                }
+
                 let mut activation = Activation::from_nothing(context);
 
                 events::broadcast_event(&mut activation, object, event);

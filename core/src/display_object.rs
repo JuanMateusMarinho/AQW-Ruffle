@@ -1045,6 +1045,8 @@ struct DrawCacheInfo {
 
 const AQW_OFFSCREEN_CACHE_LIMIT_PIXELS: f64 = 512.0 * 512.0;
 const AQW_OFFSCREEN_CACHE_LIMIT_SIDE: f64 = 1024.0;
+const AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_PIXELS: u64 = 16_384;
+const AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_SIDE: u32 = 128;
 
 fn should_bypass_offscreen_bitmap_cache<'gc>(
     this: DisplayObject<'gc>,
@@ -1150,26 +1152,63 @@ pub fn render_base<'gc>(
                         y_max: filter_rect.y_max.to_pixels().ceil() as i32,
                     };
                     let draw_offset = Point::new(filter_rect.x_min, filter_rect.y_min);
+                    let actual_width = filter_rect.width().max(0) as u32;
+                    let actual_height = filter_rect.height().max(0) as u32;
                     if cache.is_dirty(&base_transform.matrix, width, height) {
-                        cache.update(
-                            context.renderer,
-                            base_transform.matrix,
-                            width,
-                            height,
-                            filter_rect.width() as u32,
-                            filter_rect.height() as u32,
-                            draw_offset,
-                            swf_version,
-                            allow_aqw_large_cache,
-                        );
-                        cache_info = cache.handle().map(|handle| DrawCacheInfo {
-                            handle,
-                            dirty: true,
-                            base_transform,
-                            bounds,
-                            draw_offset,
-                            filters,
-                        });
+                        let redraw_pixels = u64::from(actual_width) * u64::from(actual_height);
+                        let should_budget_redraw = allow_aqw_large_cache
+                            && redraw_pixels >= AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_PIXELS
+                            && (actual_width >= AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_SIDE
+                                || actual_height >= AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_SIDE);
+                        let can_redraw_cache = !should_budget_redraw
+                            || context.try_reserve_dirty_cache_redraw(redraw_pixels);
+
+                        if can_redraw_cache {
+                            cache.update(
+                                context.renderer,
+                                base_transform.matrix,
+                                width,
+                                height,
+                                actual_width,
+                                actual_height,
+                                draw_offset,
+                                swf_version,
+                                allow_aqw_large_cache,
+                            );
+                            cache_info = cache.handle().map(|handle| DrawCacheInfo {
+                                handle,
+                                dirty: true,
+                                base_transform,
+                                bounds,
+                                draw_offset,
+                                filters,
+                            });
+                        } else {
+                            // Prefer an existing cache while the redraw is deferred.
+                            // If this is the first draw, normal vector rendering below
+                            // keeps the object visible until its cache is admitted.
+                            cache_info = cache.handle().map(|handle| DrawCacheInfo {
+                                handle,
+                                dirty: false,
+                                base_transform,
+                                bounds,
+                                draw_offset,
+                                filters,
+                            });
+
+                            if aqw_diagnostics_enabled() {
+                                tracing::info!(
+                                    target: "aqw_diag",
+                                    width,
+                                    height,
+                                    actual_width,
+                                    actual_height,
+                                    redraw_pixels,
+                                    has_stale_cache = cache_info.is_some(),
+                                    "Deferring dirty AQW bitmap cache redraw"
+                                );
+                            }
+                        }
                     } else {
                         cache_info = cache.handle().map(|handle| DrawCacheInfo {
                             handle,
@@ -1227,7 +1266,13 @@ pub fn render_base<'gc>(
                 library: context.library,
                 transform_stack: &mut transform_stack,
                 is_offscreen: true,
-                use_bitmap_cache: true,
+                // The outer cache already captures this subtree. Reusing child
+                // cacheAsBitmap objects here duplicates textures and can explode
+                // memory in crowded AQW rooms.
+                use_bitmap_cache: !is_aqw_movie_url(this.movie().url()),
+                dirty_cache_redraws_remaining: 0,
+                dirty_cache_redraws_reserved: 0,
+                dirty_cache_redraw_pixels_remaining: 0,
                 stage: context.stage,
             };
             this.render_self(&mut offscreen_context);
@@ -2057,6 +2102,27 @@ pub trait TDisplayObject<'gc>:
     #[no_dynamic]
     fn parent(self) -> Option<DisplayObject<'gc>> {
         self.base().parent()
+    }
+
+    /// Whether this object belongs to an AQW player-asset Loader that was
+    /// removed from the display list. These detached trees may remain strongly
+    /// referenced by game code, but should not consume frame time until they
+    /// are attached again.
+    #[no_dynamic]
+    fn is_in_detached_aqw_avatar_loader(self) -> bool {
+        let mut current: Option<DisplayObject<'gc>> = Some(self.into());
+
+        while let Some(display_object) = current {
+            if let DisplayObject::LoaderDisplay(loader) = display_object
+                && loader.is_detached_aqw_avatar_loader()
+            {
+                return true;
+            }
+
+            current = display_object.parent();
+        }
+
+        false
     }
 
     /// Set the parent of this display object.

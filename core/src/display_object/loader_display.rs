@@ -18,7 +18,7 @@ use gc_arena::barrier::unlock;
 use gc_arena::lock::{Lock, RefLock};
 use gc_arena::{Collect, Gc, GcWeak, Mutation};
 use ruffle_common::utils::HasPrefixField;
-use std::cell::{Ref, RefMut};
+use std::cell::{Cell, Ref, RefMut};
 use std::sync::Arc;
 
 use super::interactive::Avm2MousePick;
@@ -43,6 +43,7 @@ pub struct LoaderDisplayData<'gc> {
     container: RefLock<ChildContainer<'gc>>,
     avm2_object: Lock<Option<Avm2StageObject<'gc>>>,
     movie: Arc<SwfMovie>,
+    aqw_was_detached: Cell<bool>,
 }
 
 impl<'gc> LoaderDisplay<'gc> {
@@ -54,6 +55,7 @@ impl<'gc> LoaderDisplay<'gc> {
                 container: RefLock::new(ChildContainer::new(&movie)),
                 avm2_object: Lock::new(None),
                 movie,
+                aqw_was_detached: Cell::new(false),
             },
         ));
 
@@ -64,6 +66,18 @@ impl<'gc> LoaderDisplay<'gc> {
 
     pub fn downgrade(self) -> LoaderDisplayWeak<'gc> {
         LoaderDisplayWeak(Gc::downgrade(self.0))
+    }
+
+    pub fn is_detached_aqw_avatar_loader(self) -> bool {
+        self.parent().is_none()
+            && self.0.aqw_was_detached.get()
+            && self.iter_render_list().any(|child| {
+                let movie = child.movie();
+                let url = movie.url();
+                url.contains("/gamefiles/items/")
+                    || url.contains("/gamefiles/classes/")
+                    || url.contains("/gamefiles/hair/")
+            })
     }
 }
 
@@ -135,6 +149,7 @@ impl<'gc> TDisplayObject<'gc> for LoaderDisplay<'gc> {
 
     fn on_parent_removed(self, context: &mut UpdateContext<'gc>) {
         if self.movie().is_action_script_3() {
+            self.0.aqw_was_detached.set(true);
             context.orphan_manager.add_orphan_obj(self.into())
         }
     }
