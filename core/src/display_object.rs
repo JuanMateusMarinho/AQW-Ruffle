@@ -2132,6 +2132,7 @@ pub trait TDisplayObject<'gc>:
         let write = Gc::write(context.gc(), self.base());
         DisplayObjectBase::set_parent_ignoring_orphan_list(write, parent);
         let parent_removed = had_parent && parent.is_none();
+        let parent_added = !had_parent && parent.is_some();
 
         if parent_removed {
             if let Some(int) = self.as_interactive() {
@@ -2139,8 +2140,14 @@ pub trait TDisplayObject<'gc>:
             }
 
             self.on_parent_removed(context);
+        } else if parent_added {
+            self.on_parent_added(context);
         }
     }
+
+    /// This method is called when an object without a parent is attached.
+    /// It may be overwritten to restore implementation-specific state.
+    fn on_parent_added(self, _context: &mut UpdateContext<'gc>) {}
 
     /// This method is called when the parent is removed.
     /// It may be overwritten to inject some implementation-specific behavior.

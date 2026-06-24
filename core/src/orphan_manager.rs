@@ -1,8 +1,9 @@
 //! Special handling for AVM2 orphan objects
 
 use crate::context::UpdateContext;
-use crate::display_object::{DisplayObject, DisplayObjectWeak, TDisplayObject};
+use crate::display_object::{DisplayObject, DisplayObjectPtr, DisplayObjectWeak, TDisplayObject};
 use gc_arena::{Collect, Mutation};
+use std::collections::HashSet;
 use std::rc::Rc;
 
 /// The list of 'orphan' objects - these objects have no parent,
@@ -46,6 +47,13 @@ impl<'gc> OrphanManager<'gc> {
     pub fn remove_orphan_obj(&mut self, dobj: DisplayObject<'gc>) {
         self.orphans_mut()
             .retain(|orphan| !std::ptr::eq(orphan.as_ptr(), dobj.as_ptr()));
+    }
+
+    pub fn remove_orphan_objs(&mut self, objects: &[DisplayObject<'gc>]) {
+        let object_ptrs: HashSet<*const DisplayObjectPtr> =
+            objects.iter().map(|object| object.as_ptr()).collect();
+        self.orphans_mut()
+            .retain(|orphan| !object_ptrs.contains(&orphan.as_ptr()));
     }
 
     pub fn len(&self) -> usize {

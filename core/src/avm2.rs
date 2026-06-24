@@ -28,6 +28,7 @@ use fnv::FnvHashMap;
 use gc_arena::lock::GcRefLock;
 use gc_arena::{Collect, Gc, Mutation};
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::sync::Arc;
 use swf::DoAbc2Flag;
 use swf::avm2::read::Reader;
@@ -207,6 +208,10 @@ pub struct Avm2<'gc> {
     /// currently present on the display list. This list keeps track of that.
     broadcast_list: FnvHashMap<AvmString<'gc>, Vec<WeakObject<'gc>>>,
 
+    /// AQW player asset listeners temporarily removed from the active broadcast
+    /// lists while their Loader is detached from the display list.
+    broadcast_list_suspended: FnvHashMap<AvmString<'gc>, Vec<WeakObject<'gc>>>,
+
     alias_to_class_map: FnvHashMap<AvmString<'gc>, ClassObject<'gc>>,
     class_to_alias_map: FnvHashMap<Class<'gc>, AvmString<'gc>>,
 
@@ -263,6 +268,7 @@ impl<'gc> Avm2<'gc> {
             native_custom_constructor_table: Default::default(),
             native_fast_call_list: Default::default(),
             broadcast_list: Default::default(),
+            broadcast_list_suspended: Default::default(),
 
             alias_to_class_map: Default::default(),
             class_to_alias_map: Default::default(),
@@ -426,6 +432,67 @@ impl<'gc> Avm2<'gc> {
         for bucket in self.broadcast_list.values_mut() {
             bucket.retain(|weak| !std::ptr::eq(weak.as_ptr(), object_ptr));
         }
+        for bucket in self.broadcast_list_suspended.values_mut() {
+            bucket.retain(|weak| !std::ptr::eq(weak.as_ptr(), object_ptr));
+        }
+    }
+
+    pub fn suspend_objects_from_broadcast_list(
+        &mut self,
+        object_ptrs: &[*const crate::avm2::object::ObjectPtr],
+    ) {
+        let object_ptrs: HashSet<_> = object_ptrs.iter().copied().collect();
+        let mut suspended = Vec::new();
+
+        for (event_name, bucket) in &mut self.broadcast_list {
+            let mut index = 0;
+            while index < bucket.len() {
+                if object_ptrs.contains(&bucket[index].as_ptr()) {
+                    suspended.push((*event_name, bucket.swap_remove(index)));
+                } else {
+                    index += 1;
+                }
+            }
+        }
+
+        for (event_name, listener) in suspended {
+            let bucket = self.broadcast_list_suspended.entry(event_name).or_default();
+            if bucket
+                .iter()
+                .all(|entry| !std::ptr::eq(entry.as_ptr(), listener.as_ptr()))
+            {
+                bucket.push(listener);
+            }
+        }
+    }
+
+    pub fn restore_objects_to_broadcast_list(
+        &mut self,
+        object_ptrs: &[*const crate::avm2::object::ObjectPtr],
+    ) {
+        let object_ptrs: HashSet<_> = object_ptrs.iter().copied().collect();
+        let mut restored = Vec::new();
+
+        for (event_name, bucket) in &mut self.broadcast_list_suspended {
+            let mut index = 0;
+            while index < bucket.len() {
+                if object_ptrs.contains(&bucket[index].as_ptr()) {
+                    restored.push((*event_name, bucket.swap_remove(index)));
+                } else {
+                    index += 1;
+                }
+            }
+        }
+
+        for (event_name, listener) in restored {
+            let bucket = self.broadcast_list.entry(event_name).or_default();
+            if bucket
+                .iter()
+                .all(|entry| !std::ptr::eq(entry.as_ptr(), listener.as_ptr()))
+            {
+                bucket.push(listener);
+            }
+        }
     }
 
     pub fn broadcast_listener_count(&self) -> usize {
@@ -441,7 +508,18 @@ impl<'gc> Avm2<'gc> {
             return;
         }
 
-        let bucket = context.avm2.broadcast_list.entry(event_name).or_default();
+        let suspended = object
+            .as_display_object()
+            .is_some_and(|display_object| display_object.is_in_detached_aqw_avatar_loader());
+        let bucket = if suspended {
+            context
+                .avm2
+                .broadcast_list_suspended
+                .entry(event_name)
+                .or_default()
+        } else {
+            context.avm2.broadcast_list.entry(event_name).or_default()
+        };
 
         for entry in bucket.iter() {
             // Note: comparing pointers is correct because GcWeak keeps its allocation alive,
@@ -497,18 +575,9 @@ impl<'gc> Avm2<'gc> {
                 .get(i)
                 .copied();
 
-            if let Some(object) = object.and_then(|obj| obj.upgrade(context.gc())) {
-                if object
-                    .as_display_object()
-                    .is_some_and(|display_object| display_object.is_in_detached_aqw_avatar_loader())
-                {
-                    continue;
-                }
-
-                if !object.is_of_type(on_type.inner_class_definition()) {
-                    continue;
-                }
-
+            if let Some(object) = object.and_then(|obj| obj.upgrade(context.gc()))
+                && object.is_of_type(on_type.inner_class_definition())
+            {
                 let mut activation = Activation::from_nothing(context);
 
                 events::broadcast_event(&mut activation, object, event);

@@ -1,6 +1,7 @@
 use crate::avm1::Object as Avm1Object;
 use crate::avm2::Activation;
 use crate::avm2::StageObject as Avm2StageObject;
+use crate::avm2::object::TObject as _;
 use crate::backend::ui::MouseCursor;
 use crate::context::RenderContext;
 use crate::context::UpdateContext;
@@ -69,15 +70,44 @@ impl<'gc> LoaderDisplay<'gc> {
     }
 
     pub fn is_detached_aqw_avatar_loader(self) -> bool {
-        self.parent().is_none()
-            && self.0.aqw_was_detached.get()
-            && self.iter_render_list().any(|child| {
-                let movie = child.movie();
-                let url = movie.url();
-                url.contains("/gamefiles/items/")
-                    || url.contains("/gamefiles/classes/")
-                    || url.contains("/gamefiles/hair/")
-            })
+        self.parent().is_none() && self.0.aqw_was_detached.get() && self.contains_aqw_avatar_asset()
+    }
+
+    fn contains_aqw_avatar_asset(self) -> bool {
+        self.iter_render_list().any(|child| {
+            let movie = child.movie();
+            let url = movie.url();
+            url.contains("/gamefiles/items/")
+                || url.contains("/gamefiles/classes/")
+                || url.contains("/gamefiles/hair/")
+        })
+    }
+
+    fn set_aqw_tree_suspended(self, context: &mut UpdateContext<'gc>, suspended: bool) {
+        let mut stack: Vec<DisplayObject<'gc>> = vec![self.into()];
+        let mut tree = Vec::new();
+        let mut object_ptrs = Vec::new();
+
+        while let Some(display_object) = stack.pop() {
+            if let Some(object) = display_object.object2() {
+                object_ptrs.push(object.as_ptr());
+            }
+
+            if let Some(container) = display_object.as_container() {
+                stack.extend(container.iter_render_list());
+            }
+
+            tree.push(display_object);
+        }
+
+        context.orphan_manager.remove_orphan_objs(&tree);
+        if suspended {
+            context
+                .avm2
+                .suspend_objects_from_broadcast_list(&object_ptrs);
+        } else {
+            context.avm2.restore_objects_to_broadcast_list(&object_ptrs);
+        }
     }
 }
 
@@ -147,10 +177,20 @@ impl<'gc> TDisplayObject<'gc> for LoaderDisplay<'gc> {
         self.0.movie.clone()
     }
 
+    fn on_parent_added(self, context: &mut UpdateContext<'gc>) {
+        if self.0.aqw_was_detached.replace(false) {
+            self.set_aqw_tree_suspended(context, false);
+        }
+    }
+
     fn on_parent_removed(self, context: &mut UpdateContext<'gc>) {
         if self.movie().is_action_script_3() {
-            self.0.aqw_was_detached.set(true);
-            context.orphan_manager.add_orphan_obj(self.into())
+            if self.contains_aqw_avatar_asset() {
+                self.0.aqw_was_detached.set(true);
+                self.set_aqw_tree_suspended(context, true);
+            } else {
+                context.orphan_manager.add_orphan_obj(self.into())
+            }
         }
     }
 }
