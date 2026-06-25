@@ -366,8 +366,8 @@ app.launchArtixRuffleGame = (gameName) => {
 		'--frame-rate', '24',
 		'--width', gameInfo.width,
 		'--height', gameInfo.height,
-		'--scale', 'exact-fit',
-		'--force-scale',
+		'--scale', 'show-all',
+		'--letterbox', 'on',
 		'--upgrade-to-https',
 		'--player-version', '32',
 		'-m', '60',
@@ -421,6 +421,11 @@ if (!main.includes("app.launchArtixRuffleGame = (gameName) =>")) {
   }
   main = main.replace(insertBefore, artixRuffleLauncher + insertBefore);
 }
+
+main = main.replace(
+  /'--scale', 'exact-fit',\r?\n\t\t'--force-scale',/,
+  "'--scale', 'show-all',\r\n\t\t'--letterbox', 'on',"
+);
 
 if (!main.includes("app.injectAqTubeTab = () =>")) {
   if (!main.includes(insertBefore)) {
