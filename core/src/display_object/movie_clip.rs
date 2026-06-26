@@ -2607,10 +2607,10 @@ impl<'gc> MovieClip<'gc> {
             return false;
         }
 
-        let divisor = if *context.aqw_avatar_asset_roots_previous >= AQW_AVATAR_HEAVY_THROTTLE_ROOTS
-        {
+        let previous_roots = *context.aqw_avatar_asset_roots_previous;
+        let divisor = if previous_roots >= AQW_AVATAR_HEAVY_THROTTLE_ROOTS {
             3
-        } else if *context.aqw_avatar_asset_roots_previous >= AQW_AVATAR_THROTTLE_ROOTS {
+        } else if previous_roots >= AQW_AVATAR_THROTTLE_ROOTS {
             2
         } else {
             self.0.aqw_timeline_counter.set(0);
@@ -2621,6 +2621,16 @@ impl<'gc> MovieClip<'gc> {
         self.0.aqw_timeline_counter.set(counter);
         let skip = counter != 0;
         self.0.aqw_skip_timeline_frame.set(skip);
+
+        if aqw_diagnostics_enabled() {
+            tracing::info!(
+                target: "aqw_diag",
+                "AQW_THROTTLE: {} avatar frame {}/{} (roots: {}, total_active: {})",
+                if skip { "skip" } else { "render" },
+                counter, divisor, previous_roots, context.aqw_avatar_asset_roots
+            );
+        }
+
         skip
     }
 }
