@@ -69,6 +69,11 @@ fn aqw_diagnostics_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
 }
 
+fn aqw_timeline_throttle_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_TIMELINE_THROTTLE").is_some())
+}
+
 fn is_aqw_avatar_asset_movie_url(url: &str) -> bool {
     url.contains("/gamefiles/items/")
         || url.contains("/gamefiles/classes/")
@@ -995,7 +1000,7 @@ impl<'gc> MovieClip<'gc> {
             // Despite not running, the goto still overwrites the currently enqueued frame.
             self.0.queued_goto_frame.set(None);
 
-            if is_aqw_avatar_asset_movie_url(movie.url()) {
+            if aqw_timeline_throttle_enabled() && is_aqw_avatar_asset_movie_url(movie.url()) {
                 if aqw_diagnostics_enabled() {
                     tracing::info!(
                         target: "aqw_diag",
@@ -2601,6 +2606,11 @@ impl<'gc> MovieClip<'gc> {
 
         *context.aqw_avatar_asset_roots = context.aqw_avatar_asset_roots.saturating_add(1);
         self.0.aqw_skip_timeline_frame.set(false);
+
+        if !aqw_timeline_throttle_enabled() {
+            self.0.aqw_timeline_counter.set(0);
+            return false;
+        }
 
         if !can_throttle || self.current_frame() == 0 {
             self.0.aqw_timeline_counter.set(0);

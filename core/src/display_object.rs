@@ -2450,6 +2450,14 @@ pub trait TDisplayObject<'gc>:
         self.base().cell.borrow().cache.is_some()
     }
 
+    /// Drop any rendered bitmap cache while preserving the object's cache preference.
+    #[no_dynamic]
+    fn clear_bitmap_cache(self) {
+        if let Some(cache) = &mut *self.base().bitmap_cache_mut() {
+            cache.clear();
+        }
+    }
+
     /// Explicitly sets the preference of this display object to be cached into a bitmap rendering.
     /// Note that the object will still be bitmap cached if a filter is active.
     #[no_dynamic]

@@ -67,6 +67,29 @@ foreach ($exeName in $exeNames) {
 }
 $sourceByExe["AQW.exe"] = $AqwExePath
 
+function Copy-ItemWithRetry {
+    param(
+        [string]$Source,
+        [string]$Destination,
+        [int]$Attempts = 8,
+        [int]$DelayMilliseconds = 750
+    )
+
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            Copy-Item -LiteralPath $Source -Destination $Destination -Force
+            return
+        } catch {
+            if ($attempt -eq $Attempts) {
+                throw
+            }
+
+            Write-Warning "Copy failed for $Destination; retrying ($attempt/$Attempts)."
+            Start-Sleep -Milliseconds $DelayMilliseconds
+        }
+    }
+}
+
 foreach ($exeName in $exeNames) {
     $sourcePath = $sourceByExe[$exeName]
     if (-not (Test-Path -LiteralPath $sourcePath)) {
@@ -88,7 +111,7 @@ foreach ($exeName in $exeNames) {
     foreach ($destination in $destinations) {
         $destinationDir = Split-Path -Parent $destination
         New-Item -ItemType Directory -Path $destinationDir -Force | Out-Null
-        Copy-Item -LiteralPath $sourcePath -Destination $destination -Force
+        Copy-ItemWithRetry -Source $sourcePath -Destination $destination
 
         $destinationHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $destination).Hash
         if ($destinationHash -ne $sourceHash) {

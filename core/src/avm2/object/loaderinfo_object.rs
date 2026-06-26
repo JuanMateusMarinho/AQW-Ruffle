@@ -24,6 +24,7 @@ fn cleanup_unloaded_display_object_tree<'gc>(
 
     while let Some(dobj) = stack.pop() {
         context.orphan_manager.remove_orphan_obj(dobj);
+        dobj.clear_bitmap_cache();
 
         if let Some(object) = dobj.object2() {
             context
@@ -347,15 +348,18 @@ impl<'gc> LoaderInfoObject<'gc> {
             .display_object();
         let mut loader = loader_display_object.as_container().unwrap();
 
-        // Remove only the content tracked by LoaderInfo. User code can add
-        // auxiliary children to Loader, and Flash does not purge those here.
-        if let Some(content) = previous_content
-            && content
+        if let Some(content) = previous_content {
+            context.load_manager.cancel_load_for_target(content);
+
+            // Remove only the content tracked by LoaderInfo. User code can add
+            // auxiliary children to Loader, and Flash does not purge those here.
+            if content
                 .parent()
                 .is_some_and(|parent| DisplayObject::ptr_eq(parent, loader_display_object))
-        {
-            context.load_manager.cancel_load_for_target(content);
-            loader.remove_child(context, content);
+            {
+                loader.remove_child(context, content);
+            }
+
             cleanup_unloaded_display_object_tree(context, content);
         }
     }

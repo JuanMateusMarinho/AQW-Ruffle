@@ -396,18 +396,26 @@ app.artixRuffleGames = {
 
 app.artixRuffleProcesses = app.artixRuffleProcesses || {};
 
+app.resolveArtixRuffleExe = (gameInfo) => {
+	const binDir = path.join(process.resourcesPath || path.join(__dirname, '..'), 'bin');
+	return {
+		exeName: gameInfo.exe,
+		exePath: path.join(binDir, gameInfo.exe),
+	};
+};
+
 app.launchArtixRuffleGame = (gameName) => {
 	const gameInfo = app.artixRuffleGames[gameName];
 	if (!gameInfo) {
 		return false;
 	}
 
+	const resolvedExe = app.resolveArtixRuffleExe(gameInfo);
 	if (app.artixRuffleProcesses[gameName]) {
-		devToolsLog(gameInfo.exe + ' is already running for ' + gameName);
+		devToolsLog(resolvedExe.exeName + ' is already running for ' + gameName);
 		return true;
 	}
 
-	const exePath = path.join(process.resourcesPath || path.join(__dirname, '..'), 'bin', gameInfo.exe);
 	const args = [
 		gameInfo.swfURL,
 		'--spoof-url', gameInfo.swfURL,
@@ -427,22 +435,24 @@ app.launchArtixRuffleGame = (gameName) => {
 		'--tcp-connections', 'allow'
 	];
 
-	if (!fs.existsSync(exePath)) {
-		devToolsLog(gameInfo.exe + ' not found at ' + exePath);
+	if (!fs.existsSync(resolvedExe.exePath)) {
+		devToolsLog(gameInfo.exe + ' not found at ' + resolvedExe.exePath);
 		return true;
 	}
 
 	try {
-		const ruffleProcess = spawn(exePath, args, {
+		const childEnv = Object.assign({}, process.env, {
+			ARTIX_RUFFLE_WINDOW_TITLE: gameInfo.title,
+			ARTIX_RUFFLE_GAME: gameName,
+			ARTIX_RUFFLE_GAME_ICON: gameInfo.icon,
+			RUST_LOG: 'warn'
+		});
+
+		const ruffleProcess = spawn(resolvedExe.exePath, args, {
 			detached: true,
 			stdio: 'ignore',
 			windowsHide: true,
-			env: Object.assign({}, process.env, {
-				ARTIX_RUFFLE_WINDOW_TITLE: gameInfo.title,
-				ARTIX_RUFFLE_GAME: gameName,
-				ARTIX_RUFFLE_GAME_ICON: gameInfo.icon,
-				RUST_LOG: 'warn'
-			})
+			env: childEnv
 		});
 		app.artixRuffleProcesses[gameName] = ruffleProcess;
 		ruffleProcess.on('exit', () => {
@@ -452,10 +462,10 @@ app.launchArtixRuffleGame = (gameName) => {
 			app.artixRuffleProcesses[gameName] = null;
 		});
 		ruffleProcess.unref();
-		devToolsLog('spawned ' + gameInfo.exe + ' for ' + gameName);
+		devToolsLog('spawned ' + resolvedExe.exeName + ' for ' + gameName);
 	} catch (error) {
 		app.artixRuffleProcesses[gameName] = null;
-		devToolsLog('Error spawning ' + gameInfo.exe + ': ' + error.message);
+		devToolsLog('Error spawning ' + resolvedExe.exeName + ': ' + error.message);
 	}
 
 	return true;
@@ -467,7 +477,10 @@ app.launchAQWExe = () => {
 
 `;
 
-if (!main.includes("app.launchArtixRuffleGame = (gameName) =>")) {
+const artixRuffleLauncherRegex = /app\.artixRuffleGames = \{[\s\S]*?app\.launchAQWExe = \(\) => \{\r?\n\tapp\.launchArtixRuffleGame\('aqw'\);\r?\n\};\r?\n/;
+if (artixRuffleLauncherRegex.test(main)) {
+  main = main.replace(artixRuffleLauncherRegex, artixRuffleLauncher);
+} else {
   if (!main.includes(insertBefore)) {
     throw new Error("Could not find launchGameLocal insertion point");
   }

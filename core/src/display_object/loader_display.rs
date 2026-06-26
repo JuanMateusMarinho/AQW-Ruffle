@@ -95,6 +95,10 @@ impl<'gc> LoaderDisplay<'gc> {
                 object_ptrs.push(object.as_ptr());
             }
 
+            if suspended {
+                display_object.clear_bitmap_cache();
+            }
+
             if let Some(container) = display_object.as_container() {
                 stack.extend(container.iter_render_list());
             }
