@@ -447,6 +447,21 @@ impl<'gc> Avm2<'gc> {
         }
     }
 
+    /// Remove one object from a specific broadcast event after its last
+    /// listener for that event has been removed.
+    pub fn unregister_broadcast_listener(
+        &mut self,
+        object_ptr: *const crate::avm2::object::ObjectPtr,
+        event_name: AvmString<'gc>,
+    ) {
+        if let Some(bucket) = self.broadcast_list.get_mut(&event_name) {
+            bucket.retain(|listener| !std::ptr::eq(listener.object.as_ptr(), object_ptr));
+        }
+        if let Some(bucket) = self.broadcast_list_suspended.get_mut(&event_name) {
+            bucket.retain(|listener| !std::ptr::eq(listener.object.as_ptr(), object_ptr));
+        }
+    }
+
     pub fn suspend_objects_from_broadcast_list(
         &mut self,
         object_ptrs: &[*const crate::avm2::object::ObjectPtr],

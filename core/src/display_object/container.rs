@@ -14,15 +14,18 @@ use crate::display_object::{Depth, DisplayObject, TDisplayObject, TInteractiveOb
 use crate::focus_tracker::TabOrder;
 use crate::string::WStr;
 use crate::tag_utils::SwfMovie;
+use fnv::FnvHashMap;
 use gc_arena::{Collect, Mutation};
 use ruffle_macros::{enum_trait_object, istr};
 use ruffle_render::commands::CommandHandler;
-use std::cell::{Ref, RefMut};
+use std::cell::{Ref, RefCell, RefMut};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::ops::{Bound, RangeBounds};
 use std::rc::Rc;
+
+const RENDER_LIST_INDEX_CACHE_THRESHOLD: usize = 8;
 
 /// Dispatch the `removedFromStage` event on a child and all of it's
 /// grandchildren.
@@ -152,6 +155,12 @@ pub trait TDisplayObjectContainer<'gc>:
     #[no_dynamic]
     fn child_by_index(self, index: usize) -> Option<DisplayObject<'gc>> {
         self.raw_container().get_id(index)
+    }
+
+    /// Get a child's position in the render list.
+    #[no_dynamic]
+    fn child_index(self, child: DisplayObject<'gc>) -> Option<usize> {
+        self.raw_container().get_index(child)
     }
 
     /// Get a child display object by its position in the depth list.
@@ -665,6 +674,12 @@ pub struct ChildContainer<'gc> {
     /// updated list.
     render_list: Rc<Vec<DisplayObject<'gc>>>,
 
+    /// Lazily populated pointer-to-index map for repeated `getChildIndex`
+    /// calls. Structural mutations invalidate it, while swaps update the two
+    /// affected entries in place.
+    #[collect(require_static)]
+    render_list_index: RefCell<Option<FnvHashMap<usize, usize>>>,
+
     /// The mapping from timeline Depths to child display objects.
     ///
     /// This list is the list used to map depths to actual display objects.
@@ -699,6 +714,7 @@ impl<'gc> ChildContainer<'gc> {
     pub fn new(movie: &SwfMovie) -> Self {
         Self {
             render_list: Rc::new(Vec::new()),
+            render_list_index: RefCell::new(None),
             depth_list: BTreeMap::new(),
             has_pending_removals: false,
             mouse_children: true,
@@ -957,6 +973,27 @@ impl<'gc> ChildContainer<'gc> {
         self.render_list.get(id).copied()
     }
 
+    /// Get a child's render-list index, building a cache only when needed.
+    fn get_index(&self, child: DisplayObject<'gc>) -> Option<usize> {
+        if self.render_list.len() < RENDER_LIST_INDEX_CACHE_THRESHOLD {
+            return self
+                .render_list
+                .iter()
+                .position(|candidate| DisplayObject::ptr_eq(*candidate, child));
+        }
+
+        let key = child.as_ptr() as usize;
+        let mut index = self.render_list_index.borrow_mut();
+        let index = index.get_or_insert_with(|| {
+            self.render_list
+                .iter()
+                .enumerate()
+                .map(|(index, child)| (child.as_ptr() as usize, index))
+                .collect()
+        });
+        index.get(&key).copied()
+    }
+
     /// Replace a child in the render list with another child in the same
     /// position.
     fn replace_id(&mut self, id: usize, child: DisplayObject<'gc>) {
@@ -1033,7 +1070,14 @@ impl<'gc> ChildContainer<'gc> {
     ///
     /// No changes to the depth or render lists are made by this function.
     fn swap_at_id(&mut self, id1: usize, id2: usize) {
-        self.render_list_mut().swap(id1, id2);
+        let child1 = self.render_list[id1];
+        let child2 = self.render_list[id2];
+        Rc::make_mut(&mut self.render_list).swap(id1, id2);
+
+        if let Some(index) = self.render_list_index.get_mut() {
+            index.insert(child1.as_ptr() as usize, id2);
+            index.insert(child2.as_ptr() as usize, id1);
+        }
     }
 
     /// Move an already-inserted child to a new location on the depth list.
@@ -1183,6 +1227,7 @@ impl<'gc> ChildContainer<'gc> {
     }
 
     fn render_list_mut(&mut self) -> &mut Vec<DisplayObject<'gc>> {
+        *self.render_list_index.get_mut() = None;
         Rc::make_mut(&mut self.render_list)
     }
 }

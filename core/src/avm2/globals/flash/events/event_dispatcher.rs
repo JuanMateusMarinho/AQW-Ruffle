@@ -68,10 +68,20 @@ pub fn remove_event_listener<'gc>(
     let listener = args.get_function(activation, 1, "listener")?;
     let use_capture = args.get_bool(2);
 
-    dispatch_list
-        .as_dispatch_mut(activation.gc())
-        .expect("Internal properties should have what I put in them")
-        .remove_event_listener(event_type, listener, use_capture);
+    let mc = activation.gc();
+    let mut dispatch_list = dispatch_list
+        .as_dispatch_mut(mc)
+        .expect("Internal properties should have what I put in them");
+    dispatch_list.remove_event_listener(event_type, listener, use_capture);
+    let has_remaining_listener = dispatch_list.has_event_listener(event_type, mc);
+    drop(dispatch_list);
+
+    if !has_remaining_listener {
+        activation
+            .context
+            .avm2
+            .unregister_broadcast_listener(this.as_ptr(), event_type);
+    }
 
     Ok(Value::Undefined)
 }

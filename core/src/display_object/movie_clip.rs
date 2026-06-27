@@ -2610,6 +2610,17 @@ impl<'gc> MovieClip<'gc> {
         *context.aqw_avatar_asset_roots = context.aqw_avatar_asset_roots.saturating_add(1);
         self.0.aqw_skip_timeline_frame.set(false);
 
+        let full_timeline_throttle = aqw_full_timeline_throttle_enabled();
+        // Keep attached avatar assets at the SWF frame rate. Skipping their
+        // enter-frame phase makes animation visibly choppy while the Stage FPS
+        // counter still reports the full rate. Detached assets may still be
+        // throttled, and attached assets can only be throttled by explicit opt-in.
+        if self.is_on_stage(context) && !full_timeline_throttle {
+            self.0.aqw_timeline_counter.set(0);
+            self.0.aqw_timeline_divisor.set(0);
+            return false;
+        }
+
         if !can_throttle || self.current_frame() == 0 {
             self.0.aqw_timeline_counter.set(0);
             self.0.aqw_timeline_divisor.set(0);
@@ -2638,7 +2649,7 @@ impl<'gc> MovieClip<'gc> {
         let skip = counter != 0;
         self.0
             .aqw_skip_timeline_frame
-            .set(aqw_full_timeline_throttle_enabled() && skip);
+            .set(full_timeline_throttle && skip);
 
         if aqw_diagnostics_enabled() {
             tracing::info!(

@@ -286,12 +286,10 @@ pub fn get_child_index<'gc>(
     {
         let target_child = args.get_object(activation, 0, "child")?.as_display_object();
 
-        if let Some(target_child) = target_child {
-            for (i, child) in ctr.iter_render_list().enumerate() {
-                if DisplayObject::ptr_eq(child, target_child) {
-                    return Ok(Value::from_usize_lossy(i));
-                }
-            }
+        if let Some(target_child) = target_child
+            && let Some(index) = ctr.child_index(target_child)
+        {
+            return Ok(Value::from_usize_lossy(index));
         }
     }
 
@@ -443,20 +441,14 @@ pub fn swap_children<'gc>(
             .as_display_object()
             .expect("Child must be a display object");
 
-        let index0 = ctr
-            .iter_render_list()
-            .position(|a| DisplayObject::ptr_eq(a, child0))
-            .ok_or(make_error_2025(activation))?;
+        let index0 = ctr.child_index(child0).ok_or(make_error_2025(activation))?;
 
         let child1 = args
             .get_object(activation, 1, "child")?
             .as_display_object()
             .expect("Child must be a display object");
 
-        let index1 = ctr
-            .iter_render_list()
-            .position(|a| DisplayObject::ptr_eq(a, child1))
-            .ok_or(make_error_2025(activation))?;
+        let index1 = ctr.child_index(child1).ok_or(make_error_2025(activation))?;
 
         child0.set_placed_by_avm2_script(true);
         child1.set_placed_by_avm2_script(true);

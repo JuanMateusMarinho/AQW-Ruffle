@@ -9,6 +9,7 @@ use crate::display_object::TDisplayObject;
 use crate::string::AvmString;
 use fnv::FnvHashMap;
 use gc_arena::{Collect, Gc, GcWeak, Mutation};
+use smallvec::SmallVec;
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 
@@ -283,7 +284,7 @@ impl<'gc> DispatchList<'gc> {
         event: AvmString<'gc>,
         use_capture: bool,
         mc: &Mutation<'gc>,
-    ) -> Vec<FunctionObject<'gc>> {
+    ) -> SmallVec<[FunctionObject<'gc>; 2]> {
         self.prune_dead_handlers(event, mc);
 
         self.get_event_mut(event)

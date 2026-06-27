@@ -1,6 +1,5 @@
 //! Array class
 
-use crate::avm2::Error;
 use crate::avm2::activation::Activation;
 use crate::avm2::array::ArrayStorage;
 use crate::avm2::error::{make_error_1005, make_error_1125};
@@ -8,6 +7,7 @@ use crate::avm2::function::FunctionArgs;
 use crate::avm2::object::{ArrayObject, Object, TObject};
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::value::Value;
+use crate::avm2::{Error, Multiname};
 use crate::string::AvmString;
 use bitflags::bitflags;
 use ruffle_macros::istr;
@@ -1199,6 +1199,47 @@ fn extract_maybe_array_sort_options<'gc>(
     Ok(out)
 }
 
+/// Extract side-effect-free numeric keys for the common single-field
+/// `sortOn` case. Returning `None` keeps getters, proxies, prototypes,
+/// coercions, and sealed traits on the fully generic path.
+fn numeric_dynamic_sort_keys<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    values: &[(usize, Value<'gc>)],
+    field_name: AvmString<'gc>,
+) -> Option<Vec<(usize, Value<'gc>, f64)>> {
+    let multiname = Multiname::new(activation.avm2().find_public_namespace(), field_name);
+    let mut keyed_values = Vec::with_capacity(values.len());
+
+    for &(index, value) in values {
+        let object = value.as_object()?;
+        object.as_script_object()?;
+        if object.vtable().has_trait(&multiname) {
+            return None;
+        }
+
+        let key = match object.get_dynamic_property(field_name)? {
+            Value::Number(value) => value,
+            Value::Integer(value) => f64::from(value),
+            _ => return None,
+        };
+        keyed_values.push((index, value, key));
+    }
+
+    Some(keyed_values)
+}
+
+fn compare_numeric_key(a: f64, b: f64) -> Ordering {
+    if a.is_nan() && b.is_nan() {
+        Ordering::Equal
+    } else if a.is_nan() {
+        Ordering::Greater
+    } else if b.is_nan() {
+        Ordering::Less
+    } else {
+        a.partial_cmp(&b).unwrap()
+    }
+}
+
 /// Impl `Array.sortOn`
 pub fn sort_on<'gc>(
     activation: &mut Activation<'_, 'gc>,
@@ -1228,6 +1269,37 @@ pub fn sort_on<'gc>(
             field_names.len(),
             options.last().cloned().unwrap_or_else(SortOptions::empty),
         );
+    }
+
+    if field_names.len() == 1
+        && activation.caller_movie_or_root().version() >= 11
+        && options[0].contains(SortOptions::NUMERIC)
+        && let Some(mut keyed_values) =
+            numeric_dynamic_sort_keys(activation, &values, field_names[0])
+    {
+        let mut unique_sort_satisfied = true;
+        let sort_result: Result<(), std::convert::Infallible> =
+            qsort(&mut keyed_values, &mut |&(_, _, a), &(_, _, b)| {
+                let mut order = compare_numeric_key(a, b);
+                if order == Ordering::Equal {
+                    unique_sort_satisfied = false;
+                } else if options[0].contains(SortOptions::DESCENDING) {
+                    order = order.reverse();
+                }
+                Ok(order)
+            });
+        match sort_result {
+            Ok(()) => {}
+            Err(never) => match never {},
+        }
+
+        values = keyed_values
+            .into_iter()
+            .map(|(index, value, _)| (index, value))
+            .collect();
+        let unique_satisfied =
+            !first_option.contains(SortOptions::UNIQUE_SORT) || unique_sort_satisfied;
+        return sort_postprocess(activation, this, first_option, unique_satisfied, values);
     }
 
     let unique_satisfied = sort_inner(
