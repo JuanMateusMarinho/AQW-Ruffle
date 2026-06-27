@@ -70,7 +70,7 @@ mod windows_launcher {
     // Loader3 fetches the current game version and initializes Game.params before startup.
     const AQW_SWF_URL: &str = "https://game.aq.com/game/gamefiles/Loader3.swf";
     const AQW_BASE_URL: &str = "https://game.aq.com/game/gamefiles/";
-    const AQW_WINDOW_TITLE: &str = "Artix Entertainment - AdventureQuest Worlds V0.3";
+    const AQW_WINDOW_TITLE: &str = "Artix Entertainment - AdventureQuest Worlds V0.5";
     const AQW_DESIGN_NOTES_URL: &str = "https://www.aq.com/gamedesignnotes/";
     const AQW_YOUTUBE_RECENT_URL: &str =
         "https://www.youtube.com/channel/UC0vYUqgESNR3sqEPiJ4SpeA/recent";

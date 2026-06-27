@@ -46,7 +46,7 @@ impl ArtixGame {
 
     fn title(self) -> &'static str {
         match self {
-            Self::Aqw => "Artix Entertainment - AdventureQuest Worlds V0.3",
+            Self::Aqw => "Artix Entertainment - AdventureQuest Worlds V0.5",
             Self::EpicDuel => "Artix Entertainment - Epic Duel",
             Self::DragonFable => "Artix Entertainment - Dragon Fable",
             Self::AdventureQuest => "Artix Entertainment - AdventureQuest",
