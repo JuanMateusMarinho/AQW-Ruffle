@@ -1,0 +1,8 @@
+num_ticks = 8
+
+[[compilers]]
+type = "Asc"
+target = "test.swf"
+class = "Test"
+scripts = ["Test.as", "Listener.as"]
+swf_version = 32

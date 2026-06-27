@@ -67,6 +67,7 @@ mod windows_launcher {
     const MIN_WINDOW_WIDTH: i32 = 960;
     const MIN_WINDOW_HEIGHT: i32 = 620;
     const WM_MOUSELEAVE: u32 = 0x02A3;
+    // Loader3 fetches the current game version and initializes Game.params before startup.
     const AQW_SWF_URL: &str = "https://game.aq.com/game/gamefiles/Loader3.swf";
     const AQW_BASE_URL: &str = "https://game.aq.com/game/gamefiles/";
     const AQW_WINDOW_TITLE: &str = "Artix Entertainment - AdventureQuest Worlds V0.3";

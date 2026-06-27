@@ -3,6 +3,7 @@ const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
+// Loader3 fetches the current game version and initializes Game.params before startup.
 const AQW_SWF_URL = "https://game.aq.com/game/gamefiles/Loader3.swf";
 const AQW_BASE_URL = "https://game.aq.com/game/gamefiles/";
 const DRAGON_FABLE_SWF_URL = "https://play.dragonfable.com/game/DFLoader.swf";

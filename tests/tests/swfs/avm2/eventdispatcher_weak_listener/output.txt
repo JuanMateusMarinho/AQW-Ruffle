@@ -1,0 +1,5 @@
+initial strong: true
+initial weak: true
+collected strong: true
+collected weak: false
+strong
