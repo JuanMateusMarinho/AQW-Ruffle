@@ -2635,6 +2635,8 @@ mod windows_launcher {
         if diagnostics {
             command.env("RUFFLE_AQW_DIAGNOSTICS", "1");
             command.env("RUST_BACKTRACE", "1");
+            // Exercise the bitmap-cache memory budget while diagnosing leaks.
+            command.env("RUFFLE_AQW_CACHE_BUDGET_MB", "1024");
 
             let log_path = temp_path.join("ruffle-debug.log");
             let mut log_file = OpenOptions::new()

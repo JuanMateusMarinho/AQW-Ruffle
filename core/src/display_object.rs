@@ -252,9 +252,17 @@ impl BitmapCache {
     fn handle(&self) -> Option<BitmapHandle> {
         self.bitmap.as_ref().map(|b| b.handle.clone())
     }
+
+    /// Estimated bytes held by this cache's texture (RGBA), for AQW memory
+    /// diagnostics and the cache-memory budget.
+    fn estimated_bytes(&self) -> u64 {
+        self.bitmap
+            .as_ref()
+            .map_or(0, |b| u64::from(b.width) * u64::from(b.height) * 4)
+    }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct RenderOptions {
     /// Whether to skip rendering masks.
     ///
@@ -280,6 +288,12 @@ pub struct RenderOptions {
     ///
     /// Matrix is applied by default.
     pub apply_matrix: bool,
+
+    /// Whether to apply 9-slice scaling from `scale9Grid`/`DefineScalingGrid`.
+    ///
+    /// This is disabled only while recursively drawing the individual 9-slice
+    /// regions of the object that owns the scaling grid.
+    pub apply_scaling_grid: bool,
 }
 
 impl Default for RenderOptions {
@@ -288,6 +302,7 @@ impl Default for RenderOptions {
             apply_transform: true,
             skip_masks: true,
             apply_matrix: true,
+            apply_scaling_grid: true,
         }
     }
 }
@@ -1043,10 +1058,182 @@ struct DrawCacheInfo {
     filters: Vec<Filter>,
 }
 
+const SCALING_GRID_EPSILON: f32 = 0.0001;
 const AQW_OFFSCREEN_CACHE_LIMIT_PIXELS: f64 = 512.0 * 512.0;
 const AQW_OFFSCREEN_CACHE_LIMIT_SIDE: f64 = 1024.0;
 const AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_PIXELS: u64 = 16_384;
 const AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_SIDE: u32 = 128;
+
+fn scale_twips(value: Twips, scale: f32) -> Twips {
+    Twips::new((value.get() as f32 * scale).round_ties_even() as i32)
+}
+
+fn slice_matrix(
+    src_x0: Twips,
+    src_x1: Twips,
+    dst_x0: Twips,
+    dst_x1: Twips,
+    src_y0: Twips,
+    src_y1: Twips,
+    dst_y0: Twips,
+    dst_y1: Twips,
+) -> Option<Matrix> {
+    let src_w = src_x1 - src_x0;
+    let src_h = src_y1 - src_y0;
+    let dst_w = dst_x1 - dst_x0;
+    let dst_h = dst_y1 - dst_y0;
+
+    if src_w <= Twips::ZERO || src_h <= Twips::ZERO || dst_w <= Twips::ZERO || dst_h <= Twips::ZERO
+    {
+        return None;
+    }
+
+    let scale_x = dst_w.get() as f32 / src_w.get() as f32;
+    let scale_y = dst_h.get() as f32 / src_h.get() as f32;
+
+    Some(Matrix {
+        a: scale_x,
+        b: 0.0,
+        c: 0.0,
+        d: scale_y,
+        tx: dst_x0 - scale_twips(src_x0, scale_x),
+        ty: dst_y0 - scale_twips(src_y0, scale_y),
+    })
+}
+
+fn render_aqw_scaling_grid<'gc>(
+    this: DisplayObject<'gc>,
+    context: &mut RenderContext<'_, 'gc>,
+    options: RenderOptions,
+) -> bool {
+    if !is_aqw_movie_url(this.movie().url())
+        || !options.apply_transform
+        || !options.apply_matrix
+        || !options.apply_scaling_grid
+    {
+        return false;
+    }
+
+    let grid = this.scaling_grid();
+    if !grid.is_valid() {
+        return false;
+    }
+
+    let base_transform = this.base().transform(true);
+    let parent_transform = context.transform_stack.transform();
+    let parent_matrix = parent_transform.matrix;
+    let object_matrix = base_transform.matrix;
+
+    // AQW window panels use an object-local scale and translation. Preserve
+    // their corners and edges while stretching only the scaling-grid center.
+    // Rotated or skewed content keeps the standard rendering path.
+    if object_matrix.b.abs() > SCALING_GRID_EPSILON
+        || object_matrix.c.abs() > SCALING_GRID_EPSILON
+        || object_matrix.a <= SCALING_GRID_EPSILON
+        || object_matrix.d <= SCALING_GRID_EPSILON
+    {
+        return false;
+    }
+
+    if (object_matrix.a - 1.0).abs() <= SCALING_GRID_EPSILON
+        && (object_matrix.d - 1.0).abs() <= SCALING_GRID_EPSILON
+    {
+        return false;
+    }
+
+    let bounds = this.bounds(BoundsMode::Engine).union(&grid);
+    if !bounds.is_valid()
+        || bounds.width() <= Twips::ZERO
+        || bounds.height() <= Twips::ZERO
+        || grid.x_min >= grid.x_max
+        || grid.y_min >= grid.y_max
+    {
+        return false;
+    }
+
+    let dst_bounds = object_matrix * bounds;
+    if !dst_bounds.is_valid()
+        || dst_bounds.width() <= Twips::ZERO
+        || dst_bounds.height() <= Twips::ZERO
+    {
+        return false;
+    }
+
+    let left_width = grid.x_min - bounds.x_min;
+    let right_width = bounds.x_max - grid.x_max;
+    let top_height = grid.y_min - bounds.y_min;
+    let bottom_height = bounds.y_max - grid.y_max;
+
+    let dst_x = [
+        dst_bounds.x_min,
+        dst_bounds.x_min + left_width,
+        dst_bounds.x_max - right_width,
+        dst_bounds.x_max,
+    ];
+    let dst_y = [
+        dst_bounds.y_min,
+        dst_bounds.y_min + top_height,
+        dst_bounds.y_max - bottom_height,
+        dst_bounds.y_max,
+    ];
+
+    if dst_x[1] >= dst_x[2] || dst_y[1] >= dst_y[2] {
+        return false;
+    }
+
+    let src_x = [bounds.x_min, grid.x_min, grid.x_max, bounds.x_max];
+    let src_y = [bounds.y_min, grid.y_min, grid.y_max, bounds.y_max];
+    let old_use_bitmap_cache = context.use_bitmap_cache;
+    context.use_bitmap_cache = false;
+
+    let mut slice_options = options;
+    slice_options.apply_transform = false;
+    slice_options.apply_scaling_grid = false;
+
+    for y in 0..3 {
+        for x in 0..3 {
+            let Some(matrix) = slice_matrix(
+                src_x[x],
+                src_x[x + 1],
+                dst_x[x],
+                dst_x[x + 1],
+                src_y[y],
+                src_y[y + 1],
+                dst_y[y],
+                dst_y[y + 1],
+            ) else {
+                continue;
+            };
+
+            let mask_rect = Rectangle {
+                x_min: dst_x[x],
+                x_max: dst_x[x + 1],
+                y_min: dst_y[y],
+                y_max: dst_y[y + 1],
+            };
+            let mask_matrix = parent_matrix * Matrix::create_box_from_rectangle(&mask_rect);
+
+            context.commands.push_mask();
+            context.commands.draw_rect(Color::WHITE, mask_matrix);
+            context.commands.activate_mask();
+
+            context.transform_stack.push(&Transform {
+                matrix,
+                color_transform: base_transform.color_transform,
+                perspective_projection: base_transform.perspective_projection,
+            });
+            this.render_with_options(context, slice_options);
+            context.transform_stack.pop();
+
+            context.commands.deactivate_mask();
+            context.commands.draw_rect(Color::WHITE, mask_matrix);
+            context.commands.pop_mask();
+        }
+    }
+
+    context.use_bitmap_cache = old_use_bitmap_cache;
+    true
+}
 
 fn should_bypass_offscreen_bitmap_cache<'gc>(
     this: DisplayObject<'gc>,
@@ -1080,6 +1267,135 @@ fn should_bypass_offscreen_bitmap_cache<'gc>(
         || height >= AQW_OFFSCREEN_CACHE_LIMIT_SIDE
 }
 
+/// Total bitmap-cache memory budget in MB before off-screen caches are evicted.
+/// Controlled by `RUFFLE_AQW_CACHE_BUDGET_MB`; `0`/unset disables eviction.
+fn aqw_cache_budget_mb() -> u64 {
+    static BUDGET: OnceLock<u64> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("RUFFLE_AQW_CACHE_BUDGET_MB")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Once-per-second AQW memory sweep. Totals bitmap-cache memory across the
+/// display tree and, with `RUFFLE_AQW_DIAGNOSTICS`, logs orphan/loader/cache
+/// counts so the source of a leak can be identified. When cache memory exceeds
+/// `RUFFLE_AQW_CACHE_BUDGET_MB`, off-screen caches are evicted to cap memory.
+/// No-op unless diagnostics or a budget are enabled.
+pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
+    let diagnostics = aqw_diagnostics_enabled();
+    let budget_mb = aqw_cache_budget_mb();
+    if (!diagnostics && budget_mb == 0) || !is_aqw_movie_url(context.stage.movie().url()) {
+        return;
+    }
+
+    // Throttle to roughly once per second.
+    static SWEEP_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if SWEEP_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 48 != 0 {
+        return;
+    }
+
+    // Evict using the previous sweep's total so this stays a single pass.
+    static LAST_CACHE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let budget_bytes = budget_mb.saturating_mul(1024 * 1024);
+    let over_budget = budget_bytes > 0
+        && LAST_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed) > budget_bytes;
+
+    let view_bounds = context.stage.view_bounds();
+    let root: DisplayObject<'_> = context.stage.into();
+
+    let mut cached_objects: u64 = 0;
+    let mut cache_bytes: u64 = 0;
+    let mut evicted_bytes: u64 = 0;
+    aqw_sweep_node(
+        root,
+        &view_bounds,
+        over_budget,
+        &mut cached_objects,
+        &mut cache_bytes,
+        &mut evicted_bytes,
+    );
+    LAST_CACHE_BYTES.store(cache_bytes, std::sync::atomic::Ordering::Relaxed);
+
+    if diagnostics {
+        let orphans = context.orphan_manager.len();
+        let loaders = context.load_manager.len();
+        let cache_mb = cache_bytes / (1024 * 1024);
+        let evicted_mb = evicted_bytes / (1024 * 1024);
+        tracing::info!(
+            target: "aqw_diag",
+            orphans,
+            loaders,
+            cached_objects,
+            cache_mb,
+            evicted_mb,
+            over_budget,
+            "AQW memory sweep"
+        );
+
+        // Also append to a file so the sweep is captured even when the game is
+        // spawned detached (the normal launcher discards stdout/stderr).
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(std::env::temp_dir().join("aqw-memory.log"))
+        {
+            let _ = writeln!(
+                file,
+                "AQW sweep: orphans={orphans} loaders={loaders} cached_objects={cached_objects} cache_mb={cache_mb} evicted_mb={evicted_mb} over_budget={over_budget}"
+            );
+        }
+    }
+}
+
+fn aqw_sweep_node<'gc>(
+    obj: DisplayObject<'gc>,
+    view_bounds: &Rectangle<Twips>,
+    over_budget: bool,
+    cached_objects: &mut u64,
+    cache_bytes: &mut u64,
+    evicted_bytes: &mut u64,
+) {
+    let object_cache_bytes = {
+        let base = obj.base();
+        let cache = base.bitmap_cache_mut();
+        cache.as_ref().map_or(0, BitmapCache::estimated_bytes)
+    };
+
+    if object_cache_bytes > 0 {
+        let on_screen = obj
+            .world_bounds(BoundsMode::Engine)
+            .intersects(view_bounds);
+        if over_budget && !on_screen {
+            let base = obj.base();
+            let mut cache_ref = base.bitmap_cache_mut();
+            if let Some(cache) = cache_ref.as_mut() {
+                cache.clear();
+            }
+            *evicted_bytes += object_cache_bytes;
+        } else {
+            *cached_objects += 1;
+            *cache_bytes += object_cache_bytes;
+        }
+    }
+
+    if let Some(container) = obj.as_container() {
+        for child in container.iter_render_list() {
+            aqw_sweep_node(
+                child,
+                view_bounds,
+                over_budget,
+                cached_objects,
+                cache_bytes,
+                evicted_bytes,
+            );
+        }
+    }
+}
+
 pub fn render_base<'gc>(
     this: DisplayObject<'gc>,
     context: &mut RenderContext<'_, 'gc>,
@@ -1095,6 +1411,10 @@ pub fn render_base<'gc>(
     else {
         return;
     };
+
+    if render_aqw_scaling_grid(this, context, options) {
+        return;
+    }
 
     if options.apply_transform {
         let transform = this.base().transform(options.apply_matrix);

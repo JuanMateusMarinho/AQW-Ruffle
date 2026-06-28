@@ -272,6 +272,16 @@ impl<'gc> LoadManager<'gc> {
         Self(SlotMap::with_key())
     }
 
+    /// Number of in-flight loaders (used for AQW memory diagnostics).
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether there are no in-flight loaders.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     /// Add a new loader to the `LoadManager`.
     ///
     /// Returns the loader handle for later inspection. A loader handle is

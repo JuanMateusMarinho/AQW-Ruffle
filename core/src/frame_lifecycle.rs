@@ -112,6 +112,10 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
     // a result of a RemoveObject tag - see `cleanup_dead_orphans` for details.
     context.orphan_manager.cleanup_dead_orphans(context.gc());
 
+    // AQW memory diagnostics + bitmap-cache budget (no-op unless enabled via
+    // RUFFLE_AQW_DIAGNOSTICS / RUFFLE_AQW_CACHE_BUDGET_MB).
+    crate::display_object::aqw_cache_sweep(context);
+
     *context.aqw_avatar_asset_roots_previous = *context.aqw_avatar_asset_roots;
     *context.frame_phase = FramePhase::Idle;
 }
