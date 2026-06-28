@@ -160,6 +160,15 @@ inherits = "release"
 lto = true
 codegen-units = 1
 
+# Perfil dos exes da Artix (refresh_artix_release.ps1). Thin LTO entrega
+# ~80-90% do ganho do fat LTO do "dist" com link paralelo muito mais rápido
+# (refresh ~15-20 min vs ~45). Mantém codegen-units no padrão do release para
+# permitir o paralelismo do thin LTO. Não usar "dist" aqui: ele é o perfil de
+# release oficial (.github/workflows/release.yml) e deve continuar fat LTO.
+[profile.artix]
+inherits = "release"
+lto = "thin"
+
 [profile.dev.package.h263-rs]
 opt-level = 3
 
