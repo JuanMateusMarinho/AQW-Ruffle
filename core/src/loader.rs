@@ -261,6 +261,12 @@ impl From<crate::avm1::Error<'_>> for Error {
     }
 }
 
+/// Exit-frames a finished load's target must stay detached from the display
+/// list before its (dead) loader is garbage-collected. ~5s at 24fps -- long
+/// enough that a briefly-detached/re-attached AQW avatar is never collected,
+/// short enough that leaving a crowded map frees its avatars' SWFs promptly.
+const LOADER_GC_GRACE_FRAMES: u32 = 120;
+
 /// Holds all in-progress loads for the player.
 #[derive(Collect)]
 #[collect(no_drop)]
@@ -421,6 +427,7 @@ impl<'gc> LoadManager<'gc> {
             loader_status: LoaderStatus::Pending,
             from_bytes: false,
             movie: None,
+            detached_frames: 0,
         };
         let handle = self.add_loader(loader);
         let loader = self.get_loader_mut(handle).unwrap();
@@ -518,6 +525,7 @@ impl<'gc> LoadManager<'gc> {
             loader_status: LoaderStatus::Pending,
             movie: None,
             from_bytes: true,
+            detached_frames: 0,
         };
         let handle = context.load_manager.add_loader(loader);
         MovieLoader::movie_loader_bytes(handle, context, bytes)
@@ -595,6 +603,48 @@ impl<'gc> LoadManager<'gc> {
                 && movie.try_fire_loaderinfo_events(context)
             {
                 context.load_manager.remove_loader(handle)
+            }
+        }
+
+        // GC dead loaders. An AVM2 load whose target was removed from the display
+        // list (e.g. AQW clearing other players' avatars on a map change) is never
+        // removed by the event path above, so it lingers forever pinning its
+        // `Arc<SwfMovie>` -- the avatar's decoded art and textures -- and RAM grows
+        // on every map change. Once a finished load's target has stayed off the
+        // stage past a grace period it's dead bookkeeping, so drop it and let the
+        // movie free. The AVM2 `LoaderInfo` the script holds is a separate object
+        // and survives; the grace period spares a briefly-detached/re-attached one.
+        let candidates: Vec<(LoaderHandle, DisplayObject<'gc>)> = context
+            .load_manager
+            .0
+            .iter()
+            .filter(|(_, loader)| {
+                matches!(
+                    loader.loader_status,
+                    LoaderStatus::Succeeded | LoaderStatus::Failed
+                )
+            })
+            .map(|(handle, loader)| (handle, loader.target_clip))
+            .collect();
+        for (handle, target_clip) in candidates {
+            let on_stage = target_clip.is_on_stage(context);
+            let Some(loader) = context.load_manager.0.get_mut(handle) else {
+                continue;
+            };
+            if on_stage {
+                loader.detached_frames = 0;
+                continue;
+            }
+            loader.detached_frames = loader.detached_frames.saturating_add(1);
+            if loader.detached_frames >= LOADER_GC_GRACE_FRAMES {
+                if aqw_diagnostics_enabled() {
+                    tracing::info!(
+                        target: "aqw_diag",
+                        ?handle,
+                        "GC'ing dead off-stage loader (freeing its SWF)"
+                    );
+                }
+                context.load_manager.remove_loader(handle);
             }
         }
     }
@@ -690,6 +740,14 @@ pub struct MovieLoader<'gc> {
 
     /// Whether or not this was loaded as a result of a `Loader.loadBytes` call
     from_bytes: bool,
+
+    /// Consecutive exit-frames this loader's target has spent detached from the
+    /// display list (an AQW avatar removed on a map change). Once a finished load
+    /// stays detached past a grace period it's dead bookkeeping pinning its
+    /// `Arc<SwfMovie>`, so it's garbage-collected; the grace period keeps a
+    /// briefly-detached/re-attached avatar from being collected.
+    #[collect(require_static)]
+    detached_frames: u32,
 }
 
 impl<'gc> MovieLoader<'gc> {
