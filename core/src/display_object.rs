@@ -118,6 +118,12 @@ pub struct BitmapCache {
 const MAX_CACHE_BITMAP_DIMENSION: u32 = 4096;
 const MAX_CACHE_BITMAP_PIXELS: u32 = 2_500_000;
 const MAX_AQW_CACHE_BITMAP_PIXELS: u32 = 8_000_000;
+/// A transform scale component beyond this is degenerate for bitmap caching: even
+/// a 1px object would exceed the cache dimension limit, so the cache would be
+/// rejected anyway. Used to short-circuit such objects (e.g. AQW's occasional
+/// `instance####` with a multi-million-pixel transform) before the bounds
+/// traversal and to guard against NaN/inf matrices.
+const CACHE_DEGENERATE_SCALE: f32 = MAX_CACHE_BITMAP_DIMENSION as f32;
 
 fn aqw_diagnostics_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -1432,17 +1438,39 @@ pub fn render_base<'gc>(
         let mut cache_info: Option<DrawCacheInfo> = None;
         let base_transform = context.transform_stack.transform();
         let allow_aqw_large_cache = is_aqw_movie_url(this.movie().url());
-        let bounds: Rectangle<Twips> = this.render_bounds_with_transform(
-            &base_transform.matrix,
-            false, // we want to do the filter growth for this object ourselves, to know the offsets
-            &context.stage.view_matrix(),
-        );
+        // A non-finite or absurdly-scaled transform can't yield a usable cache (it
+        // would be rejected as "incredibly large" further down anyway). Detect it
+        // from the matrix up front so we skip the bounds traversal and the cache
+        // math, and never feed NaN/inf into them. AQW-only to keep other content's
+        // behavior byte-identical.
+        let m = &base_transform.matrix;
+        let degenerate_transform = allow_aqw_large_cache
+            && (!m.a.is_finite()
+                || !m.b.is_finite()
+                || !m.c.is_finite()
+                || !m.d.is_finite()
+                || m.a.abs().max(m.b.abs()).max(m.c.abs()).max(m.d.abs())
+                    > CACHE_DEGENERATE_SCALE);
+        let bounds: Rectangle<Twips> = if degenerate_transform {
+            Rectangle {
+                x_min: Twips::ZERO,
+                x_max: Twips::ZERO,
+                y_min: Twips::ZERO,
+                y_max: Twips::ZERO,
+            }
+        } else {
+            this.render_bounds_with_transform(
+                &base_transform.matrix,
+                false, // we do the filter growth for this object ourselves, to know the offsets
+                &context.stage.view_matrix(),
+            )
+        };
         let name = this.name();
         let mut filters: Vec<Filter> = this.filters().to_owned();
         let swf_version = this.swf_version();
         filters.retain(|f| !f.impotent());
-        let bypass_bitmap_cache =
-            should_bypass_offscreen_bitmap_cache(this, context, &options, &bounds, &filters);
+        let bypass_bitmap_cache = degenerate_transform
+            || should_bypass_offscreen_bitmap_cache(this, context, &options, &bounds, &filters);
 
         if let Some(cache) = &mut *this.base().bitmap_cache_mut() {
             if bypass_bitmap_cache {

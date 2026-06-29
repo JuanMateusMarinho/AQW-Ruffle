@@ -3,6 +3,7 @@ use crate::globals::Globals;
 use fnv::FnvHashMap;
 use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 type PoolInner<T> = Mutex<Vec<T>>;
@@ -12,11 +13,21 @@ type Constructor<Type, Description> = Box<dyn Fn(&Descriptors, &Description) -> 
 pub struct TexturePool {
     pools: FnvHashMap<TextureKey, BufferPool<(wgpu::Texture, wgpu::TextureView), AlwaysCompatible>>,
     globals_cache: FnvHashMap<GlobalsKey, Arc<Globals>>,
+    /// Total bytes of textures this pool has created since it was constructed.
+    /// Pooled textures are retained for reuse (not freed until the whole pool is
+    /// dropped), so this also approximates the pool's resident size — callers use
+    /// it to cap retention and avoid hoarding gigabytes of distinct sizes.
+    created_bytes: Arc<AtomicU64>,
 }
 
 impl TexturePool {
     pub fn new() -> Self {
         Default::default()
+    }
+
+    /// Approximate bytes of GPU texture memory currently retained by this pool.
+    pub fn retained_bytes(&self) -> u64 {
+        self.created_bytes.load(Ordering::Relaxed)
     }
 
     pub fn get_texture(
@@ -33,6 +44,7 @@ impl TexturePool {
             format,
             sample_count,
         };
+        let created_bytes = self.created_bytes.clone();
         let pool = self.pools.entry(key).or_insert_with(|| {
             let label = if cfg!(feature = "render_debug_labels") {
                 use std::sync::atomic::{AtomicU32, Ordering};
@@ -53,6 +65,16 @@ impl TexturePool {
                     view_formats: &[format],
                     usage,
                 });
+                // Track bytes of textures this pool has created (only real
+                // creations -- the closure runs on a pool miss) so callers can cap
+                // how much the pool retains and reuse offscreen targets across
+                // frames instead of churning the GPU driver.
+                let bytes = u64::from(size.width)
+                    * u64::from(size.height)
+                    * u64::from(size.depth_or_array_layers)
+                    * u64::from(sample_count)
+                    * u64::from(format.block_copy_size(None).unwrap_or(4));
+                created_bytes.fetch_add(bytes, Ordering::Relaxed);
                 let view = texture.create_view(&Default::default());
                 (texture, view)
             }))

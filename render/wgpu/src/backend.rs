@@ -83,6 +83,15 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     active_frame: ActiveFrame,
 }
 
+/// Cap on how much GPU texture memory the offscreen pool may retain before it's
+/// dropped and rebuilt. Reusing offscreen targets across frames eliminates the
+/// per-frame allocation churn that otherwise overwhelms the GPU driver in
+/// heavily-cached AQW rooms; capping retention stops animated objects (whose
+/// bounds, and thus target size, change every frame) from hoarding gigabytes of
+/// distinct-sized targets. The working set of a single frame is only tens of MB,
+/// so this leaves ample headroom for genuine reuse.
+const OFFSCREEN_POOL_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+
 impl WgpuRenderBackend<SwapChainTarget> {
     #[cfg(target_family = "wasm")]
     pub async fn for_canvas(
@@ -424,6 +433,8 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
 
         self.viewport_scale_factor = dimensions.scale_factor;
         self.texture_pool = TexturePool::new();
+        // Old offscreen targets are sized for the previous viewport; drop them.
+        self.offscreen_texture_pool = TexturePool::new();
     }
 
     fn create_context3d(
@@ -673,7 +684,15 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
 
         self.active_frame
             .submit_for_target(&self.descriptors, &self.target, frame_output);
-        self.offscreen_texture_pool = TexturePool::new();
+        // Reuse offscreen render targets across frames instead of reallocating
+        // them every frame; drop the pool only once it has retained more than the
+        // budget, to release distinct sizes that piled up (e.g. from animated
+        // objects whose target size changes every frame). Recreating it every
+        // frame caused dozens of large targets to be allocated per frame,
+        // ballooning driver memory to many GB and OOM-crashing.
+        if self.offscreen_texture_pool.retained_bytes() > OFFSCREEN_POOL_BUDGET_BYTES {
+            self.offscreen_texture_pool = TexturePool::new();
+        }
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -1228,7 +1247,7 @@ async fn request_device(
         }
     }
 
-    adapter
+    let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: None,
             required_features: features,
@@ -1237,7 +1256,44 @@ async fn request_device(
             trace: wgpu::Trace::Off,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
         })
-        .await
+        .await?;
+
+    // By default wgpu treats every uncaptured error as fatal (a panic). An
+    // out-of-memory error is recoverable enough that crashing the whole game is
+    // the worst outcome: a single failed texture allocation in a crowded AQW
+    // room would otherwise kill the session. Downgrade OOM to a logged warning
+    // so the process survives (rendering may degrade until memory frees up),
+    // while keeping validation/internal errors fatal so real bugs stay loud.
+    device.on_uncaptured_error(Arc::new(handle_uncaptured_wgpu_error));
+
+    Ok((device, queue))
+}
+
+/// Set once the device has reported an out-of-memory error. Subsequent errors
+/// are almost always cascades from the failed allocation (e.g. `create_view` on
+/// a texture that never got memory), so we downgrade them to logs instead of
+/// crashing — the whole point of the guard is to survive the OOM episode.
+static WGPU_OOM_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Uncaptured-error handler installed on every device: logs out-of-memory (and
+/// post-OOM cascade) errors instead of panicking, so the process survives;
+/// validation/internal errors before any OOM stay fatal.
+fn handle_uncaptured_wgpu_error(error: wgpu::Error) {
+    match error {
+        wgpu::Error::OutOfMemory { .. } => {
+            WGPU_OOM_SEEN.store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!(
+                "wgpu out of memory (non-fatal): GPU memory exhausted; rendering may degrade"
+            );
+        }
+        // Once we've seen an OOM, treat later errors as cascade fallout and keep
+        // the process alive. Before any OOM, validation/internal errors are real
+        // bugs and stay fatal so they're not silently hidden.
+        other if WGPU_OOM_SEEN.load(std::sync::atomic::Ordering::Relaxed) => {
+            tracing::error!("wgpu error after OOM (non-fatal): {other}");
+        }
+        other => panic!("wgpu error: {other}"),
+    }
 }
 
 /// Determines how we choose our frame buffer
