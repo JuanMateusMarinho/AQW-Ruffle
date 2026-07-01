@@ -119,7 +119,12 @@ impl<'gc> Avm2ClassRegistry<'gc> {
 #[derive(Collect)]
 #[collect(no_drop)]
 pub struct MovieLibrary<'gc> {
-    swf: Arc<SwfMovie>,
+    // Stored weak: `MovieLibrary` lives in `MovieLibraries`, which is keyed by
+    // `Weak<SwfMovie>` so unused libraries can be evicted once nothing else
+    // references the movie. A strong `Arc` here would keep that key's strong
+    // count above zero forever, defeating the weak-map eviction entirely.
+    #[collect(require_static)]
+    swf: Weak<SwfMovie>,
     characters: HashMap<CharacterId, Character<'gc>>,
     export_characters: Avm1PropertyMap<'gc, CharacterId>,
     imported_assets: HashMap<AvmString<'gc>, CharacterId>,
@@ -131,7 +136,7 @@ pub struct MovieLibrary<'gc> {
 impl<'gc> MovieLibrary<'gc> {
     pub fn new(swf: Arc<SwfMovie>) -> Self {
         Self {
-            swf,
+            swf: Arc::downgrade(&swf),
             characters: HashMap::new(),
             imported_assets: HashMap::new(),
             export_characters: Avm1PropertyMap::new(),
@@ -256,7 +261,11 @@ impl<'gc> MovieLibrary<'gc> {
             Character::Bitmap(bitmap) => {
                 let avm2_class = bitmap.avm2_class();
                 let bitmap = bitmap.compressed().decode().unwrap();
-                let bitmap = Bitmap::new(mc, id, bitmap, self.swf.clone());
+                let swf = self
+                    .swf
+                    .upgrade()
+                    .expect("MovieLibrary's SwfMovie should still be alive while instantiating");
+                let bitmap = Bitmap::new(mc, id, bitmap, swf);
                 bitmap.set_avm2_bitmapdata_class(mc, avm2_class);
                 Some(bitmap.instantiate(mc))
             }

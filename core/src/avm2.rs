@@ -610,9 +610,22 @@ impl<'gc> Avm2<'gc> {
             if let Some(object) = object.and_then(|obj| obj.upgrade(context.gc()))
                 && object.is_of_type(on_type.inner_class_definition())
             {
-                let mut activation = Activation::from_nothing(context);
+                // Skip AQW avatar-loader children the instant they're parentless,
+                // rather than waiting for the deferred suspend bookkeeping to
+                // catch up. Otherwise a listener like `AvatarMC.onEnterFrameWalk`
+                // can run with `this.stage == null` for one frame before it's
+                // suspended, throwing and leaving the avatar stuck (see
+                // `is_in_currently_detached_aqw_avatar_loader`).
+                let suspended = object
+                    .as_display_object()
+                    .is_some_and(|display_object| {
+                        display_object.is_in_currently_detached_aqw_avatar_loader()
+                    });
+                if !suspended {
+                    let mut activation = Activation::from_nothing(context);
 
-                events::broadcast_event(&mut activation, object, event);
+                    events::broadcast_event(&mut activation, object, event);
+                }
             }
         }
         // Once we're done iterating, remove dead weak references from the list.

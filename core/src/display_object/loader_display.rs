@@ -75,6 +75,16 @@ impl<'gc> LoaderDisplay<'gc> {
         self.parent().is_none() && self.0.aqw_was_detached.get() && self.contains_aqw_avatar_asset()
     }
 
+    /// Like `is_detached_aqw_avatar_loader`, but doesn't require the one-frame
+    /// grace period (`aqw_was_detached`) to have already elapsed. Used to skip
+    /// `Event.ENTER_FRAME` broadcast dispatch to a child the instant it's
+    /// parentless, closing the race where AQW's own frame scripts (e.g.
+    /// `AvatarMC.onEnterFrameWalk` -> `stopWalking`) read `this.stage` before
+    /// the deferred suspend/restore bookkeeping has caught up.
+    pub fn is_currently_parentless_aqw_avatar_loader(self) -> bool {
+        self.parent().is_none() && self.contains_aqw_avatar_asset()
+    }
+
     fn contains_aqw_avatar_asset(self) -> bool {
         self.iter_render_list().any(|child| {
             let movie = child.movie();
