@@ -117,11 +117,7 @@ pub struct BitmapCache {
 
 const MAX_CACHE_BITMAP_DIMENSION: u32 = 4096;
 const MAX_CACHE_BITMAP_PIXELS: u32 = 2_500_000;
-// Was 8_000_000: large AQW UI panels (e.g. the quest-log window) can land just
-// over that by a few percent, especially at fullscreen's higher effective
-// pixel scale, silently losing their cache for the rest of the session (see
-// `warned_for_oversize`) and falling back to a different render path.
-const MAX_AQW_CACHE_BITMAP_PIXELS: u32 = 12_000_000;
+const MAX_AQW_CACHE_BITMAP_PIXELS: u32 = 8_000_000;
 /// A transform scale component beyond this is degenerate for bitmap caching: even
 /// a 1px object would exceed the cache dimension limit, so the cache would be
 /// rejected anyway. Used to short-circuit such objects (e.g. AQW's occasional
@@ -261,14 +257,6 @@ impl BitmapCache {
 
     fn handle(&self) -> Option<BitmapHandle> {
         self.bitmap.as_ref().map(|b| b.handle.clone())
-    }
-
-    /// The pixel size of the currently cached texture, if any. Used to detect
-    /// when a dirty object's rendered size has actually changed (e.g. a
-    /// growing filter/blur) so a deferred redraw isn't reusing a texture of
-    /// the wrong size at the new position/bounds.
-    fn cached_size(&self) -> Option<(u32, u32)> {
-        self.bitmap.as_ref().map(|b| (b.width, b.height))
     }
 
     /// Estimated bytes held by this cache's texture (RGBA), for AQW memory
@@ -1530,16 +1518,7 @@ pub fn render_base<'gc>(
                     let actual_height = filter_rect.height().max(0) as u32;
                     if cache.is_dirty(&base_transform.matrix, width, height) {
                         let redraw_pixels = u64::from(actual_width) * u64::from(actual_height);
-                        // A deferred redraw reuses the existing cached texture at the
-                        // *new* bounds/draw_offset. That's fine when only the pixel
-                        // content changed (e.g. an animation frame) at a stable size,
-                        // but if the size itself changed (e.g. a growing blur/glow
-                        // filter), the stale texture no longer matches the new
-                        // bounds and visibly misplaces/distorts the object. Never
-                        // defer that case, regardless of the redraw budget.
-                        let size_changed = cache.cached_size() != Some((actual_width, actual_height));
                         let should_budget_redraw = allow_aqw_large_cache
-                            && !size_changed
                             && redraw_pixels >= AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_PIXELS
                             && (actual_width >= AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_SIDE
                                 || actual_height >= AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_SIDE);
@@ -1566,23 +1545,6 @@ pub fn render_base<'gc>(
                                 draw_offset,
                                 filters,
                             });
-
-                            if aqw_diagnostics_enabled()
-                                && redraw_pixels >= AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_PIXELS
-                            {
-                                tracing::info!(
-                                    target: "aqw_diag",
-                                    ?name,
-                                    width,
-                                    height,
-                                    actual_width,
-                                    actual_height,
-                                    draw_offset_x = draw_offset.x,
-                                    draw_offset_y = draw_offset.y,
-                                    size_changed,
-                                    "Fresh AQW bitmap cache redraw"
-                                );
-                            }
                         } else {
                             // Prefer an existing cache while the redraw is deferred.
                             // If this is the first draw, normal vector rendering below
@@ -1599,14 +1561,11 @@ pub fn render_base<'gc>(
                             if aqw_diagnostics_enabled() {
                                 tracing::info!(
                                     target: "aqw_diag",
-                                    ?name,
                                     width,
                                     height,
                                     actual_width,
                                     actual_height,
                                     redraw_pixels,
-                                    draw_offset_x = draw_offset.x,
-                                    draw_offset_y = draw_offset.y,
                                     has_stale_cache = cache_info.is_some(),
                                     "Deferring dirty AQW bitmap cache redraw"
                                 );
