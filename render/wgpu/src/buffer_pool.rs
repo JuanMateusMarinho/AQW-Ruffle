@@ -3,7 +3,6 @@ use crate::globals::Globals;
 use fnv::FnvHashMap;
 use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 type PoolInner<T> = Mutex<Vec<T>>;
@@ -13,11 +12,6 @@ type Constructor<Type, Description> = Box<dyn Fn(&Descriptors, &Description) -> 
 pub struct TexturePool {
     pools: FnvHashMap<TextureKey, BufferPool<(wgpu::Texture, wgpu::TextureView), AlwaysCompatible>>,
     globals_cache: FnvHashMap<GlobalsKey, Arc<Globals>>,
-    /// Total bytes of textures this pool has created since it was constructed.
-    /// Pooled textures are retained for reuse (not freed until the whole pool is
-    /// dropped), so this also approximates the pool's resident size — callers use
-    /// it to cap retention and avoid hoarding gigabytes of distinct sizes.
-    created_bytes: Arc<AtomicU64>,
 }
 
 impl TexturePool {
@@ -25,9 +19,47 @@ impl TexturePool {
         Default::default()
     }
 
-    /// Approximate bytes of GPU texture memory currently retained by this pool.
+    fn bytes_per_texture(key: &TextureKey) -> u64 {
+        u64::from(key.size.width)
+            * u64::from(key.size.height)
+            * u64::from(key.size.depth_or_array_layers)
+            * u64::from(key.sample_count)
+            * u64::from(key.format.block_copy_size(None).unwrap_or(4))
+    }
+
+    /// Bytes of GPU texture memory *currently held* by this pool (idle textures
+    /// available for reuse), computed from the live buckets.
     pub fn retained_bytes(&self) -> u64 {
-        self.created_bytes.load(Ordering::Relaxed)
+        self.pools
+            .iter()
+            .map(|(key, pool)| pool.available_len() as u64 * Self::bytes_per_texture(key))
+            .sum()
+    }
+
+    /// Free idle textures until retention is at or below `budget`, but drop at
+    /// most `max_free_bytes` this call. Called every frame, this spreads the
+    /// destruction of piled-up single-use offscreen targets across frames
+    /// instead of dumping them all into the driver at once (which stalls a
+    /// single frame - the periodic hitch). Textures still in use aren't in the
+    /// pool, so they're never touched.
+    pub fn evict_over_budget(&mut self, budget: u64, max_free_bytes: u64) {
+        let retained = self.retained_bytes();
+        if retained <= budget {
+            return;
+        }
+        let mut to_free = (retained - budget).min(max_free_bytes);
+        for (key, pool) in self.pools.iter() {
+            if to_free == 0 {
+                break;
+            }
+            let per = Self::bytes_per_texture(key);
+            if per == 0 {
+                continue;
+            }
+            let want = (to_free / per).max(1) as usize;
+            let dropped = pool.evict(want) as u64;
+            to_free = to_free.saturating_sub(dropped * per);
+        }
     }
 
     pub fn get_texture(
@@ -44,7 +76,6 @@ impl TexturePool {
             format,
             sample_count,
         };
-        let created_bytes = self.created_bytes.clone();
         let pool = self.pools.entry(key).or_insert_with(|| {
             let label = if cfg!(feature = "render_debug_labels") {
                 use std::sync::atomic::{AtomicU32, Ordering};
@@ -65,16 +96,6 @@ impl TexturePool {
                     view_formats: &[format],
                     usage,
                 });
-                // Track bytes of textures this pool has created (only real
-                // creations -- the closure runs on a pool miss) so callers can cap
-                // how much the pool retains and reuse offscreen targets across
-                // frames instead of churning the GPU driver.
-                let bytes = u64::from(size.width)
-                    * u64::from(size.height)
-                    * u64::from(size.depth_or_array_layers)
-                    * u64::from(sample_count)
-                    * u64::from(format.block_copy_size(None).unwrap_or(4));
-                created_bytes.fetch_add(bytes, Ordering::Relaxed);
                 let view = texture.create_view(&Default::default());
                 (texture, view)
             }))
@@ -159,6 +180,27 @@ impl<Type, Description: BufferDescription> BufferPool<Type, Description> {
             available: Arc::new(Mutex::new(vec![])),
             constructor,
         }
+    }
+
+    /// Number of idle items currently available for reuse.
+    pub fn available_len(&self) -> usize {
+        self.available
+            .lock()
+            .expect("Should not be able to lock recursively")
+            .len()
+    }
+
+    /// Drop up to `count` idle items, returning how many were dropped. Only
+    /// touches pooled (unused) items; anything still checked out is unaffected.
+    pub fn evict(&self, count: usize) -> usize {
+        let mut guard = self
+            .available
+            .lock()
+            .expect("Should not be able to lock recursively");
+        let len = guard.len();
+        let n = count.min(len);
+        guard.truncate(len - n);
+        n
     }
 
     pub fn take(

@@ -61,8 +61,13 @@ use super::interactive::Avm2MousePick;
 
 type FrameNumber = u16;
 
-const AQW_AVATAR_THROTTLE_ROOTS: u32 = 24;
-const AQW_AVATAR_HEAVY_THROTTLE_ROOTS: u32 = 48;
+/// Crowd thresholds for the avatar timeline throttle, counted in *topmost
+/// avatar-asset clips* (see `is_aqw_avatar_asset_root`): one avatar
+/// contributes roughly 8-14 (armor pieces + helm + cape + weapon + hair).
+/// ~8 players' worth engages the half-rate throttle; ~16 players' worth the
+/// third-rate one. Solo play (~10-14) never reaches either.
+const AQW_AVATAR_THROTTLE_ROOTS: u32 = 96;
+const AQW_AVATAR_HEAVY_THROTTLE_ROOTS: u32 = 192;
 
 fn aqw_diagnostics_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -72,6 +77,13 @@ fn aqw_diagnostics_enabled() -> bool {
 fn aqw_full_timeline_throttle_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_TIMELINE_THROTTLE").is_some())
+}
+
+/// Kill-switch for the hidden-subtree (TRASH) freeze, so it can be turned off
+/// in the field without a rebuild if it ever misbehaves.
+fn aqw_hidden_freeze_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_HIDDEN_FREEZE").is_some())
 }
 
 fn is_aqw_avatar_asset_movie_url(url: &str) -> bool {
@@ -2593,8 +2605,51 @@ impl<'gc> MovieClip<'gc> {
         self.set_has_pending_script(has_pending_script);
     }
 
+    /// Whether this clip is the topmost clip of an AQW avatar-asset (item/
+    /// class/hair SWF) subtree. `is_root()` alone misses most of the real
+    /// load: AQW instantiates armor pieces via `getDefinition(...) as Class`
+    /// from the item SWF's ApplicationDomain and parents them into the avatar
+    /// chassis (`AvatarMC.loadArmorPiecesFromDomain`), so the displayed clips
+    /// are class instances, not loaded roots. "Topmost" = my movie is an
+    /// avatar-asset SWF and my parent isn't a clip from an avatar-asset SWF
+    /// (clips further down are covered by the topmost node's early return).
     fn is_aqw_avatar_asset_root(self) -> bool {
-        self.is_root() && is_aqw_avatar_asset_movie_url(self.movie().url())
+        let movie = self.movie();
+        match self.parent() {
+            None => is_aqw_avatar_asset_movie_url(movie.url()),
+            Some(parent) => {
+                if let Some(parent_clip) = parent.as_movie_clip() {
+                    let parent_movie = parent_clip.movie();
+                    if Arc::ptr_eq(&movie, &parent_movie) {
+                        // Fast path: internal clip of the same SWF as its
+                        // parent (the overwhelming majority) — never topmost.
+                        return false;
+                    }
+                    if is_aqw_avatar_asset_movie_url(parent_movie.url()) {
+                        return false;
+                    }
+                }
+                is_aqw_avatar_asset_movie_url(movie.url())
+            }
+        }
+    }
+
+    /// Whether this clip or any display-list ancestor is invisible. AQW parks
+    /// leavers'/off-cell avatars inside `world.TRASH` — an invisible, unnamed
+    /// `MovieClip` at y=-1000 (`World.as`) — instead of unloading them, and
+    /// they accumulate there for the whole session. Anything under a hidden
+    /// ancestor can't be seen, so freezing its art timelines is visually free.
+    fn is_in_aqw_hidden_subtree(self) -> bool {
+        let mut node: DisplayObject<'gc> = self.into();
+        loop {
+            if !node.visible() {
+                return true;
+            }
+            match node.parent() {
+                Some(parent) => node = parent,
+                None => return false,
+            }
+        }
     }
 
     fn update_aqw_timeline_throttle(
@@ -2606,15 +2661,42 @@ impl<'gc> MovieClip<'gc> {
             return false;
         }
 
-        let root_index = *context.aqw_avatar_asset_roots;
-        *context.aqw_avatar_asset_roots = context.aqw_avatar_asset_roots.saturating_add(1);
         self.0.aqw_skip_timeline_frame.set(false);
 
+        // TRASH freeze: fully stop timeline advancement for avatar-asset art
+        // that sits under a hidden ancestor (AQW's invisible `world.TRASH`
+        // parking lot, hidden UI panels, etc.). This kills the per-frame cost
+        // of the avatars that pile up there across map changes WITHOUT freeing
+        // or unloading anything: every AS3 reference stays valid, ENTER_FRAME
+        // broadcasts still fire (combat queues etc. keep running — that's what
+        // broke every destroy-style fix), and the moment AQW re-parents the
+        // avatar back under CHARS it resumes on the very next frame. Clips
+        // that haven't run their first frame yet are exempt so construction
+        // always completes. `RUFFLE_AQW_NO_HIDDEN_FREEZE` disables this.
+        if can_throttle
+            && !aqw_hidden_freeze_disabled()
+            && self.current_frame() != 0
+            && self.is_in_aqw_hidden_subtree()
+        {
+            self.0.aqw_timeline_counter.set(0);
+            self.0.aqw_timeline_divisor.set(0);
+            return true;
+        }
+
+        let root_index = *context.aqw_avatar_asset_roots;
+        *context.aqw_avatar_asset_roots = context.aqw_avatar_asset_roots.saturating_add(1);
+
         let full_timeline_throttle = aqw_full_timeline_throttle_enabled();
-        // Keep attached avatar assets at the SWF frame rate. Skipping their
-        // enter-frame phase makes animation visibly choppy while the Stage FPS
-        // counter still reports the full rate. Detached assets may still be
-        // throttled, and attached assets can only be throttled by explicit opt-in.
+        // Keep attached avatar assets at the SWF frame rate. On-stage crowd
+        // throttling was re-tried on 2026-07-02 (with the corrected topmost-clip
+        // counting below) and REJECTED by field testing: with 8+ players the
+        // item art dropping to 12fps reads as constant stutter even while the
+        // FPS counter says 22-24, and it bought no measurable frame rate
+        // (crowded rooms are GPU-bound on filtered cache redraws — CPU sits at
+        // ~2% while FPS is 5 — which timeline throttling doesn't move). Only
+        // detached (off-stage, non-hidden) assets may be crowd-throttled, and
+        // on-stage throttling stays explicit opt-in via
+        // `RUFFLE_AQW_TIMELINE_THROTTLE`. Do not re-enable it by default.
         if self.is_on_stage(context) && !full_timeline_throttle {
             self.0.aqw_timeline_counter.set(0);
             self.0.aqw_timeline_divisor.set(0);

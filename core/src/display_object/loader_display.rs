@@ -163,6 +163,7 @@ impl<'gc> TDisplayObject<'gc> for LoaderDisplay<'gc> {
 
     fn enter_frame(self, context: &mut UpdateContext<'gc>) {
         if self.parent().is_none() && self.0.aqw_detach_pending.replace(false) {
+            context.avm2.aqw_dec_pending_detach();
             if self.contains_aqw_avatar_asset() {
                 self.0.aqw_was_detached.set(true);
                 self.set_aqw_tree_suspended(context, true);
@@ -203,6 +204,7 @@ impl<'gc> TDisplayObject<'gc> for LoaderDisplay<'gc> {
 
     fn on_parent_added(self, context: &mut UpdateContext<'gc>) {
         if self.0.aqw_detach_pending.replace(false) {
+            context.avm2.aqw_dec_pending_detach();
             return;
         }
 
@@ -217,7 +219,9 @@ impl<'gc> TDisplayObject<'gc> for LoaderDisplay<'gc> {
                 // AQW frequently removes and re-adds Loaders in the same frame
                 // while reordering players, monsters, rooms, and UI. Wait until
                 // the next frame before treating the removal as persistent.
-                self.0.aqw_detach_pending.set(true);
+                if !self.0.aqw_detach_pending.replace(true) {
+                    context.avm2.aqw_inc_pending_detach();
+                }
                 context.orphan_manager.add_orphan_obj(self.into());
             } else {
                 context.orphan_manager.add_orphan_obj(self.into())

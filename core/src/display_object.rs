@@ -1107,11 +1107,21 @@ fn slice_matrix(
     })
 }
 
+/// Test toggle: when `RUFFLE_AQW_NO_SCALE9` is set, the 9-slice scaling path is
+/// disabled, so we can measure its FPS cost against the visual fix it provides.
+fn aqw_scale9_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_SCALE9").is_some())
+}
+
 fn render_aqw_scaling_grid<'gc>(
     this: DisplayObject<'gc>,
     context: &mut RenderContext<'_, 'gc>,
     options: RenderOptions,
 ) -> bool {
+    if aqw_scale9_disabled() {
+        return false;
+    }
     if !is_aqw_movie_url(this.movie().url())
         || !options.apply_transform
         || !options.apply_matrix
@@ -1342,6 +1352,12 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
             .known_movies()
             .filter(|m| is_aqw_movie_url(m.url()))
             .count();
+        // Probe: how many topmost avatar-asset clips (armor pieces, helms,
+        // capes, weapons, hair — roughly 8-14 per avatar) the timeline
+        // throttle counted last frame. Frozen (hidden/TRASH) subtrees are
+        // excluded. The crowded-room throttle engages at
+        // `AQW_AVATAR_THROTTLE_ROOTS` (96) and hardens at 192.
+        let avatar_roots = *context.aqw_avatar_asset_roots_previous;
         tracing::info!(
             target: "aqw_diag",
             orphans,
@@ -1352,6 +1368,7 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
             over_budget,
             movie_libs_total,
             movie_libs_aqw,
+            avatar_roots,
             "AQW memory sweep"
         );
 
@@ -1365,7 +1382,7 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         {
             let _ = writeln!(
                 file,
-                "AQW sweep: orphans={orphans} loaders={loaders} cached_objects={cached_objects} cache_mb={cache_mb} evicted_mb={evicted_mb} over_budget={over_budget} movie_libs_total={movie_libs_total} movie_libs_aqw={movie_libs_aqw}"
+                "AQW sweep: orphans={orphans} loaders={loaders} cached_objects={cached_objects} cache_mb={cache_mb} evicted_mb={evicted_mb} over_budget={over_budget} movie_libs_total={movie_libs_total} movie_libs_aqw={movie_libs_aqw} avatar_roots={avatar_roots}"
             );
         }
     }

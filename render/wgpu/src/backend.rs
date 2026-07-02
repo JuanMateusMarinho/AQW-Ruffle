@@ -83,14 +83,21 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     active_frame: ActiveFrame,
 }
 
-/// Cap on how much GPU texture memory the offscreen pool may retain before it's
-/// dropped and rebuilt. Reusing offscreen targets across frames eliminates the
-/// per-frame allocation churn that otherwise overwhelms the GPU driver in
-/// heavily-cached AQW rooms; capping retention stops animated objects (whose
-/// bounds, and thus target size, change every frame) from hoarding gigabytes of
-/// distinct-sized targets. The working set of a single frame is only tens of MB,
-/// so this leaves ample headroom for genuine reuse.
+/// Cap on how much GPU texture memory the offscreen pool may retain. Reusing
+/// offscreen targets across frames eliminates the per-frame allocation churn
+/// that otherwise overwhelms the GPU driver in heavily-cached AQW rooms;
+/// capping retention stops animated objects (whose bounds, and thus target
+/// size, change every frame) from hoarding gigabytes of distinct-sized targets.
+/// The working set of a single frame is only tens of MB, so this leaves ample
+/// headroom for genuine reuse.
 const OFFSCREEN_POOL_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+
+/// How many bytes of over-budget pooled offscreen textures may be freed per
+/// frame. Dropping the whole pool at once (the previous behavior) dumped up to
+/// 256 MB of textures into the driver's deferred-destruction queue in a single
+/// frame — a visible hitch. Freeing incrementally spreads that cost out while
+/// the janitor thread (see `request_device`) reclaims what's freed.
+const OFFSCREEN_POOL_EVICT_BYTES_PER_FRAME: u64 = 32 * 1024 * 1024;
 
 impl WgpuRenderBackend<SwapChainTarget> {
     #[cfg(target_family = "wasm")]
@@ -685,14 +692,16 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         self.active_frame
             .submit_for_target(&self.descriptors, &self.target, frame_output);
         // Reuse offscreen render targets across frames instead of reallocating
-        // them every frame; drop the pool only once it has retained more than the
-        // budget, to release distinct sizes that piled up (e.g. from animated
-        // objects whose target size changes every frame). Recreating it every
-        // frame caused dozens of large targets to be allocated per frame,
-        // ballooning driver memory to many GB and OOM-crashing.
-        if self.offscreen_texture_pool.retained_bytes() > OFFSCREEN_POOL_BUDGET_BYTES {
-            self.offscreen_texture_pool = TexturePool::new();
-        }
+        // them every frame; recreating the pool every frame caused dozens of
+        // large targets to be allocated per frame, ballooning driver memory to
+        // many GB and OOM-crashing. Once retention exceeds the budget (distinct
+        // sizes piled up, e.g. from animated objects whose target size changes
+        // every frame), free idle textures incrementally instead of dropping the
+        // whole pool at once, which stalled a single frame.
+        self.offscreen_texture_pool.evict_over_budget(
+            OFFSCREEN_POOL_BUDGET_BYTES,
+            OFFSCREEN_POOL_EVICT_BYTES_PER_FRAME,
+        );
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -1265,6 +1274,13 @@ async fn request_device(
     // so the process survives (rendering may degrade until memory frees up),
     // while keeping validation/internal errors fatal so real bugs stay loud.
     device.on_uncaptured_error(Arc::new(handle_uncaptured_wgpu_error));
+
+    // NOTE: a dedicated "janitor" thread looping `device.poll(Wait)` to drain
+    // wgpu's deferred-destruction queue was tried here (2026-07-02) and
+    // REMOVED after field testing: it didn't reduce the heavy-map RAM backlog
+    // (§5) and is the prime suspect for new frame-pacing stutter and a
+    // locked-up castleparty (poll contends with the render thread's submits
+    // under churn). Don't re-add it.
 
     Ok((device, queue))
 }

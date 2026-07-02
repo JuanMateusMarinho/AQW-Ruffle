@@ -219,6 +219,14 @@ pub struct Avm2<'gc> {
     /// lists while their Loader is detached from the display list.
     broadcast_list_suspended: FnvHashMap<AvmString<'gc>, Vec<BroadcastListener<'gc>>>,
 
+    /// Number of AQW avatar loaders currently in the one-frame "detach pending"
+    /// window (parent just removed, not yet suspended). While this is zero -
+    /// i.e. in any steady-state room - the per-listener detached-loader check in
+    /// `broadcast_event` is skipped entirely, so it costs nothing outside of map
+    /// transitions. Maintained by `LoaderDisplay`'s detach bookkeeping.
+    #[collect(require_static)]
+    aqw_pending_detach_count: u32,
+
     next_broadcast_listener_order: u64,
 
     alias_to_class_map: FnvHashMap<AvmString<'gc>, ClassObject<'gc>>,
@@ -278,6 +286,7 @@ impl<'gc> Avm2<'gc> {
             native_fast_call_list: Default::default(),
             broadcast_list: Default::default(),
             broadcast_list_suspended: Default::default(),
+            aqw_pending_detach_count: 0,
             next_broadcast_listener_order: 0,
 
             alias_to_class_map: Default::default(),
@@ -525,6 +534,21 @@ impl<'gc> Avm2<'gc> {
         self.broadcast_list.values().map(std::vec::Vec::len).sum()
     }
 
+    /// Whether any AQW avatar loader is in the one-frame detach-pending window.
+    /// When false, `broadcast_event` can skip its per-listener detached-loader
+    /// check entirely.
+    pub fn aqw_has_pending_detach(&self) -> bool {
+        self.aqw_pending_detach_count > 0
+    }
+
+    pub fn aqw_inc_pending_detach(&mut self) {
+        self.aqw_pending_detach_count = self.aqw_pending_detach_count.saturating_add(1);
+    }
+
+    pub fn aqw_dec_pending_detach(&mut self) {
+        self.aqw_pending_detach_count = self.aqw_pending_detach_count.saturating_sub(1);
+    }
+
     pub fn register_broadcast_listener(
         context: &mut UpdateContext<'gc>,
         object: Object<'gc>,
@@ -616,11 +640,17 @@ impl<'gc> Avm2<'gc> {
                 // can run with `this.stage == null` for one frame before it's
                 // suspended, throwing and leaving the avatar stuck (see
                 // `is_in_currently_detached_aqw_avatar_loader`).
-                let suspended = object
-                    .as_display_object()
-                    .is_some_and(|display_object| {
-                        display_object.is_in_currently_detached_aqw_avatar_loader()
-                    });
+                //
+                // This only matters during the one-frame detach window; gate the
+                // per-listener tree walk on a global counter so it's free in any
+                // steady-state (e.g. a crowded room with stable avatars), where no
+                // loader is mid-detach.
+                let suspended = context.avm2.aqw_has_pending_detach()
+                    && object
+                        .as_display_object()
+                        .is_some_and(|display_object| {
+                            display_object.is_in_currently_detached_aqw_avatar_loader()
+                        });
                 if !suspended {
                     let mut activation = Activation::from_nothing(context);
 
