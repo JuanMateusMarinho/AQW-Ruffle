@@ -1114,12 +1114,44 @@ fn aqw_scale9_disabled() -> bool {
     *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_SCALE9").is_some())
 }
 
+thread_local! {
+    /// When the stage viewport last changed size (a window resize). Set from
+    /// `Stage::build_matrices`; read by the 9-slice path below.
+    static LAST_AQW_RESIZE: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+}
+
+/// How long after a resize the AQW 9-slice path stays disabled. A resize
+/// invalidates every bitmap cache at once; in a crowded room the per-frame
+/// redraw budget can't refresh them all immediately, and AQW simultaneously
+/// re-lays-out its HUD by real pixels. During that storm the 9-slice path can
+/// paint a panel (e.g. the gold/exp bar) black, and a deferred parent cache
+/// freezes that black frame for many frames. Falling back to the normal render
+/// path for a moment after a resize avoids the black (the normal path degrades
+/// to stale-but-visible, which is what `RUFFLE_AQW_NO_SCALE9` showed); 9-slice
+/// resumes once the layout settles. Resizes don't happen in normal play, so
+/// this has no steady-state cost.
+const AQW_RESIZE_SETTLE: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// Record that the stage viewport just changed size. Called from
+/// `Stage::build_matrices` when the stage size actually changes.
+pub fn note_aqw_stage_resize() {
+    LAST_AQW_RESIZE.with(|cell| cell.set(Some(std::time::Instant::now())));
+}
+
+/// Whether we're still within the post-resize settle window.
+fn aqw_recently_resized() -> bool {
+    LAST_AQW_RESIZE.with(|cell| {
+        cell.get()
+            .is_some_and(|at| at.elapsed() < AQW_RESIZE_SETTLE)
+    })
+}
+
 fn render_aqw_scaling_grid<'gc>(
     this: DisplayObject<'gc>,
     context: &mut RenderContext<'_, 'gc>,
     options: RenderOptions,
 ) -> bool {
-    if aqw_scale9_disabled() {
+    if aqw_scale9_disabled() || aqw_recently_resized() {
         return false;
     }
     if !is_aqw_movie_url(this.movie().url())
