@@ -73,19 +73,18 @@ app.openAqTubeWindow = () => {
 		'<!doctype html><html><head><meta charset="utf-8">',
 		'<title>AQTUBE</title>',
 		'<style>',
-		'html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#050505;color:#f5d09a;font-family:Arial,sans-serif;}',
-		'.toolbar{height:48px;display:flex;align-items:center;gap:8px;padding:0 12px;background:linear-gradient(#211208,#070402);border-bottom:1px solid #7f3908;box-sizing:border-box;}',
-		'.brand{font-weight:700;color:#fff;margin-right:8px;text-shadow:0 1px 2px #000;}',
-		'button{height:30px;padding:0 12px;border:1px solid #6e4214;background:linear-gradient(#4a2b12,#170c06);color:#ffd7a0;font-weight:700;font-size:12px;cursor:pointer;text-transform:uppercase;}',
-		'button:hover{border-color:#c56b16;color:#fff;}',
+		'html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#0a0603;color:#f5d09a;font-family:Arial,sans-serif;}',
+		'.toolbar{height:48px;display:flex;align-items:center;gap:10px;padding:0 14px;background:linear-gradient(#2a1707,#160b05 55%,#0a0603);border-bottom:1px solid #a9761f;box-shadow:inset 0 1px 0 rgba(255,214,120,.15);box-sizing:border-box;}',
+		'.brand{font-weight:700;font-size:15px;letter-spacing:1px;margin-right:6px;background-image:linear-gradient(#fff1c9,#f2c65a 50%,#d98f24);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;filter:drop-shadow(0 1px 1px rgba(0,0,0,.6));}',
+		'button{height:31px;padding:0 14px;border:1px solid #8a5a16;border-radius:4px;background:linear-gradient(#3c250f,#180d05);color:#ffd9a0;font-weight:700;font-size:12px;cursor:pointer;text-transform:uppercase;letter-spacing:.4px;transition:all .16s ease;}',
+		'button:hover{border-color:#e8a52a;color:#fff3d6;background:linear-gradient(#5a3714,#241206);box-shadow:0 0 10px rgba(232,165,42,.35),inset 0 1px 0 rgba(255,214,120,.25);}',
 		'.spacer{flex:1;}',
 		'</style></head><body>',
-		'<div class="toolbar"><span class="brand">AQTUBE</span><button id="back">Back</button><button id="home">Channel</button><span class="spacer"></span><button id="open">Open Window</button></div>',
+		'<div class="toolbar"><span class="brand">AQTUBE</span><button id="back">Back</button><button id="home">Channel</button></div>',
 		'<script>',
 		'const app=require("electron").remote.app;',
 		'document.getElementById("back").addEventListener("click",()=>app.aqTubeGoBack());',
 		'document.getElementById("home").addEventListener("click",()=>app.aqTubeGoHome());',
-		'document.getElementById("open").addEventListener("click",()=>app.aqTubeOpenCurrent());',
 		'</script>',
 		'</body></html>'
 	].join('');
@@ -228,27 +227,38 @@ app.injectAqTubeTab = () => {
 		return;
 	}
 
+	if (!document.getElementById('aqtube-style')) {
+		const style = document.createElement('style');
+		style.id = 'aqtube-style';
+		style.textContent = '#aqtube-nav-item > a{transition:filter .18s ease,text-shadow .18s ease;}#aqtube-nav-item > a:hover{filter:brightness(1.18);text-shadow:0 0 9px rgba(255,178,66,.9),0 1px 2px #000;}';
+		(document.head || document.documentElement).appendChild(style);
+	}
+
 	const nav = findTopNav();
 	const navItem = document.createElement(nav && nav.tagName === 'UL' ? 'li' : 'span');
 	navItem.id = 'aqtube-nav-item';
-	navItem.style.cssText = 'display:inline-block;vertical-align:top;background:linear-gradient(#3d1f09,#140805);';
+	const inTopNav = !!(nav && nav.tagName === 'UL');
 
 	const link = document.createElement('a');
 	link.href = '#aqtube';
 	link.textContent = 'AQTUBE';
 	link.title = 'AQTubers';
-	link.style.cssText = [
-		'display:block',
-		'height:44px',
-		'line-height:44px',
-		'padding:0 13px',
-		'color:#f4e0bd',
-		'font:700 15px Georgia,serif',
-		'letter-spacing:0',
-		'text-decoration:none',
-		'text-shadow:0 1px 2px #000',
-		'box-shadow:inset 0 -2px 0 #f08219'
-	].join(';');
+	if (inTopNav) {
+		link.style.cssText = "background:url('https://www.artix.com/media/1283/gl-topnav-hover.png') no-repeat center bottom;";
+	} else {
+		navItem.style.cssText = 'display:inline-block;vertical-align:top;';
+		link.style.cssText = [
+			'display:block',
+			'height:30px',
+			'line-height:30px',
+			'padding:10px 14px 12px',
+			'color:#f4e0bd',
+			"font:400 14px 'Cinzel',Georgia,serif",
+			'text-decoration:none',
+			'text-shadow:0 1px 2px #000',
+			"background:url('https://www.artix.com/media/1283/gl-topnav-hover.png') no-repeat center bottom"
+		].join(';');
+	}
 
 	link.addEventListener('click', (event) => {
 		event.preventDefault();
@@ -440,7 +450,10 @@ main = main.replace(
   "'--scale', 'show-all',\r\n\t\t'--letterbox', 'on',"
 );
 
-if (!main.includes("app.injectAqTubeTab = () =>")) {
+const aqTubeBlockRegex = /\nconst aqTubeFs = require\('fs'\);[\s\S]*?(?=\napp\.launchGameLocal = \(gameName\) => \{)/;
+if (aqTubeBlockRegex.test(main)) {
+  main = main.replace(aqTubeBlockRegex, aqTubePatch.replace(/\s*$/, ""));
+} else {
   if (!main.includes(insertBefore)) {
     throw new Error("Could not find AQTUBE insertion point");
   }
