@@ -1139,10 +1139,23 @@ pub fn note_aqw_stage_resize() {
 }
 
 /// Whether we're still within the post-resize settle window.
+///
+/// This is called for every display object every frame (via `render_base`),
+/// so the common case - no resize in the last second - must be nearly free:
+/// it's a single thread-local read of `None`. Only within the settle window
+/// after an actual resize do we pay the `Instant::elapsed()` timer read, and
+/// once the window elapses we reset the cell back to `None` so subsequent
+/// frames take the cheap path again. (Reading a timer per object per frame,
+/// as an earlier version did, measurably cost FPS in effect-heavy boss fights
+/// on slower `QueryPerformanceCounter` hardware.)
 fn aqw_recently_resized() -> bool {
-    LAST_AQW_RESIZE.with(|cell| {
-        cell.get()
-            .is_some_and(|at| at.elapsed() < AQW_RESIZE_SETTLE)
+    LAST_AQW_RESIZE.with(|cell| match cell.get() {
+        None => false,
+        Some(at) if at.elapsed() < AQW_RESIZE_SETTLE => true,
+        Some(_) => {
+            cell.set(None);
+            false
+        }
     })
 }
 
