@@ -1539,6 +1539,8 @@ pub fn draw<'gc>(
         dirty_cache_redraws_remaining: 0,
         dirty_cache_redraws_reserved: 0,
         dirty_cache_redraw_pixels_remaining: 0,
+        small_cache_redraws_remaining: 0,
+        aged_cache_redraws_remaining: 0,
         stage: context.stage,
     };
 

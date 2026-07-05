@@ -84,6 +84,40 @@ pub const FALLBACK_DEVICE_FONT: &[u8] = include_bytes!("../assets/notosans.subse
 
 const AQW_DIRTY_CACHE_REDRAWS_PER_FRAME: u32 = 8;
 const AQW_DIRTY_CACHE_REDRAW_PIXELS_PER_FRAME: u64 = 6_000_000;
+/// Per-frame quota for *small* dirty AQW cache redraws (below the large-cache
+/// defer thresholds). Generous enough that normal play (a handful of animating
+/// filtered clips) never hits it; an FX storm (fireworks, ultra skill spam)
+/// gets throttled into deferral instead of melting FPS. Field-tunable via
+/// `RUFFLE_AQW_SMALL_REDRAW_CAP=N` (`0` disables the cap).
+const AQW_SMALL_CACHE_REDRAWS_PER_FRAME: u32 = 32;
+/// Per-frame quota for aged redraws (caches starved by the budget for ~1s).
+/// Disable with `RUFFLE_AQW_NO_CACHE_AGING`.
+const AQW_AGED_CACHE_REDRAWS_PER_FRAME: u32 = 2;
+
+fn aqw_small_cache_redraw_budget() -> u32 {
+    static BUDGET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        match std::env::var("RUFFLE_AQW_SMALL_REDRAW_CAP")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+        {
+            Some(0) => u32::MAX,
+            Some(n) => n,
+            None => AQW_SMALL_CACHE_REDRAWS_PER_FRAME,
+        }
+    })
+}
+
+fn aqw_aged_cache_redraw_budget() -> u32 {
+    static BUDGET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        if std::env::var_os("RUFFLE_AQW_NO_CACHE_AGING").is_some() {
+            0
+        } else {
+            AQW_AGED_CACHE_REDRAWS_PER_FRAME
+        }
+    })
+}
 
 #[derive(Collect)]
 #[collect(no_drop)]
@@ -2066,6 +2100,8 @@ impl Player {
                 dirty_cache_redraws_remaining: AQW_DIRTY_CACHE_REDRAWS_PER_FRAME,
                 dirty_cache_redraws_reserved: 0,
                 dirty_cache_redraw_pixels_remaining: AQW_DIRTY_CACHE_REDRAW_PIXELS_PER_FRAME,
+                small_cache_redraws_remaining: aqw_small_cache_redraw_budget(),
+                aged_cache_redraws_remaining: aqw_aged_cache_redraw_budget(),
                 stage,
             };
 

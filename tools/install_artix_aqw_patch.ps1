@@ -335,7 +335,7 @@ app.artixRuffleGames = {
 	aqw: {
 		exe: 'AQW.exe',
 		icon: 'aqw',
-		title: 'Artix Entertainment - AdventureQuest Worlds V1.0',
+		title: 'Artix Entertainment - AdventureQuest Worlds V1.1',
 		swfURL: 'https://game.aq.com/game/gamefiles/Loader3.swf',
 		baseURL: 'https://game.aq.com/game/gamefiles/',
 		width: '960',
@@ -530,7 +530,7 @@ if (!main.includes("app.launchArtixRuffleGame(gameName)")) {
   );
 }
 
-const launcherWindowTitle = 'GameLauncher on Artix Entertainment v.230';
+const launcherWindowTitle = 'GameLauncher on Artix Entertainment v.231';
 main = main.replaceAll("'Artix Game Launcher v.' + clientVersion", `'${launcherWindowTitle}'`);
 main = main.replaceAll("title: 'Loading Artix Games',", "title: '" + launcherWindowTitle + "',");
 main = main.replaceAll("mainWindow.once('page-title-updated', function (event) {", "mainWindow.on('page-title-updated', function (event) {");

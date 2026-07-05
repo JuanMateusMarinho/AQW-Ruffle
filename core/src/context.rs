@@ -584,6 +584,18 @@ pub struct RenderContext<'a, 'gc> {
     /// Approximate remaining pixel budget for dirty bitmap cache redraws this frame.
     pub dirty_cache_redraw_pixels_remaining: u64,
 
+    /// Remaining budget for *small* dirty AQW cache redraws this frame (below the
+    /// large-cache defer thresholds). Small caches used to bypass budgeting
+    /// entirely, but FX storms (fireworks, ultra-boss skill spam) run hundreds of
+    /// small filtered clips at once and the unbudgeted redraw swarm melts FPS and
+    /// churns the offscreen texture pool.
+    pub small_cache_redraws_remaining: u32,
+
+    /// Remaining budget for aged redraws: caches that kept losing the (render-
+    /// order) budget race for many consecutive frames get a reserved quota so
+    /// every stale object still refreshes within about a second.
+    pub aged_cache_redraws_remaining: u32,
+
     /// The current player's stage (including all loaded levels)
     pub stage: Stage<'gc>,
 }
@@ -614,6 +626,22 @@ impl<'gc> RenderContext<'_, 'gc> {
         self.dirty_cache_redraw_pixels_remaining = self
             .dirty_cache_redraw_pixels_remaining
             .saturating_sub(pixels);
+        true
+    }
+
+    pub fn try_reserve_small_cache_redraw(&mut self) -> bool {
+        if self.small_cache_redraws_remaining == 0 {
+            return false;
+        }
+        self.small_cache_redraws_remaining -= 1;
+        true
+    }
+
+    pub fn try_reserve_aged_cache_redraw(&mut self) -> bool {
+        if self.aged_cache_redraws_remaining == 0 {
+            return false;
+        }
+        self.aged_cache_redraws_remaining -= 1;
         true
     }
 
