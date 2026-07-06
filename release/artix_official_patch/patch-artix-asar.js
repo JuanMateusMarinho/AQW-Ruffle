@@ -293,7 +293,7 @@ app.artixRuffleGames = {
 	aqw: {
 		exe: 'AQW.exe',
 		icon: 'aqw',
-		title: 'Artix Entertainment - AdventureQuest Worlds V1.1',
+		title: 'Artix Entertainment - AdventureQuest Worlds V1.2',
 		swfURL: 'https://game.aq.com/game/gamefiles/Loader3.swf',
 		baseURL: 'https://game.aq.com/game/gamefiles/',
 		width: '960',
@@ -403,7 +403,9 @@ app.launchArtixRuffleGame = (gameName) => {
 			ARTIX_RUFFLE_WINDOW_TITLE: gameInfo.title,
 			ARTIX_RUFFLE_GAME: gameName,
 			ARTIX_RUFFLE_GAME_ICON: gameInfo.icon,
-			RUST_LOG: 'warn'
+			RUST_LOG: 'warn',
+			// SSAA 1.25x for AQW only (sharpens its fine vector lineart); '1' = off.
+			RUFFLE_AQW_SUPERSAMPLE: gameName === 'aqw' ? '1.25' : '1'
 		});
 
 		const ruffleProcess = spawn(resolvedExe.exePath, args, {

@@ -67,6 +67,7 @@ impl Surface {
     pub fn draw_commands_and_copy_to<'frame, 'global: 'frame>(
         &self,
         frame_view: &wgpu::TextureView,
+        smooth: bool,
         render_target_mode: RenderTargetMode,
         descriptors: &'global Descriptors,
         staging_belt: &'frame mut wgpu::util::StagingBelt,
@@ -97,6 +98,7 @@ impl Surface {
             target.whole_frame_bind_group(descriptors),
             target.globals(),
             1,
+            smooth,
             draw_encoder,
         );
     }

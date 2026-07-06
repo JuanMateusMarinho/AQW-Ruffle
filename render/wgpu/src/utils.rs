@@ -203,6 +203,7 @@ pub fn run_copy_pipeline(
     whole_frame_bind_group: &wgpu::BindGroup,
     globals: &Globals,
     sample_count: u32,
+    smooth: bool,
     encoder: &mut CommandEncoder,
 ) {
     let copy_bind_group = descriptors
@@ -221,7 +222,7 @@ pub fn run_copy_pipeline(
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(
-                        descriptors.bitmap_samplers.get_sampler(false, false),
+                        descriptors.bitmap_samplers.get_sampler(false, smooth),
                     ),
                 },
             ],

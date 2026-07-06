@@ -70,7 +70,7 @@ mod windows_launcher {
     // Loader3 fetches the current game version and initializes Game.params before startup.
     const AQW_SWF_URL: &str = "https://game.aq.com/game/gamefiles/Loader3.swf";
     const AQW_BASE_URL: &str = "https://game.aq.com/game/gamefiles/";
-    const AQW_WINDOW_TITLE: &str = "Artix Entertainment - AdventureQuest Worlds V1.1";
+    const AQW_WINDOW_TITLE: &str = "Artix Entertainment - AdventureQuest Worlds V1.2";
     const AQW_DESIGN_NOTES_URL: &str = "https://www.aq.com/gamedesignnotes/";
     const AQW_YOUTUBE_RECENT_URL: &str =
         "https://www.youtube.com/channel/UC0vYUqgESNR3sqEPiJ4SpeA/recent";
@@ -2603,6 +2603,10 @@ mod windows_launcher {
                     "warn"
                 },
             )
+            // SSAA: render AQW at 1.25× and downsample, to sharpen its fine vector
+            // lineart (Ruffle renders it softer than Flash at 1×). AQW-only launcher,
+            // so always on; set to "1" to disable. See RUFFLE_AQW_SUPERSAMPLE.
+            .env("RUFFLE_AQW_SUPERSAMPLE", "1.25")
             .arg(swf_url)
             .arg("--spoof-url")
             .arg(swf_url)

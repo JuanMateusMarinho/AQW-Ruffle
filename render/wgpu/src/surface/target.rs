@@ -290,6 +290,7 @@ impl CommandTarget {
                     get_whole_frame_bind_group(&whole_frame_bind_group, descriptors, size),
                     &globals,
                     sample_count,
+                    false,
                     encoder,
                 );
             } else {

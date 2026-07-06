@@ -67,10 +67,35 @@ pub fn create_wgpu_instance(
     })
 }
 
+/// Supersampling factor for the main render surface, from `RUFFLE_AQW_SUPERSAMPLE`
+/// (default `1` = off, clamped to 1..=4). The whole scene is rendered into a surface
+/// N× the swapchain resolution and linearly downsampled at present (SSAA). We inflate
+/// the reported `scale_factor` by the same N, so the *logical* stage size
+/// (physical / scale_factor) is unchanged — AQW keeps its NO_SCALE HUD at the real
+/// 960×540 — while every vector shape and cacheAsBitmap avatar rasterizes at N×. This
+/// is the only Ruffle-side lever against AQW's soft lineart (Flash renders it crisper
+/// at 1×); cost is ~N² GPU memory/fill, so it stays behind the env var.
+///
+/// Exposed so the desktop mouse mapping can scale window coordinates by the same
+/// factor (the renderer reports an N× viewport to the player).
+pub fn aqw_supersample_factor() -> f32 {
+    static FACTOR: OnceLock<f32> = OnceLock::new();
+    *FACTOR.get_or_init(|| {
+        std::env::var("RUFFLE_AQW_SUPERSAMPLE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|n| n.is_finite())
+            .map(|n| n.clamp(1.0, 4.0))
+            .unwrap_or(1.0)
+    })
+}
+
 pub struct WgpuRenderBackend<T: RenderTarget> {
     pub(crate) descriptors: Arc<Descriptors>,
     target: T,
     surface: Surface,
+    /// SSAA factor; see [`aqw_supersample_factor`]. `1.0` = disabled (normal path).
+    supersample: f32,
     meshes: Vec<Mesh>,
     shape_tessellator: ShapeTessellator,
     // This is currently unused - we just store it to report in
@@ -261,6 +286,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             descriptors,
             target,
             surface,
+            supersample: aqw_supersample_factor(),
             meshes: Vec::new(),
             shape_tessellator: ShapeTessellator::new(),
             viewport_scale_factor: 1.0,
@@ -428,17 +454,29 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             ),
             1,
         );
+        // The swapchain always matches the real window.
         self.target.resize(&self.descriptors.device, width, height);
 
+        // Supersampling: render into a surface `supersample`× the window and
+        // linearly downsample to the swapchain at present (see submit_frame). The
+        // reported scale_factor is inflated by the same factor (viewport_dimensions),
+        // so the logical stage size (physical / scale_factor) is unchanged — AQW's
+        // NO_SCALE HUD stays put — while shapes and cacheAsBitmap avatars rasterize
+        // at N×. With supersample=1 this is identical to the old path.
+        let ss = self.supersample;
+        let max = self.descriptors.limits.max_texture_dimension_2d;
+        let scale_dim = |d: u32| ((d as f32 * ss).round() as u32).clamp(1, max);
+        let render_width = scale_dim(width);
+        let render_height = scale_dim(height);
         self.surface = Surface::new(
             &self.descriptors,
             self.surface.quality(),
-            width,
-            height,
+            render_width,
+            render_height,
             self.target.format(),
         );
 
-        self.viewport_scale_factor = dimensions.scale_factor;
+        self.viewport_scale_factor = dimensions.scale_factor * f64::from(ss);
         self.texture_pool = TexturePool::new();
         // Old offscreen targets are sized for the previous viewport; drop them.
         self.offscreen_texture_pool = TexturePool::new();
@@ -503,9 +541,14 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     }
 
     fn viewport_dimensions(&self) -> ViewportDimensions {
+        // Report the (supersampled) render size and inflated scale_factor so the
+        // player builds commands at N× while the logical stage stays 1× (the
+        // swapchain `self.target` keeps the real window size). With supersample=1
+        // this is exactly the render/window size, as before.
+        let size = self.surface.size();
         ViewportDimensions {
-            width: self.target.width(),
-            height: self.target.height(),
+            width: size.width,
+            height: size.height,
             scale_factor: self.viewport_scale_factor,
         }
     }
@@ -661,6 +704,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     target.whole_frame_bind_group(&self.descriptors),
                     target.globals(),
                     target.color_texture().sample_count(),
+                    false,
                     &mut self.active_frame.command_encoder,
                 );
             }
@@ -672,6 +716,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
 
         self.surface.draw_commands_and_copy_to(
             frame_output.view(),
+            // Linearly downsample when supersampling (render surface is N× the
+            // swapchain); a 1:1 present keeps the cheaper nearest copy.
+            self.supersample > 1.0,
             RenderTargetMode::FreshWithColor(wgpu::Color {
                 r: f64::from(clear.r) / 255.0,
                 g: f64::from(clear.g) / 255.0,
@@ -849,6 +896,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         );
         surface.draw_commands_and_copy_to(
             frame_output.view(),
+            false,
             RenderTargetMode::FreshWithTexture(target.get_texture()),
             &self.descriptors,
             &mut self.active_frame.staging_belt,
