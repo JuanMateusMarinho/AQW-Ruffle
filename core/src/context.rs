@@ -591,6 +591,16 @@ pub struct RenderContext<'a, 'gc> {
     /// churns the offscreen texture pool.
     pub small_cache_redraws_remaining: u32,
 
+    /// Number of small dirty cache redraws already reserved during this frame.
+    pub small_cache_redraws_reserved: u32,
+
+    /// Remaining screen-pixel budget for small dirty cache redraws this frame.
+    /// The count quota bounds how many; this bounds how much GPU fill/filter
+    /// work they add up to. In fullscreen each redraw covers 4-6x the pixels
+    /// of its windowed self, and admitting a windowed *count* of them melts
+    /// crowded-room FPS.
+    pub small_cache_redraw_pixels_remaining: u64,
+
     /// Remaining budget for aged redraws: caches that kept losing the (render-
     /// order) budget race for many consecutive frames get a reserved quota so
     /// every stale object still refreshes within about a second.
@@ -629,11 +639,24 @@ impl<'gc> RenderContext<'_, 'gc> {
         true
     }
 
-    pub fn try_reserve_small_cache_redraw(&mut self) -> bool {
+    pub fn try_reserve_small_cache_redraw(&mut self, pixels: u64) -> bool {
         if self.small_cache_redraws_remaining == 0 {
             return false;
         }
+
+        // As with large redraws, always let one over-budget redraw make
+        // progress per frame so a lone biggish FX can't starve forever.
+        if pixels > self.small_cache_redraw_pixels_remaining
+            && self.small_cache_redraws_reserved > 0
+        {
+            return false;
+        }
+
         self.small_cache_redraws_remaining -= 1;
+        self.small_cache_redraws_reserved += 1;
+        self.small_cache_redraw_pixels_remaining = self
+            .small_cache_redraw_pixels_remaining
+            .saturating_sub(pixels);
         true
     }
 

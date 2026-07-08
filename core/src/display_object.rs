@@ -179,6 +179,7 @@ impl BitmapCache {
         draw_offset: Point<i32>,
         swf_version: u8,
         allow_aqw_large_cache: bool,
+        allow_size_padding: bool,
     ) {
         self.matrix_a = matrix.a;
         self.matrix_b = matrix.b;
@@ -187,11 +188,26 @@ impl BitmapCache {
         self.source_width = source_width;
         self.source_height = source_height;
         self.draw_offset = draw_offset;
-        if let Some(current) = &mut self.bitmap
-            && current.width == actual_width
-            && current.height == actual_height
-        {
-            return; // No need to resize it
+        if let Some(current) = &mut self.bitmap {
+            if current.width == actual_width && current.height == actual_height {
+                return; // No need to resize it
+            }
+            // With size padding, keep an existing texture as long as the
+            // logical contents still fit and the texture isn't oversized by
+            // more than ~2x in pixels (shrink hysteresis). Pulsing FX bounds
+            // then reuse one allocation instead of recreating a GPU texture
+            // every frame.
+            if allow_size_padding
+                && current.width >= actual_width
+                && current.height >= actual_height
+            {
+                let current_pixels = u64::from(current.width) * u64::from(current.height);
+                let needed_pixels = u64::from(quantize_cache_dimension(actual_width))
+                    * u64::from(quantize_cache_dimension(actual_height));
+                if current_pixels <= needed_pixels.saturating_mul(2) {
+                    return;
+                }
+            }
         }
         let total_pixels = actual_width.saturating_mul(actual_height);
         let flash_acceptable_size = if swf_version > 9 {
@@ -245,15 +261,27 @@ impl BitmapCache {
             );
         }
 
+        // The allocation may be padded up to a size bucket; the logical
+        // contents occupy the top-left region and the margin stays transparent
+        // (the redraw clears the whole texture), so consumers can keep treating
+        // the texture dimensions as the drawable size.
+        let (alloc_width, alloc_height) = if allow_size_padding {
+            (
+                quantize_cache_dimension(actual_width),
+                quantize_cache_dimension(actual_height),
+            )
+        } else {
+            (actual_width, actual_height)
+        };
         if renderer.is_offscreen_supported()
-            && let Some(actual_width) = NonZero::new(actual_width)
-            && let Some(actual_height) = NonZero::new(actual_height)
+            && let Some(alloc_width) = NonZero::new(alloc_width)
+            && let Some(alloc_height) = NonZero::new(alloc_height)
             && acceptable_size
         {
-            let handle = renderer.create_empty_texture(actual_width, actual_height);
+            let handle = renderer.create_empty_texture(alloc_width, alloc_height);
             self.bitmap = handle.ok().map(|handle| BitmapInfo {
-                width: actual_width.get(),
-                height: actual_height.get(),
+                width: alloc_width.get(),
+                height: alloc_height.get(),
                 handle,
             });
         } else {
@@ -1090,6 +1118,13 @@ const AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_SIDE: u32 = 128;
 /// aged-redraw quota (~1s at AQW's 24fps).
 const AQW_STALE_CACHE_AGED_FRAMES: u32 = 24;
 
+/// How far (in twips, per axis) a deferred cache's live offset may drift from
+/// its stale anchor before the stale texture stops being a plausible stand-in.
+/// Ambient glow pulses move bounds by a few pixels; a weapon swing moves them
+/// by hundreds, and anchored old art then shows up visibly detached from the
+/// object. 16px covers the former and catches the latter.
+const AQW_STALE_ANCHOR_MAX_DRIFT_TWIPS: i32 = 16 * 20;
+
 /// Kill-switch: `RUFFLE_AQW_NO_STALE_ANCHOR` restores the old behavior of
 /// drawing deferred caches at the live bounds (the "glow drifts away from the
 /// weapon in a busy room" artifact), for field A/B without a rebuild.
@@ -1098,12 +1133,129 @@ fn aqw_stale_anchor_disabled() -> bool {
     *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_STALE_ANCHOR").is_some())
 }
 
+/// Kill-switch: `RUFFLE_AQW_NO_STALE_GUARD` disables the drift guard and
+/// always draws deferred caches at their stale anchor, for field A/B.
+fn aqw_stale_guard_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_STALE_GUARD").is_some())
+}
+
+/// Kill-switch: `RUFFLE_AQW_NO_PADDED_CACHE` restores exact-size cache
+/// textures, for field A/B without a rebuild.
+fn aqw_padded_cache_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_PADDED_CACHE").is_some())
+}
+
+/// Round a cache texture dimension up to a coarse bucket. AQW's animated
+/// filtered clips change bounds by a few pixels every frame; allocating the
+/// exact size recreates the GPU texture (and every offscreen-pool target
+/// derived from it) each frame, and that allocate/destroy churn is what bloats
+/// driver memory in busy rooms. Buckets make those small bounds changes land
+/// on the same allocation. The padding margin is cleared transparent on every
+/// redraw and the on-screen quad covers the whole texture, so the drawn
+/// output is unchanged.
+fn quantize_cache_dimension(dim: u32) -> u32 {
+    if dim <= 1024 {
+        dim.next_multiple_of(32)
+    } else {
+        dim.next_multiple_of(128)
+    }
+}
+
+/// VRAM pressure level (0 = none, 1 = soft, 2 = hard), updated about once per
+/// second by `aqw_cache_sweep` from the renderer's process GPU-memory report.
+/// Under pressure the per-frame cache-redraw quotas are clamped (see
+/// `Player::render`) so no new cache textures are allocated while the driver
+/// drains its deferred-destruction backlog.
+static AQW_VRAM_PRESSURE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn aqw_vram_pressure() -> u8 {
+    AQW_VRAM_PRESSURE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Kill-switch: `RUFFLE_AQW_NO_VRAM_VALVE` disables the VRAM pressure valve.
+fn aqw_vram_valve_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_VRAM_VALVE").is_some())
+}
+
+/// Refresh `AQW_VRAM_PRESSURE` from the renderer's process GPU-memory report.
+/// Returns `(used_mb, budget_mb)` for the sweep log (`(0, 0)` if unavailable).
+/// Hysteresis keeps the valve from flapping: soft engages at 92% of the OS
+/// budget and releases below 87%; hard engages at 96% and drops back to soft
+/// below 92%. The thresholds sit deliberately close to the cliff: the driver
+/// keeps freed memory cached in its arenas, so a session idles near 90% all
+/// the time without actually paging - engaging there would leave combat FX
+/// permanently stale (weapon art drawn at its stale anchor, visibly detached
+/// from the swing).
+fn update_aqw_vram_pressure(renderer: &mut dyn RenderBackend) -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+
+    if aqw_vram_valve_disabled() {
+        AQW_VRAM_PRESSURE.store(0, Ordering::Relaxed);
+        return (0, 0);
+    }
+    let Some((used, budget)) = renderer.gpu_memory_info() else {
+        AQW_VRAM_PRESSURE.store(0, Ordering::Relaxed);
+        return (0, 0);
+    };
+    let pct = if budget == 0 {
+        0
+    } else {
+        used.saturating_mul(100) / budget
+    };
+    let previous = AQW_VRAM_PRESSURE.load(Ordering::Relaxed);
+    let level = match previous {
+        0 => {
+            if pct >= 96 {
+                2
+            } else if pct >= 92 {
+                1
+            } else {
+                0
+            }
+        }
+        1 => {
+            if pct >= 96 {
+                2
+            } else if pct < 87 {
+                0
+            } else {
+                1
+            }
+        }
+        _ => {
+            if pct < 87 {
+                0
+            } else if pct < 92 {
+                1
+            } else {
+                2
+            }
+        }
+    };
+    if level != previous {
+        tracing::warn!(
+            used_mb = used / (1024 * 1024),
+            budget_mb = budget / (1024 * 1024),
+            pct,
+            level,
+            "GPU memory pressure changed; adjusting cache redraw quotas"
+        );
+    }
+    AQW_VRAM_PRESSURE.store(level, Ordering::Relaxed);
+    (used / (1024 * 1024), budget / (1024 * 1024))
+}
+
 /// Per-sweep-window counters for the AQW dirty-cache budget, reported by
 /// `aqw_cache_sweep` under diagnostics. Relaxed atomics; reset on each sweep.
 static AQW_CACHE_REDRAWS_LARGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AQW_CACHE_REDRAWS_SMALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AQW_CACHE_REDRAWS_AGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AQW_CACHE_REDRAWS_DEFERRED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static AQW_CACHE_STALE_FALLBACKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static AQW_BLEND_LAYERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1385,13 +1537,23 @@ fn aqw_cache_budget_mb() -> u64 {
 pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
     let diagnostics = aqw_diagnostics_enabled();
     let budget_mb = aqw_cache_budget_mb();
-    if (!diagnostics && budget_mb == 0) || !is_aqw_movie_url(context.stage.movie().url()) {
+    if !is_aqw_movie_url(context.stage.movie().url()) {
         return;
     }
 
     // Throttle to roughly once per second.
     static SWEEP_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if SWEEP_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 48 != 0 {
+        return;
+    }
+
+    // VRAM pressure valve: sample the renderer's GPU-memory report and adjust
+    // the per-frame cache-redraw quotas (consumed in `Player::render`). This
+    // runs even with diagnostics off - it's the field guard against the
+    // paging collapse when the driver's texture backlog fills the card.
+    let (vram_mb, vram_budget_mb) = update_aqw_vram_pressure(context.renderer);
+
+    if !diagnostics && budget_mb == 0 {
         return;
     }
 
@@ -1449,7 +1611,9 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         let redraw_small = AQW_CACHE_REDRAWS_SMALL.swap(0, Ordering::Relaxed);
         let redraw_aged = AQW_CACHE_REDRAWS_AGED.swap(0, Ordering::Relaxed);
         let redraw_deferred = AQW_CACHE_REDRAWS_DEFERRED.swap(0, Ordering::Relaxed);
+        let stale_fallback = AQW_CACHE_STALE_FALLBACKS.swap(0, Ordering::Relaxed);
         let blend_layers = AQW_BLEND_LAYERS.swap(0, Ordering::Relaxed);
+        let vram_pressure = aqw_vram_pressure();
         tracing::info!(
             target: "aqw_diag",
             orphans,
@@ -1465,7 +1629,11 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
             redraw_small,
             redraw_aged,
             redraw_deferred,
+            stale_fallback,
             blend_layers,
+            vram_mb,
+            vram_budget_mb,
+            vram_pressure,
             "AQW memory sweep"
         );
 
@@ -1479,7 +1647,7 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         {
             let _ = writeln!(
                 file,
-                "AQW sweep: orphans={orphans} loaders={loaders} cached_objects={cached_objects} cache_mb={cache_mb} evicted_mb={evicted_mb} over_budget={over_budget} movie_libs_total={movie_libs_total} movie_libs_aqw={movie_libs_aqw} avatar_roots={avatar_roots} redraw_large={redraw_large} redraw_small={redraw_small} redraw_aged={redraw_aged} redraw_deferred={redraw_deferred} blend_layers={blend_layers}"
+                "AQW sweep: orphans={orphans} loaders={loaders} cached_objects={cached_objects} cache_mb={cache_mb} evicted_mb={evicted_mb} over_budget={over_budget} movie_libs_total={movie_libs_total} movie_libs_aqw={movie_libs_aqw} avatar_roots={avatar_roots} redraw_large={redraw_large} redraw_small={redraw_small} redraw_aged={redraw_aged} redraw_deferred={redraw_deferred} stale_fallback={stale_fallback} blend_layers={blend_layers} vram_mb={vram_mb} vram_budget_mb={vram_budget_mb} vram_pressure={vram_pressure}"
             );
         }
     }
@@ -1600,6 +1768,11 @@ pub fn render_base<'gc>(
         filters.retain(|f| !f.impotent());
         let bypass_bitmap_cache = degenerate_transform
             || should_bypass_offscreen_bitmap_cache(this, context, &options, &bounds, &filters);
+        // Padded cache textures are only safe when the redraw clear is
+        // transparent; an opaque background would paint the padding margin.
+        let allow_size_padding = allow_aqw_large_cache
+            && !aqw_padded_cache_disabled()
+            && this.opaque_background().is_none();
 
         if let Some(cache) = &mut *this.base().bitmap_cache_mut() {
             if bypass_bitmap_cache {
@@ -1633,9 +1806,27 @@ pub fn render_base<'gc>(
                     let actual_height = filter_rect.height().max(0) as u32;
                     if cache.is_dirty(&base_transform.matrix, width, height) {
                         let redraw_pixels = u64::from(actual_width) * u64::from(actual_height);
-                        let is_large = redraw_pixels >= AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_PIXELS
-                            && (actual_width >= AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_SIDE
-                                || actual_height >= AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_SIDE);
+                        // The large/small split (and the per-frame pixel budget in
+                        // `Player::render`) is calibrated in ~1x windowed pixels.
+                        // Fullscreen plus supersampling multiplies every cache's
+                        // pixel size by the view scale squared, which reclassified
+                        // ordinary combat FX as "large" and starved them on the
+                        // small large-redraw quota - chronic deferral, detached
+                        // stale weapon art and old-scale damage numbers appearing
+                        // only in fullscreen. Normalize the thresholds by the view
+                        // scale so classification matches the windowed calibration.
+                        let view_scale = {
+                            let view = context.stage.view_matrix();
+                            f64::from(view.a.abs().max(view.d.abs())).max(1.0)
+                        };
+                        let defer_min_pixels = (AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_PIXELS as f64
+                            * view_scale
+                            * view_scale) as u64;
+                        let defer_min_side = (f64::from(AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_SIDE)
+                            * view_scale) as u32;
+                        let is_large = redraw_pixels >= defer_min_pixels
+                            && (actual_width >= defer_min_side
+                                || actual_height >= defer_min_side);
                         // Small caches used to bypass the budget entirely ("small is
                         // cheap"), but AQW FX storms (fireworks, ultra-boss skill spam)
                         // run hundreds of small filtered clips at once — each admitted
@@ -1648,7 +1839,7 @@ pub fn render_base<'gc>(
                         } else if is_large {
                             context.try_reserve_dirty_cache_redraw(redraw_pixels)
                         } else {
-                            context.try_reserve_small_cache_redraw()
+                            context.try_reserve_small_cache_redraw(redraw_pixels)
                         };
                         // Budget admission is in render order, so the same objects can
                         // lose the race every frame and stay stale indefinitely. Let
@@ -1672,6 +1863,7 @@ pub fn render_base<'gc>(
                                 draw_offset,
                                 swf_version,
                                 allow_aqw_large_cache,
+                                allow_size_padding,
                             );
                             cache.deferred_frames = 0;
                             cache.stale_anchor = Point::new(
@@ -1708,17 +1900,44 @@ pub fn render_base<'gc>(
                             cache.deferred_frames = cache.deferred_frames.saturating_add(1);
                             AQW_CACHE_REDRAWS_DEFERRED
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            // A stale texture only stands in convincingly while the
+                            // object's bounds still sit near where its contents were
+                            // rendered. A fast animation (a weapon swing) moves them
+                            // by hundreds of pixels within a couple frames, and the
+                            // anchored old art then shows up detached, floating away
+                            // from the object. Past the drift tolerance, skip the
+                            // stale draw and let vector rendering below carry the
+                            // object this frame (briefly without filters, same
+                            // degradation as a fresh denied cache).
+                            let current_offset = Point::new(
+                                bounds.x_min - base_transform.matrix.tx
+                                    + Twips::from_pixels_i32(draw_offset.x),
+                                bounds.y_min - base_transform.matrix.ty
+                                    + Twips::from_pixels_i32(draw_offset.y),
+                            );
+                            let anchor_drifted = !aqw_stale_anchor_disabled()
+                                && !aqw_stale_guard_disabled()
+                                && ((cache.stale_anchor.x - current_offset.x).get().abs()
+                                    > AQW_STALE_ANCHOR_MAX_DRIFT_TWIPS
+                                    || (cache.stale_anchor.y - current_offset.y).get().abs()
+                                        > AQW_STALE_ANCHOR_MAX_DRIFT_TWIPS);
                             let offset_override =
                                 (!aqw_stale_anchor_disabled()).then_some(cache.stale_anchor);
-                            cache_info = cache.handle().map(|handle| DrawCacheInfo {
-                                handle,
-                                dirty: false,
-                                base_transform,
-                                bounds,
-                                draw_offset,
-                                filters,
-                                offset_override,
-                            });
+                            cache_info = if anchor_drifted {
+                                AQW_CACHE_STALE_FALLBACKS
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                None
+                            } else {
+                                cache.handle().map(|handle| DrawCacheInfo {
+                                    handle,
+                                    dirty: false,
+                                    base_transform,
+                                    bounds,
+                                    draw_offset,
+                                    filters,
+                                    offset_override,
+                                })
+                            };
 
                             if aqw_diagnostics_enabled() {
                                 tracing::info!(
@@ -1808,6 +2027,8 @@ pub fn render_base<'gc>(
                 dirty_cache_redraws_reserved: 0,
                 dirty_cache_redraw_pixels_remaining: 0,
                 small_cache_redraws_remaining: 0,
+                small_cache_redraws_reserved: 0,
+                small_cache_redraw_pixels_remaining: 0,
                 aged_cache_redraws_remaining: 0,
                 stage: context.stage,
             };

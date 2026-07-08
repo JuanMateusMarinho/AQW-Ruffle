@@ -119,6 +119,28 @@ fn aqw_aged_cache_redraw_budget() -> u32 {
     })
 }
 
+/// Per-frame *screen-pixel* budget for small dirty cache redraws. The count
+/// quota bounds how many; this bounds how much GPU fill/filter work they add
+/// up to. Deliberately not scaled by the view matrix: in fullscreen each
+/// redraw covers 4-6x the pixels of its windowed self, and admitting a
+/// windowed count of them is what collapsed crowded-room FPS. Field-tunable
+/// via `RUFFLE_AQW_SMALL_REDRAW_PIXEL_CAP=N` (`0` disables the pixel budget).
+const AQW_SMALL_CACHE_REDRAW_PIXELS_PER_FRAME: u64 = 1_500_000;
+
+fn aqw_small_cache_redraw_pixel_budget() -> u64 {
+    static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        match std::env::var("RUFFLE_AQW_SMALL_REDRAW_PIXEL_CAP")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            Some(0) => u64::MAX,
+            Some(n) => n,
+            None => AQW_SMALL_CACHE_REDRAW_PIXELS_PER_FRAME,
+        }
+    })
+}
+
 #[derive(Collect)]
 #[collect(no_drop)]
 struct GcRoot<'gc> {
@@ -2088,6 +2110,21 @@ impl Player {
             let stage = gc_root.stage;
 
             let mut cache_draws = vec![];
+            // Under VRAM pressure the valve brakes the redraw quotas. Large
+            // redraws (map-sized targets) are the real VRAM movers, so they're
+            // cut first; small combat FX keep refreshing under soft pressure -
+            // with padded cache textures an admitted small redraw mostly reuses
+            // its allocation, and starving them leaves weapon art visibly
+            // detached at its stale anchor mid-swing. Hard pressure throttles
+            // small FX too (stale but bounded), still leaving a trickle.
+            let vram_pressure = crate::display_object::aqw_vram_pressure();
+            // Note: both pixel budgets below are deliberately in *screen*
+            // pixels, NOT scaled by the view matrix. They bound actual GPU
+            // fill/filter work per frame, which is what crowded fullscreen
+            // rooms run out of. (Only the large/small *classification* is
+            // view-scale-normalized, in `display_object::render_base`; the
+            // one-oversized-per-frame reserve keeps the fullscreen map
+            // refreshing even though it alone can approach the budget.)
             let mut render_context = RenderContext {
                 renderer: this.renderer.deref_mut(),
                 commands: CommandList::new(),
@@ -2097,11 +2134,27 @@ impl Player {
                 transform_stack: &mut this.transform_stack,
                 is_offscreen: false,
                 use_bitmap_cache: true,
-                dirty_cache_redraws_remaining: AQW_DIRTY_CACHE_REDRAWS_PER_FRAME,
+                dirty_cache_redraws_remaining: match vram_pressure {
+                    0 => AQW_DIRTY_CACHE_REDRAWS_PER_FRAME,
+                    1 => 2,
+                    _ => 0,
+                },
                 dirty_cache_redraws_reserved: 0,
-                dirty_cache_redraw_pixels_remaining: AQW_DIRTY_CACHE_REDRAW_PIXELS_PER_FRAME,
-                small_cache_redraws_remaining: aqw_small_cache_redraw_budget(),
-                aged_cache_redraws_remaining: aqw_aged_cache_redraw_budget(),
+                dirty_cache_redraw_pixels_remaining: match vram_pressure {
+                    0 => AQW_DIRTY_CACHE_REDRAW_PIXELS_PER_FRAME,
+                    1 => AQW_DIRTY_CACHE_REDRAW_PIXELS_PER_FRAME / 2,
+                    _ => 0,
+                },
+                small_cache_redraws_remaining: match vram_pressure {
+                    0 | 1 => aqw_small_cache_redraw_budget(),
+                    _ => 8,
+                },
+                small_cache_redraws_reserved: 0,
+                small_cache_redraw_pixels_remaining: aqw_small_cache_redraw_pixel_budget(),
+                aged_cache_redraws_remaining: match vram_pressure {
+                    0 | 1 => aqw_aged_cache_redraw_budget(),
+                    _ => 1,
+                },
                 stage,
             };
 

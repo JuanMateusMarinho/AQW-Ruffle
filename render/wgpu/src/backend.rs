@@ -43,6 +43,69 @@ fn aqw_diagnostics_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
 }
 
+/// Process GPU-memory usage and OS-granted budget, in bytes, sampled via DXGI
+/// (`IDXGIAdapter3::QueryVideoMemoryInfo`) and cached for about a second.
+/// DXGI reports this regardless of which API renders (Vulkan included), and
+/// per process, which is exactly the number the OS uses to decide when to
+/// start demoting our textures to system memory.
+#[cfg(windows)]
+mod gpu_memory {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    static CACHE: Mutex<Option<(Instant, Option<(u64, u64)>)>> = Mutex::new(None);
+
+    pub fn query_cached() -> Option<(u64, u64)> {
+        let mut guard = CACHE.lock().expect("gpu_memory cache poisoned");
+        if let Some((at, value)) = *guard
+            && at.elapsed() < Duration::from_secs(1)
+        {
+            return value;
+        }
+        let value = query();
+        *guard = Some((Instant::now(), value));
+        value
+    }
+
+    fn query() -> Option<(u64, u64)> {
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory1, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO,
+            IDXGIAdapter3, IDXGIFactory1,
+        };
+        use windows::core::Interface;
+
+        unsafe {
+            let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+            // The adapter we render on is the one where this process has the
+            // most memory in use (relevant on hybrid laptops).
+            let mut best: Option<(u64, u64)> = None;
+            let mut index = 0;
+            while let Ok(adapter) = factory.EnumAdapters1(index) {
+                index += 1;
+                let Ok(adapter3) = adapter.cast::<IDXGIAdapter3>() else {
+                    continue;
+                };
+                let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+                if adapter3
+                    .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info)
+                    .is_ok()
+                    && best.is_none_or(|(used, _)| info.CurrentUsage > used)
+                {
+                    best = Some((info.CurrentUsage, info.Budget));
+                }
+            }
+            best
+        }
+    }
+}
+
+/// Kill-switch shared with the core-side valve: `RUFFLE_AQW_NO_VRAM_VALVE`
+/// also disables the pressure-driven pool squeeze here.
+fn vram_valve_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_VRAM_VALVE").is_some())
+}
+
 /// Creates a wgpu instance with Ruffle's required configuration.
 ///
 /// This disables indirect call validation because wgpu's validation runs a compute
@@ -123,6 +186,14 @@ const OFFSCREEN_POOL_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 /// frame — a visible hitch. Freeing incrementally spreads that cost out while
 /// the janitor thread (see `request_device`) reclaims what's freed.
 const OFFSCREEN_POOL_EVICT_BYTES_PER_FRAME: u64 = 32 * 1024 * 1024;
+
+/// Pool retention budget while the process is near its OS GPU-memory budget:
+/// hoarding idle targets is pointless once the OS is about to start demoting
+/// our textures to system memory (the paging FPS collapse), so squeeze hard.
+const OFFSCREEN_POOL_PRESSURE_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Faster over-budget draining under pressure.
+const OFFSCREEN_POOL_PRESSURE_EVICT_BYTES_PER_FRAME: u64 = 128 * 1024 * 1024;
 
 impl WgpuRenderBackend<SwapChainTarget> {
     #[cfg(target_family = "wasm")]
@@ -745,10 +816,19 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         // sizes piled up, e.g. from animated objects whose target size changes
         // every frame), free idle textures incrementally instead of dropping the
         // whole pool at once, which stalled a single frame.
-        self.offscreen_texture_pool.evict_over_budget(
-            OFFSCREEN_POOL_BUDGET_BYTES,
-            OFFSCREEN_POOL_EVICT_BYTES_PER_FRAME,
-        );
+        let mut pool_budget = OFFSCREEN_POOL_BUDGET_BYTES;
+        let mut evict_per_frame = OFFSCREEN_POOL_EVICT_BYTES_PER_FRAME;
+        #[cfg(windows)]
+        if !vram_valve_disabled()
+            && let Some((used, budget)) = gpu_memory::query_cached()
+            && budget > 0
+            && used.saturating_mul(100) / budget >= 92
+        {
+            pool_budget = OFFSCREEN_POOL_PRESSURE_BUDGET_BYTES;
+            evict_per_frame = OFFSCREEN_POOL_PRESSURE_EVICT_BYTES_PER_FRAME;
+        }
+        self.offscreen_texture_pool
+            .evict_over_budget(pool_budget, evict_per_frame);
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -927,6 +1007,17 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
 
     fn is_offscreen_supported(&self) -> bool {
         true
+    }
+
+    fn gpu_memory_info(&self) -> Option<(u64, u64)> {
+        #[cfg(windows)]
+        {
+            gpu_memory::query_cached()
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
     }
 
     fn apply_filter(

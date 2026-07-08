@@ -80,6 +80,12 @@ pub trait RenderBackend: Any {
         false
     }
 
+    /// Best-effort report of this process's GPU memory usage and the
+    /// OS-granted budget, in bytes, when the backend has a way to measure it.
+    fn gpu_memory_info(&self) -> Option<(u64, u64)> {
+        None
+    }
+
     fn submit_frame(
         &mut self,
         clear: swf::Color,
