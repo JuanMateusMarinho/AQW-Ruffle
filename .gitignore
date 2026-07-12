@@ -19,3 +19,6 @@ RECOVER_*.fla
 
 # A developers local Flash Player harness config
 .flash_players.toml
+
+# Mobile APK build output for the AQW launcher
+/LauncherAPK/

@@ -28,7 +28,6 @@ async-channel = { workspace = true }
 async-io = { version = "2.6.0", optional = true }
 futures-lite = "2.6.1"
 reqwest = { workspace = true, features = [
-    "native-tls",
     "socks",
     "cookies",
     "charset",
@@ -38,6 +37,14 @@ reqwest = { workspace = true, features = [
 tokio = { workspace = true, features = ["net", "macros"], optional = true }
 cpal = { workspace = true, optional = true }
 bytemuck = { workspace = true, optional = true }
+
+# TLS backend by target. native-tls uses the OS stack (SChannel/Secure Transport) on
+# desktop, but pulls OpenSSL on Android, which doesn't cross-compile — use rustls there.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+reqwest = { workspace = true, features = ["native-tls"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+reqwest = { workspace = true, features = ["rustls-tls"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
