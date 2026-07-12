@@ -12,7 +12,7 @@ use ruffle_core::events::{ImeCursorArea, ImePurpose};
 use ruffle_core::{Player, PlayerEvent};
 use ruffle_frontend_utils::content::ContentDescriptor;
 use ruffle_render_wgpu::backend::{
-    WgpuRenderBackend, aqw_supersample_factor, create_wgpu_instance, request_adapter_and_device,
+    WgpuRenderBackend, aqw_current_supersample, create_wgpu_instance, request_adapter_and_device,
 };
 use ruffle_render_wgpu::descriptors::Descriptors;
 use ruffle_render_wgpu::utils::{format_list, get_backend_names};
@@ -296,14 +296,16 @@ impl GuiController {
         // When the renderer supersamples, it reports an N× viewport to the player, so
         // stage hit-testing expects window coordinates scaled up by the same N.
         // (No-op at N=1 — click-to-move in AQW must land on the right cell.)
-        let ss = f64::from(aqw_supersample_factor());
+        // Reads the factor currently in effect — the renderer may gate SSAA off
+        // for large windows — so clicks track whatever is actually rendering.
+        let ss = f64::from(aqw_current_supersample());
         let x = position.x * ss;
         let y = (position.y - self.height_offset()) * ss;
         (x, y)
     }
 
     pub fn movie_to_window_position(&self, x: f64, y: f64) -> PhysicalPosition<f64> {
-        let ss = f64::from(aqw_supersample_factor());
+        let ss = f64::from(aqw_current_supersample());
         let y = y / ss + self.height_offset();
         PhysicalPosition::new(x / ss, y)
     }

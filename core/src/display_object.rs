@@ -1258,6 +1258,18 @@ static AQW_CACHE_REDRAWS_DEFERRED: std::sync::atomic::AtomicU64 =
 static AQW_CACHE_STALE_FALLBACKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static AQW_BLEND_LAYERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Frame-tick phase accounting (nanoseconds per sweep window) filled in by
+/// `run_all_phases_avm2`, plus how many orphan subtrees the orphan freeze
+/// skipped. Splits the tick cost between orphan processing, the on-stage
+/// tree, and event broadcasts, so a CPU-bound tick names its hot phase.
+pub(crate) static AQW_TICK_ORPHAN_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_TICK_STAGE_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_TICK_BCAST_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_ORPHANS_FROZEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 fn scale_twips(value: Twips, scale: f32) -> Twips {
     Twips::new((value.get() as f32 * scale).round_ties_even() as i32)
@@ -1613,6 +1625,10 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         let redraw_deferred = AQW_CACHE_REDRAWS_DEFERRED.swap(0, Ordering::Relaxed);
         let stale_fallback = AQW_CACHE_STALE_FALLBACKS.swap(0, Ordering::Relaxed);
         let blend_layers = AQW_BLEND_LAYERS.swap(0, Ordering::Relaxed);
+        let tick_orphan_ms = AQW_TICK_ORPHAN_NS.swap(0, Ordering::Relaxed) / 1_000_000;
+        let tick_stage_ms = AQW_TICK_STAGE_NS.swap(0, Ordering::Relaxed) / 1_000_000;
+        let tick_bcast_ms = AQW_TICK_BCAST_NS.swap(0, Ordering::Relaxed) / 1_000_000;
+        let orphans_frozen = AQW_ORPHANS_FROZEN.swap(0, Ordering::Relaxed);
         let vram_pressure = aqw_vram_pressure();
         tracing::info!(
             target: "aqw_diag",
@@ -1631,6 +1647,10 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
             redraw_deferred,
             stale_fallback,
             blend_layers,
+            tick_orphan_ms,
+            tick_stage_ms,
+            tick_bcast_ms,
+            orphans_frozen,
             vram_mb,
             vram_budget_mb,
             vram_pressure,
@@ -1647,7 +1667,7 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         {
             let _ = writeln!(
                 file,
-                "AQW sweep: orphans={orphans} loaders={loaders} cached_objects={cached_objects} cache_mb={cache_mb} evicted_mb={evicted_mb} over_budget={over_budget} movie_libs_total={movie_libs_total} movie_libs_aqw={movie_libs_aqw} avatar_roots={avatar_roots} redraw_large={redraw_large} redraw_small={redraw_small} redraw_aged={redraw_aged} redraw_deferred={redraw_deferred} stale_fallback={stale_fallback} blend_layers={blend_layers} vram_mb={vram_mb} vram_budget_mb={vram_budget_mb} vram_pressure={vram_pressure}"
+                "AQW sweep: orphans={orphans} loaders={loaders} cached_objects={cached_objects} cache_mb={cache_mb} evicted_mb={evicted_mb} over_budget={over_budget} movie_libs_total={movie_libs_total} movie_libs_aqw={movie_libs_aqw} avatar_roots={avatar_roots} redraw_large={redraw_large} redraw_small={redraw_small} redraw_aged={redraw_aged} redraw_deferred={redraw_deferred} stale_fallback={stale_fallback} blend_layers={blend_layers} tick_orphan_ms={tick_orphan_ms} tick_stage_ms={tick_stage_ms} tick_bcast_ms={tick_bcast_ms} orphans_frozen={orphans_frozen} vram_mb={vram_mb} vram_budget_mb={vram_budget_mb} vram_pressure={vram_pressure}"
             );
         }
     }

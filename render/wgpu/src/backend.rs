@@ -153,12 +153,64 @@ pub fn aqw_supersample_factor() -> f32 {
     })
 }
 
+/// Cap on the *supersampled* pixel area (`width × height × N²`) above which
+/// SSAA drops back to 1× for that window size, re-evaluated on every resize.
+/// Crispness is worth N²× fill/texture bytes at the default ~960×580 window,
+/// but at fullscreen 1080p the same N²× was measured blowing an 8 GB card
+/// past its VRAM budget in about a minute (WDDM paging, ~1 fps) — every
+/// offscreen cache/filter/blend target scales with the render surface.
+/// `RUFFLE_AQW_SUPERSAMPLE_PIXEL_CAP` overrides (in pixels; `0` = uncapped).
+fn aqw_supersample_pixel_cap() -> u64 {
+    static CAP: OnceLock<u64> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("RUFFLE_AQW_SUPERSAMPLE_PIXEL_CAP")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(2_200_000)
+    })
+}
+
+/// Factor used instead when the pixel-area gate rejects the configured one.
+/// `1.0` would present the window 1:1 (sharpest, but vector lineart shimmers
+/// with nothing smoothing it); the default `0.8333` renders ~1600×900 for a
+/// 1080p window and linearly upscales — field-tested as the preferred look:
+/// the soft filtered stretch trades a little sharpness for shimmer-free
+/// lineart, and its texture cost is even lower than a 1:1 fullscreen.
+/// `RUFFLE_AQW_SUPERSAMPLE_FALLBACK` overrides (clamped 0.25..=1.0).
+fn aqw_supersample_fallback_factor() -> f32 {
+    static FACTOR: OnceLock<f32> = OnceLock::new();
+    *FACTOR.get_or_init(|| {
+        std::env::var("RUFFLE_AQW_SUPERSAMPLE_FALLBACK")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|n| n.is_finite())
+            .map(|n| n.clamp(0.25, 1.0))
+            .unwrap_or(0.8333)
+    })
+}
+
+/// The SSAA factor currently in effect (post pixel-area gate), published by
+/// the renderer on every viewport resize. The desktop mouse mapping reads
+/// this instead of the configured factor so window↔stage coordinates always
+/// follow whatever is actually rendering.
+static AQW_SUPERSAMPLE_EFFECTIVE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(f32::to_bits(1.0));
+
+pub fn aqw_current_supersample() -> f32 {
+    f32::from_bits(AQW_SUPERSAMPLE_EFFECTIVE.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 pub struct WgpuRenderBackend<T: RenderTarget> {
     pub(crate) descriptors: Arc<Descriptors>,
     target: T,
     surface: Surface,
-    /// SSAA factor; see [`aqw_supersample_factor`]. `1.0` = disabled (normal path).
+    /// Configured SSAA factor; see [`aqw_supersample_factor`]. `1.0` = disabled.
     supersample: f32,
+    /// Factor actually in effect for the current viewport (the configured one,
+    /// or `1.0` when the pixel-area gate rejects it); see
+    /// [`aqw_supersample_pixel_cap`]. Kept in sync with
+    /// [`aqw_current_supersample`].
+    supersample_effective: f32,
     meshes: Vec<Mesh>,
     shape_tessellator: ShapeTessellator,
     // This is currently unused - we just store it to report in
@@ -358,6 +410,9 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             target,
             surface,
             supersample: aqw_supersample_factor(),
+            // The initial surface above is 1:1 with the target; the effective
+            // factor is decided per window size in `set_viewport_dimensions`.
+            supersample_effective: 1.0,
             meshes: Vec::new(),
             shape_tessellator: ShapeTessellator::new(),
             viewport_scale_factor: 1.0,
@@ -534,7 +589,22 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         // so the logical stage size (physical / scale_factor) is unchanged — AQW's
         // NO_SCALE HUD stays put — while shapes and cacheAsBitmap avatars rasterize
         // at N×. With supersample=1 this is identical to the old path.
-        let ss = self.supersample;
+        // The pixel-area gate: keep SSAA where it's cheap (small windows), fall
+        // back to a sub-1× soft-stretched render where its N²× texture bytes
+        // hit the VRAM wall (fullscreen); see `aqw_supersample_fallback_factor`.
+        let ss = {
+            let configured = self.supersample;
+            let cap = aqw_supersample_pixel_cap();
+            let ss_area =
+                f64::from(width) * f64::from(height) * f64::from(configured).powi(2);
+            if configured > 1.0 && cap != 0 && ss_area > cap as f64 {
+                aqw_supersample_fallback_factor()
+            } else {
+                configured
+            }
+        };
+        self.supersample_effective = ss;
+        AQW_SUPERSAMPLE_EFFECTIVE.store(ss.to_bits(), std::sync::atomic::Ordering::Relaxed);
         let max = self.descriptors.limits.max_texture_dimension_2d;
         let scale_dim = |d: u32| ((d as f32 * ss).round() as u32).clamp(1, max);
         let render_width = scale_dim(width);
@@ -787,9 +857,10 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
 
         self.surface.draw_commands_and_copy_to(
             frame_output.view(),
-            // Linearly downsample when supersampling (render surface is N× the
-            // swapchain); a 1:1 present keeps the cheaper nearest copy.
-            self.supersample > 1.0,
+            // Linear filtering whenever the render surface and swapchain sizes
+            // differ (downsample for SSAA, soft upscale for the sub-1× gate
+            // fallback); an exact 1:1 present keeps the cheaper nearest copy.
+            self.supersample_effective != 1.0,
             RenderTargetMode::FreshWithColor(wgpu::Color {
                 r: f64::from(clear.r) / 255.0,
                 g: f64::from(clear.g) / 255.0,

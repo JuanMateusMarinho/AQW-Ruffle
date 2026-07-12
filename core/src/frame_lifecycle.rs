@@ -17,6 +17,7 @@ use crate::display_object::{DisplayObject, MovieClip, TDisplayObject};
 use crate::loader::LoadManager;
 use crate::orphan_manager::OrphanManager;
 use tracing::instrument;
+use web_time::Instant;
 
 /// Which phase of the frame we're currently in.
 ///
@@ -79,28 +80,79 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
 
     *context.aqw_avatar_asset_roots = 0;
 
+    // Tick-phase accounting for the diagnostics sweep (`tick_*_ms` columns),
+    // plus the orphan freeze: long-detached avatar subtrees skip their frame
+    // phases entirely (see `MovieClip::update_aqw_orphan_freeze`). The freeze
+    // decision is made once per tick in the Enter pass; the later passes use
+    // the read-only check so all phases of one tick agree.
+    use crate::display_object::{
+        AQW_ORPHANS_FROZEN, AQW_TICK_BCAST_NS, AQW_TICK_ORPHAN_NS, AQW_TICK_STAGE_NS,
+    };
+    use std::sync::atomic::Ordering;
+    let mut orphan_ns = 0u64;
+    let mut stage_ns = 0u64;
+    let mut bcast_ns = 0u64;
+
     *context.frame_phase = FramePhase::Enter;
+    let started = Instant::now();
     OrphanManager::each_orphan_obj(context, |orphan, context| {
+        if let Some(clip) = orphan.as_movie_clip() {
+            if clip.update_aqw_orphan_freeze() {
+                AQW_ORPHANS_FROZEN.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
         orphan.enter_frame(context);
     });
+    orphan_ns += started.elapsed().as_nanos() as u64;
+    let started = Instant::now();
     stage.enter_frame(context);
+    stage_ns += started.elapsed().as_nanos() as u64;
 
     *context.frame_phase = FramePhase::Construct;
+    let started = Instant::now();
     OrphanManager::each_orphan_obj(context, |orphan, context| {
+        if orphan
+            .as_movie_clip()
+            .is_some_and(|clip| clip.aqw_orphan_frozen())
+        {
+            return;
+        }
         orphan.construct_frame(context);
     });
+    orphan_ns += started.elapsed().as_nanos() as u64;
+    let started = Instant::now();
     stage.construct_frame(context);
+    stage_ns += started.elapsed().as_nanos() as u64;
+    let started = Instant::now();
     broadcast_frame_constructed(context);
+    bcast_ns += started.elapsed().as_nanos() as u64;
 
     *context.frame_phase = FramePhase::FrameScripts;
+    let started = Instant::now();
     OrphanManager::each_orphan_obj(context, |orphan, context| {
+        if orphan
+            .as_movie_clip()
+            .is_some_and(|clip| clip.aqw_orphan_frozen())
+        {
+            return;
+        }
         orphan.run_frame_scripts(context);
     });
+    orphan_ns += started.elapsed().as_nanos() as u64;
+    let started = Instant::now();
     stage.run_frame_scripts(context);
     run_frame_script_cleanup(context);
+    stage_ns += started.elapsed().as_nanos() as u64;
 
     *context.frame_phase = FramePhase::Exit;
+    let started = Instant::now();
     broadcast_frame_exited(context);
+    bcast_ns += started.elapsed().as_nanos() as u64;
+
+    AQW_TICK_ORPHAN_NS.fetch_add(orphan_ns, Ordering::Relaxed);
+    AQW_TICK_STAGE_NS.fetch_add(stage_ns, Ordering::Relaxed);
+    AQW_TICK_BCAST_NS.fetch_add(bcast_ns, Ordering::Relaxed);
 
     // The correct time to run context3DCreated events seems to be here
     stage.check_requested_context3ds(context);

@@ -92,6 +92,40 @@ fn is_aqw_avatar_asset_movie_url(url: &str) -> bool {
         || url.contains("/gamefiles/hair/")
 }
 
+/// Kill-switch for the orphan (off-display-list) avatar freeze, so it can be
+/// turned off in the field without a rebuild if it ever misbehaves.
+fn aqw_orphan_freeze_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_ORPHAN_FREEZE").is_some())
+}
+
+/// Ticks a clip must stay on the orphan list before the orphan freeze may
+/// engage (~5s at AQW's 24fps): long enough for any load/init flow that
+/// briefly runs content detached to finish undisturbed.
+const AQW_ORPHAN_FREEZE_GRACE_TICKS: u16 = 120;
+
+/// Depth-first probe (capped at `budget` nodes) for any clip instantiated
+/// from an avatar-asset SWF (item/class/hair) inside `obj`'s subtree.
+fn aqw_subtree_has_avatar_asset<'gc>(obj: DisplayObject<'gc>, budget: &mut u32) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    if let Some(clip) = obj.as_movie_clip() {
+        if is_aqw_avatar_asset_movie_url(clip.movie().url()) {
+            return true;
+        }
+    }
+    if let Some(container) = obj.as_container() {
+        for child in container.iter_render_list() {
+            if aqw_subtree_has_avatar_asset(child, budget) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Indication of what frame `run_frame` should jump to next.
 #[derive(PartialEq, Eq)]
 enum NextFrame {
@@ -245,6 +279,11 @@ pub struct MovieClipData<'gc> {
     aqw_timeline_counter: Cell<u8>,
     aqw_timeline_divisor: Cell<u8>,
     aqw_skip_timeline_frame: Cell<bool>,
+    /// Consecutive orphan-list ticks this clip has been processed for, and the
+    /// cached freeze verdict (0 = unknown, 1 = freeze, 2 = no avatar art).
+    /// See `update_aqw_orphan_freeze`.
+    aqw_orphan_ticks: Cell<u16>,
+    aqw_orphan_freeze: Cell<u8>,
 
     /// Force enable button mode, which causes all mouse-related events to
     /// trigger on this clip rather than any input-eligible children.
@@ -293,6 +332,8 @@ impl<'gc> MovieClipData<'gc> {
             aqw_timeline_counter: Cell::new(0),
             aqw_timeline_divisor: Cell::new(0),
             aqw_skip_timeline_frame: Cell::new(false),
+            aqw_orphan_ticks: Cell::new(0),
+            aqw_orphan_freeze: Cell::new(0),
             queued_goto_frame: Cell::new(None),
             drop_target: Lock::new(None),
             queued_tags: Default::default(),
@@ -2743,6 +2784,65 @@ impl<'gc> MovieClip<'gc> {
         }
 
         skip
+    }
+
+    /// Orphan freeze: skip the frame phases of detached avatar subtrees.
+    ///
+    /// AQW never releases avatars — leavers' `AvatarMC`s stay referenced by
+    /// `world.avatars` for the whole session, and the ones that get
+    /// `removeChild`'d become AVM2 orphans that `run_all_phases_avm2` walks
+    /// (enter/construct/frame scripts, recursing the whole subtree) every
+    /// tick. A long session piles up hundreds of them and the tick alone
+    /// outgrows the frame budget (measured 2026-07-12: 898 orphans, one core
+    /// pegged, 3.6 fps in a 20-player room). Orphans are off the display list,
+    /// so they can never render: skipping their timeline phases is visually
+    /// free, and — like the hidden-subtree freeze above — nothing is freed
+    /// (every AS3 reference stays valid, broadcast events keep firing,
+    /// explicit gotos still run their own construction via
+    /// `run_inner_goto_frame`, which is left untouched). The moment AQW
+    /// re-parents one, it leaves the orphan list and resumes normally.
+    ///
+    /// Engages only after `AQW_ORPHAN_FREEZE_GRACE_TICKS` of continuous
+    /// orphan processing, only for constructed clips, and only when the
+    /// subtree actually contains avatar-asset art — loaders and game-logic
+    /// helpers that legitimately run detached are never touched.
+    /// `RUFFLE_AQW_NO_ORPHAN_FREEZE` disables it in the field.
+    pub(crate) fn update_aqw_orphan_freeze(self) -> bool {
+        if aqw_orphan_freeze_disabled() || !super::is_aqw_movie_url(self.movie().url()) {
+            return false;
+        }
+        // Exempt clips that haven't run their first frame, so initial
+        // construction always completes (same rule as the hidden freeze).
+        if self.current_frame() == 0 {
+            self.0.aqw_orphan_ticks.set(0);
+            return false;
+        }
+        let ticks = self.0.aqw_orphan_ticks.get().saturating_add(1);
+        self.0.aqw_orphan_ticks.set(ticks);
+        if ticks < AQW_ORPHAN_FREEZE_GRACE_TICKS {
+            return false;
+        }
+        match self.0.aqw_orphan_freeze.get() {
+            1 => true,
+            // Armor pieces parent into the chassis asynchronously after the
+            // item SWFs load, so a "no avatar art" verdict is re-probed
+            // periodically instead of cached forever.
+            2 if ticks % 64 != 0 => false,
+            _ => {
+                let mut budget = 128u32;
+                let freeze = aqw_subtree_has_avatar_asset(self.into(), &mut budget);
+                self.0.aqw_orphan_freeze.set(if freeze { 1 } else { 2 });
+                freeze
+            }
+        }
+    }
+
+    /// Read-only companion to `update_aqw_orphan_freeze` for the construct
+    /// and frame-script orphan passes, so every phase of one tick agrees.
+    pub(crate) fn aqw_orphan_frozen(self) -> bool {
+        self.0.aqw_orphan_freeze.get() == 1
+            && self.0.aqw_orphan_ticks.get() >= AQW_ORPHAN_FREEZE_GRACE_TICKS
+            && !aqw_orphan_freeze_disabled()
     }
 }
 
