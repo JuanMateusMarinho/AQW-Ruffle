@@ -218,6 +218,10 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     viewport_scale_factor: f64,
     texture_pool: TexturePool,
     offscreen_texture_pool: TexturePool,
+    /// Hysteresis state for the offscreen-pool VRAM squeeze (0/1/2); see
+    /// `submit_frame`. Separate from the core redraw valve's state, but uses
+    /// the same thresholds.
+    pool_vram_pressure: u8,
     pub(crate) offscreen_buffer_pool: Arc<BufferPool<wgpu::Buffer, BufferDimensions>>,
     dynamic_transforms: DynamicTransforms,
     active_frame: ActiveFrame,
@@ -239,12 +243,13 @@ const OFFSCREEN_POOL_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 /// the janitor thread (see `request_device`) reclaims what's freed.
 const OFFSCREEN_POOL_EVICT_BYTES_PER_FRAME: u64 = 32 * 1024 * 1024;
 
-/// Pool retention budget while the process is near its OS GPU-memory budget:
-/// hoarding idle targets is pointless once the OS is about to start demoting
-/// our textures to system memory (the paging FPS collapse), so squeeze hard.
-const OFFSCREEN_POOL_PRESSURE_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
-
-/// Faster over-budget draining under pressure.
+/// Faster long-idle draining under VRAM pressure. Deliberately not higher:
+/// the drain only touches long-idle textures, and freeing multiple GB in a
+/// couple of frames swings the process VRAM reading straight through the
+/// pressure release threshold, re-opening the redraw quotas into a
+/// reallocation storm (the bang-bang oscillation of 13/07 — unstable FPS,
+/// 10 GB commit). There is intentionally no budget-based squeeze under
+/// pressure at all; see `TexturePool::maintain`.
 const OFFSCREEN_POOL_PRESSURE_EVICT_BYTES_PER_FRAME: u64 = 128 * 1024 * 1024;
 
 impl WgpuRenderBackend<SwapChainTarget> {
@@ -418,6 +423,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             viewport_scale_factor: 1.0,
             texture_pool: TexturePool::new(),
             offscreen_texture_pool: TexturePool::new(),
+            pool_vram_pressure: 0,
             offscreen_buffer_pool: Arc::new(offscreen_buffer_pool),
             dynamic_transforms: transforms,
             active_frame,
@@ -828,12 +834,15 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     &mut self.offscreen_texture_pool,
                 );
                 for filter in entry.filters {
+                    // `filter_source()` (not `for_entire_texture`) so a
+                    // padded pool target feeds only its logical content
+                    // region into the next filter in the chain.
                     target = self.descriptors.filters.apply(
                         &self.descriptors,
                         &mut self.active_frame.command_encoder,
                         &mut self.offscreen_texture_pool,
                         &mut self.active_frame.staging_belt,
-                        FilterSource::for_entire_texture(target.color_texture()),
+                        target.filter_source(),
                         filter,
                     );
                 }
@@ -846,6 +855,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     target.globals(),
                     target.color_texture().sample_count(),
                     false,
+                    target.copy_uv_scale(),
                     &mut self.active_frame.command_encoder,
                 );
             }
@@ -887,19 +897,35 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         // sizes piled up, e.g. from animated objects whose target size changes
         // every frame), free idle textures incrementally instead of dropping the
         // whole pool at once, which stalled a single frame.
-        let mut pool_budget = OFFSCREEN_POOL_BUDGET_BYTES;
+        let pool_budget = OFFSCREEN_POOL_BUDGET_BYTES;
         let mut evict_per_frame = OFFSCREEN_POOL_EVICT_BYTES_PER_FRAME;
         #[cfg(windows)]
         if !vram_valve_disabled()
             && let Some((used, budget)) = gpu_memory::query_cached()
             && budget > 0
-            && used.saturating_mul(100) / budget >= 92
         {
-            pool_budget = OFFSCREEN_POOL_PRESSURE_BUDGET_BYTES;
-            evict_per_frame = OFFSCREEN_POOL_PRESSURE_EVICT_BYTES_PER_FRAME;
+            // Hysteresis (engage 96/92, release 92/87, mirroring the core
+            // redraw valve): the drain itself moves the VRAM reading, so a
+            // raw threshold flaps — squeeze, reading falls, squeeze releases,
+            // everything reallocates, reading spikes, repeat (the 13/07
+            // oscillation).
+            let pct = used.saturating_mul(100) / budget;
+            let prev = self.pool_vram_pressure;
+            self.pool_vram_pressure = if pct >= 96 {
+                2
+            } else if pct >= 92 {
+                if prev == 2 { 2 } else { 1 }
+            } else if pct >= 87 {
+                prev.min(1)
+            } else {
+                0
+            };
+            if self.pool_vram_pressure > 0 {
+                evict_per_frame = OFFSCREEN_POOL_PRESSURE_EVICT_BYTES_PER_FRAME;
+            }
         }
         self.offscreen_texture_pool
-            .evict_over_budget(pool_budget, evict_per_frame);
+            .maintain(pool_budget, evict_per_frame, self.pool_vram_pressure);
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -1089,6 +1115,10 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         {
             None
         }
+    }
+
+    fn offscreen_pool_stats(&self) -> Option<(u64, u64, u64)> {
+        Some(self.offscreen_texture_pool.stats())
     }
 
     fn apply_filter(

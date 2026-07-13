@@ -1630,6 +1630,26 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         let tick_bcast_ms = AQW_TICK_BCAST_NS.swap(0, Ordering::Relaxed) / 1_000_000;
         let orphans_frozen = AQW_ORPHANS_FROZEN.swap(0, Ordering::Relaxed);
         let vram_pressure = aqw_vram_pressure();
+        // Offscreen texture-pool churn since the previous sweep (~48 frames):
+        // `pool_allocs` = new GPU textures the pool had to create (misses),
+        // `pool_free` = idle ones maintenance destroyed, `pool_mb` = bytes
+        // currently retained for reuse. Sustained `pool_allocs` is the
+        // deferred-destruction churn (§5 commit creep) that the padded
+        // filter targets and age-based eviction are meant to kill.
+        static LAST_POOL_ALLOCS: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        static LAST_POOL_FREES: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let (pool_allocs, pool_free, pool_mb) =
+            if let Some((allocs, frees, retained)) = context.renderer.offscreen_pool_stats() {
+                (
+                    allocs.saturating_sub(LAST_POOL_ALLOCS.swap(allocs, Ordering::Relaxed)),
+                    frees.saturating_sub(LAST_POOL_FREES.swap(frees, Ordering::Relaxed)),
+                    retained / (1024 * 1024),
+                )
+            } else {
+                (0, 0, 0)
+            };
         tracing::info!(
             target: "aqw_diag",
             orphans,
@@ -1654,6 +1674,9 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
             vram_mb,
             vram_budget_mb,
             vram_pressure,
+            pool_allocs,
+            pool_free,
+            pool_mb,
             "AQW memory sweep"
         );
 
@@ -1667,7 +1690,7 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         {
             let _ = writeln!(
                 file,
-                "AQW sweep: orphans={orphans} loaders={loaders} cached_objects={cached_objects} cache_mb={cache_mb} evicted_mb={evicted_mb} over_budget={over_budget} movie_libs_total={movie_libs_total} movie_libs_aqw={movie_libs_aqw} avatar_roots={avatar_roots} redraw_large={redraw_large} redraw_small={redraw_small} redraw_aged={redraw_aged} redraw_deferred={redraw_deferred} stale_fallback={stale_fallback} blend_layers={blend_layers} tick_orphan_ms={tick_orphan_ms} tick_stage_ms={tick_stage_ms} tick_bcast_ms={tick_bcast_ms} orphans_frozen={orphans_frozen} vram_mb={vram_mb} vram_budget_mb={vram_budget_mb} vram_pressure={vram_pressure}"
+                "AQW sweep: orphans={orphans} loaders={loaders} cached_objects={cached_objects} cache_mb={cache_mb} evicted_mb={evicted_mb} over_budget={over_budget} movie_libs_total={movie_libs_total} movie_libs_aqw={movie_libs_aqw} avatar_roots={avatar_roots} redraw_large={redraw_large} redraw_small={redraw_small} redraw_aged={redraw_aged} redraw_deferred={redraw_deferred} stale_fallback={stale_fallback} blend_layers={blend_layers} tick_orphan_ms={tick_orphan_ms} tick_stage_ms={tick_stage_ms} tick_bcast_ms={tick_bcast_ms} orphans_frozen={orphans_frozen} vram_mb={vram_mb} vram_budget_mb={vram_budget_mb} vram_pressure={vram_pressure} pool_allocs={pool_allocs} pool_free={pool_free} pool_mb={pool_mb}"
             );
         }
     }

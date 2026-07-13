@@ -204,8 +204,29 @@ pub fn run_copy_pipeline(
     globals: &Globals,
     sample_count: u32,
     smooth: bool,
+    input_uv_scale: (f32, f32),
     encoder: &mut CommandEncoder,
 ) {
+    // Padded pool textures hold their logical content in the top-left
+    // sub-region; scale the quad's UVs so only that region is sampled.
+    // `(1, 1)` (unpadded input) keeps the shared identity uniform.
+    let scaled_transforms = if input_uv_scale != (1.0, 1.0) {
+        Some(create_buffer_with_data(
+            &descriptors.device,
+            bytemuck::cast_slice(&[crate::TextureTransforms {
+                u_matrix: [
+                    [input_uv_scale.0, 0.0, 0.0, 0.0],
+                    [0.0, input_uv_scale.1, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ],
+            }]),
+            wgpu::BufferUsages::UNIFORM,
+            create_debug_label!("Copy tex transforms (uv sub-rect)"),
+        ))
+    } else {
+        None
+    };
     let copy_bind_group = descriptors
         .device
         .create_bind_group(&wgpu::BindGroupDescriptor {
@@ -213,7 +234,10 @@ pub fn run_copy_pipeline(
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: descriptors.quad.texture_transforms.as_entire_binding(),
+                    resource: scaled_transforms
+                        .as_ref()
+                        .unwrap_or(&descriptors.quad.texture_transforms)
+                        .as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,

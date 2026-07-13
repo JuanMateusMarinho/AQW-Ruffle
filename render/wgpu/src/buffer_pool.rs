@@ -3,15 +3,77 @@ use crate::globals::Globals;
 use fnv::FnvHashMap;
 use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 type PoolInner<T> = Mutex<Vec<T>>;
 type Constructor<Type, Description> = Box<dyn Fn(&Descriptors, &Description) -> Type>;
 
+/// Maintenance ticks (≈ frames) an idle pooled texture may sit unused before
+/// the maintenance pass frees it regardless of the retention budget. Long
+/// enough to survive deferred cache redraws that skip a texture for a couple
+/// of seconds, short enough to drain the piles left behind by map changes.
+const POOL_IDLE_EVICT_TICKS: u64 = 120;
+
+/// Entries idle for fewer ticks than this are never evicted, even when the
+/// pool is over budget. This protects the recent working set: evicting a
+/// texture that gets reallocated at the same size next frame frees nothing —
+/// it just cycles allocations through the driver's deferred-destruction
+/// queue every frame, which is exactly the commit-memory creep the pool is
+/// supposed to prevent.
+const POOL_PROTECT_TICKS: u64 = 4;
+
+/// How long hard VRAM pressure must persist before the escape reset fires.
+/// Short paging episodes (map-entry bursts) resolve themselves; a streak
+/// this long means the process is parked over its OS budget.
+const POOL_HARD_RESET_AFTER_TICKS: u64 = 96;
+
+/// Minimum spacing between escape resets. The reset costs one visible hitch
+/// (a whole pool's worth of deferred destruction plus a warmup of fresh
+/// allocations), so if even that can't get the process back under budget,
+/// repeating it faster just turns the hitch periodic.
+const POOL_HARD_RESET_COOLDOWN_TICKS: u64 = 600;
+
+/// Round an offscreen render-target dimension up to a coarse bucket (powers
+/// of two up to 1024, multiples of 512 above). Animated filtered content
+/// changes bounds by a few pixels every frame; exact-size pool keys make
+/// every step a brand-new texture allocation, and that allocate/destroy
+/// churn is what inflates driver memory in busy rooms. Callers that opt in
+/// must treat the returned texture as larger than the content: render with
+/// a viewport confined to the logical size and sample only the logical UV
+/// sub-rectangle.
+pub fn quantize_pool_dimension(dim: u32) -> u32 {
+    if dim <= 16 {
+        16
+    } else if dim <= 1024 {
+        dim.next_power_of_two()
+    } else {
+        dim.next_multiple_of(512)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct TexturePool {
     pools: FnvHashMap<TextureKey, BufferPool<(wgpu::Texture, wgpu::TextureView), AlwaysCompatible>>,
     globals_cache: FnvHashMap<GlobalsKey, Arc<Globals>>,
+    /// Advanced once per frame by `maintain`; pooled entries are stamped with
+    /// it when returned, giving each an idle age.
+    clock: Arc<AtomicU64>,
+    /// Cumulative number of textures actually created (pool misses).
+    total_allocs: Arc<AtomicU64>,
+    /// Cumulative number of idle textures freed by maintenance.
+    total_frees: u64,
+    /// Consecutive maintenance ticks spent under hard VRAM pressure; drives
+    /// the escape reset.
+    hard_pressure_streak: u64,
+    /// Clock value before which another escape reset may not fire.
+    hard_reset_cooldown_until: u64,
+    /// Whether the escape reset already fired during the current hard-
+    /// pressure episode. When the reset works (arena blocks returned, VRAM
+    /// back under budget) pressure releases and re-arms it; when the live
+    /// demand instantly refills the pool it does NOT re-fire — a futile
+    /// reset repeated on cooldown is just a periodic 2 GB hitch.
+    hard_reset_fired_this_episode: bool,
 }
 
 impl TexturePool {
@@ -36,29 +98,114 @@ impl TexturePool {
             .sum()
     }
 
-    /// Free idle textures until retention is at or below `budget`, but drop at
-    /// most `max_free_bytes` this call. Called every frame, this spreads the
-    /// destruction of piled-up single-use offscreen targets across frames
-    /// instead of dumping them all into the driver at once (which stalls a
-    /// single frame - the periodic hitch). Textures still in use aren't in the
-    /// pool, so they're never touched.
-    pub fn evict_over_budget(&mut self, budget: u64, max_free_bytes: u64) {
-        let retained = self.retained_bytes();
-        if retained <= budget {
-            return;
+    /// `(cumulative allocations, cumulative frees, retained bytes)` — the
+    /// allocation delta per second is the churn measurement the diagnostics
+    /// sweep reports.
+    pub fn stats(&self) -> (u64, u64, u64) {
+        (
+            self.total_allocs.load(Ordering::Relaxed),
+            self.total_frees,
+            self.retained_bytes(),
+        )
+    }
+
+    /// Once-per-frame pool maintenance. Advances the idle clock, frees
+    /// long-idle textures, and if retention still exceeds `budget`, frees the
+    /// longest-idle entries beyond it — but never ones used within the
+    /// protection window. A hot working set larger than the budget is
+    /// deliberately left alone when VRAM is healthy: freeing it would only
+    /// re-allocate the same sizes next frame, feeding the driver's
+    /// deferred-destruction backlog without reclaiming anything. Frees are
+    /// capped at `max_free_bytes` per call so piled-up destruction spreads
+    /// across frames instead of stalling one (the periodic hitch).
+    ///
+    /// `vram_pressure` (0 = healthy, 1 = soft, 2 = hard, from the process
+    /// GPU-memory budget) picks the eviction stance. Every gradual policy
+    /// under pressure was field-tested on 13/07 and failed:
+    /// - Fast draining (budget 0-64 MB, ≥128 MB/frame): multi-GB destroy/
+    ///   create bang-bang — the redraw valve's deferrals make alive targets
+    ///   look idle, and the drain teleports the once-a-second VRAM reading
+    ///   through the release threshold.
+    /// - Holding everything: the process parks over its OS budget and WDDM
+    ///   pages live textures (15 fps).
+    /// - Slow bleeding (24 MB/frame toward a 512 MB floor): a drain↔realloc
+    ///   loop against the deferred working set — allocating while paging is
+    ///   synchronously expensive, 5 fps.
+    /// What demonstrably recovers (observed when the window was minimized:
+    /// VRAM 7.6→4.2 GB, then steady 24 fps in the same room) is a FULL
+    /// one-shot drain: emptying the pool zeroes whole driver-arena blocks,
+    /// which is what actually returns memory to the OS — a partial bleed
+    /// leaves every block fragmented and returns nothing. So under pressure
+    /// the pool only tightens its long-idle pass, and if hard pressure
+    /// *persists* it fires one full reset (one hitch), then cools down.
+    pub fn maintain(&mut self, budget: u64, max_free_bytes: u64, vram_pressure: u8) {
+        let now = self.clock.fetch_add(1, Ordering::Relaxed) + 1;
+        let idle_ticks = match vram_pressure {
+            0 => POOL_IDLE_EVICT_TICKS,
+            1 => 48,
+            _ => 32,
+        };
+
+        // Escape reset: sustained hard pressure means the process is parked
+        // over its OS budget and paging; nothing gradual gets it back under.
+        // At most once per pressure episode — see `hard_reset_fired_this_episode`.
+        if vram_pressure == 2 {
+            self.hard_pressure_streak += 1;
+            if !self.hard_reset_fired_this_episode
+                && self.hard_pressure_streak >= POOL_HARD_RESET_AFTER_TICKS
+                && now >= self.hard_reset_cooldown_until
+            {
+                for pool in self.pools.values() {
+                    self.total_frees += pool.evict_idle(now, 1, usize::MAX) as u64;
+                }
+                self.hard_reset_cooldown_until = now + POOL_HARD_RESET_COOLDOWN_TICKS;
+                self.hard_pressure_streak = 0;
+                self.hard_reset_fired_this_episode = true;
+                return;
+            }
+        } else {
+            self.hard_pressure_streak = 0;
+            self.hard_reset_fired_this_episode = false;
         }
-        let mut to_free = (retained - budget).min(max_free_bytes);
+
+        let mut free_left = max_free_bytes;
+
+        // Pass 1: long-idle entries go regardless of budget.
         for (key, pool) in self.pools.iter() {
-            if to_free == 0 {
+            if free_left == 0 {
                 break;
             }
-            let per = Self::bytes_per_texture(key);
-            if per == 0 {
+            let per = Self::bytes_per_texture(key).max(1);
+            let max_items = (free_left / per) as usize;
+            if max_items == 0 {
                 continue;
             }
-            let want = (to_free / per).max(1) as usize;
-            let dropped = pool.evict(want) as u64;
-            to_free = to_free.saturating_sub(dropped * per);
+            let dropped = pool.evict_idle(now, idle_ticks, max_items) as u64;
+            free_left = free_left.saturating_sub(dropped * per);
+            self.total_frees += dropped;
+        }
+
+        // Pass 2 (healthy VRAM only): keep the idle hoard under the normal
+        // retention budget, sparing the recent working set. Under pressure
+        // this is deliberately off — gradual budget eviction only churns
+        // against the deferred working set (see above).
+        if vram_pressure > 0 {
+            return;
+        }
+        let retained = self.retained_bytes();
+        if retained <= budget || free_left == 0 {
+            return;
+        }
+        let mut over = (retained - budget).min(free_left);
+        for (key, pool) in self.pools.iter() {
+            if over == 0 {
+                break;
+            }
+            let per = Self::bytes_per_texture(key).max(1);
+            let want = (over / per).max(1) as usize;
+            let dropped = pool.evict_idle(now, POOL_PROTECT_TICKS, want) as u64;
+            over = over.saturating_sub(dropped * per);
+            self.total_frees += dropped;
         }
     }
 
@@ -76,29 +223,35 @@ impl TexturePool {
             format,
             sample_count,
         };
+        let clock = self.clock.clone();
+        let allocs = self.total_allocs.clone();
         let pool = self.pools.entry(key).or_insert_with(|| {
             let label = if cfg!(feature = "render_debug_labels") {
-                use std::sync::atomic::{AtomicU32, Ordering};
+                use std::sync::atomic::AtomicU32;
                 static ID_COUNT: AtomicU32 = AtomicU32::new(0);
                 let id = ID_COUNT.fetch_add(1, Ordering::Relaxed);
                 create_debug_label!("Pooled texture {}", id)
             } else {
                 None
             };
-            BufferPool::new(Box::new(move |descriptors, _description| {
-                let texture = descriptors.device.create_texture(&wgpu::TextureDescriptor {
-                    label: label.as_deref(),
-                    size,
-                    mip_level_count: 1,
-                    sample_count,
-                    dimension: wgpu::TextureDimension::D2,
-                    format,
-                    view_formats: &[format],
-                    usage,
-                });
-                let view = texture.create_view(&Default::default());
-                (texture, view)
-            }))
+            BufferPool::new_with_clock(
+                Box::new(move |descriptors, _description| {
+                    allocs.fetch_add(1, Ordering::Relaxed);
+                    let texture = descriptors.device.create_texture(&wgpu::TextureDescriptor {
+                        label: label.as_deref(),
+                        size,
+                        mip_level_count: 1,
+                        sample_count,
+                        dimension: wgpu::TextureDimension::D2,
+                        format,
+                        view_formats: &[format],
+                        usage,
+                    });
+                    let view = texture.create_view(&Default::default());
+                    (texture, view)
+                }),
+                clock,
+            )
         });
         pool.take(descriptors, AlwaysCompatible)
     }
@@ -164,8 +317,13 @@ impl BufferDescription for AlwaysCompatible {
 }
 
 pub struct BufferPool<Type, Description: BufferDescription> {
-    available: Arc<PoolInner<(Type, Description)>>,
+    /// Idle items, each stamped with the pool clock value at return time.
+    available: Arc<PoolInner<(Type, Description, u64)>>,
     constructor: Constructor<Type, Description>,
+    /// Shared with `PoolEntry`s so returns are stamped with the owner's
+    /// frame clock. Pools whose owner never advances it (`new`) simply see
+    /// every entry as age 0.
+    clock: Arc<AtomicU64>,
 }
 
 impl<Type, Description: BufferDescription> Debug for BufferPool<Type, Description> {
@@ -176,9 +334,17 @@ impl<Type, Description: BufferDescription> Debug for BufferPool<Type, Descriptio
 
 impl<Type, Description: BufferDescription> BufferPool<Type, Description> {
     pub fn new(constructor: Constructor<Type, Description>) -> Self {
+        Self::new_with_clock(constructor, Arc::new(AtomicU64::new(0)))
+    }
+
+    pub fn new_with_clock(
+        constructor: Constructor<Type, Description>,
+        clock: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             available: Arc::new(Mutex::new(vec![])),
             constructor,
+            clock,
         }
     }
 
@@ -190,17 +356,26 @@ impl<Type, Description: BufferDescription> BufferPool<Type, Description> {
             .len()
     }
 
-    /// Drop up to `count` idle items, returning how many were dropped. Only
-    /// touches pooled (unused) items; anything still checked out is unaffected.
-    pub fn evict(&self, count: usize) -> usize {
+    /// Drop up to `max_items` idle items whose age (ticks since return, per
+    /// the shared clock) is at least `min_age`, oldest first. Returns how
+    /// many were dropped. Items still checked out are unaffected.
+    pub fn evict_idle(&self, now: u64, min_age: u64, max_items: usize) -> usize {
         let mut guard = self
             .available
             .lock()
             .expect("Should not be able to lock recursively");
-        let len = guard.len();
-        let n = count.min(len);
-        guard.truncate(len - n);
-        n
+        let mut candidates: Vec<usize> = (0..guard.len())
+            .filter(|&i| now.saturating_sub(guard[i].2) >= min_age)
+            .collect();
+        candidates.sort_by_key(|&i| guard[i].2);
+        candidates.truncate(max_items);
+        // Remove back-to-front so earlier indices stay valid.
+        candidates.sort_unstable_by(|a, b| b.cmp(a));
+        let dropped = candidates.len();
+        for i in candidates {
+            guard.swap_remove(i);
+        }
+        dropped
     }
 
     pub fn take(
@@ -226,7 +401,8 @@ impl<Type, Description: BufferDescription> BufferPool<Type, Description> {
         }
 
         let (item, used_description) = if let Some((_, best)) = best {
-            guard.swap_remove(best)
+            let (item, description, _stamp) = guard.swap_remove(best);
+            (item, description)
         } else {
             let item = (self.constructor)(descriptors, &description);
             (item, description)
@@ -235,6 +411,7 @@ impl<Type, Description: BufferDescription> BufferPool<Type, Description> {
             item: Some(item),
             description: used_description,
             pool: Arc::downgrade(&self.available),
+            clock: self.clock.clone(),
         }
     }
 }
@@ -242,7 +419,8 @@ impl<Type, Description: BufferDescription> BufferPool<Type, Description> {
 pub struct PoolEntry<Type, Description: BufferDescription> {
     item: Option<Type>,
     description: Description,
-    pool: Weak<PoolInner<(Type, Description)>>,
+    pool: Weak<PoolInner<(Type, Description, u64)>>,
+    clock: Arc<AtomicU64>,
 }
 
 impl<Type, Description: BufferDescription> Debug for PoolEntry<Type, Description>
@@ -259,9 +437,10 @@ impl<Type, Description: BufferDescription> Drop for PoolEntry<Type, Description>
         if let Some(item) = self.item.take()
             && let Some(pool) = self.pool.upgrade()
         {
+            let stamp = self.clock.load(Ordering::Relaxed);
             pool.lock()
                 .expect("Should not be able to lock recursively")
-                .push((item, self.description.clone()))
+                .push((item, self.description.clone(), stamp))
         }
     }
 }

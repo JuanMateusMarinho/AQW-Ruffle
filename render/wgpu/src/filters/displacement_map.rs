@@ -189,6 +189,7 @@ impl DisplacementMapFilter {
             sample_count,
             RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
             draw_encoder,
+            true,
         );
         let source_view = source.texture.create_view(&Default::default());
         let map_handle = filter.map_bitmap.clone()?;
@@ -274,6 +275,7 @@ impl DisplacementMapFilter {
             ..Default::default()
         });
         render_pass.set_pipeline(pipeline);
+        target.set_content_viewport(&mut render_pass);
 
         render_pass.set_bind_group(0, &filter_group, &[]);
 

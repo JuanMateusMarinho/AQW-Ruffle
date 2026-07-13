@@ -30,6 +30,10 @@ pub struct BlurFilter {
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
     vertex_buffer: wgpu::Buffer,
+    /// Vertices for the ping-pong passes (sampling the previous flip/flop
+    /// target). Written per `apply` because padded pool targets hold their
+    /// content in a logical sub-rectangle rather than spanning UV 0..1.
+    pingpong_vertex_buffer: wgpu::Buffer,
     uniform_buffer: wgpu::Buffer,
     vertices_size: wgpu::BufferSize,
     uniform_size: wgpu::BufferSize,
@@ -80,6 +84,12 @@ impl BlurFilter {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let pingpong_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: vertices_size,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -98,6 +108,7 @@ impl BlurFilter {
             pipelines: Default::default(),
             pipeline_layout,
             vertex_buffer,
+            pingpong_vertex_buffer,
             uniform_buffer,
             bind_group_layout,
             vertices_size: wgpu::BufferSize::new(vertices_size).expect("Definitely not zero."),
@@ -171,6 +182,7 @@ impl BlurFilter {
             sample_count,
             RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
             draw_encoder,
+            true,
         );
         let mut flop = CommandTarget::new(
             descriptors,
@@ -184,6 +196,7 @@ impl BlurFilter {
             sample_count,
             RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
             draw_encoder,
+            true,
         );
 
         staging_belt
@@ -195,6 +208,19 @@ impl BlurFilter {
                 &descriptors.device,
             )
             .copy_from_slice(bytemuck::cast_slice(&[source.vertices()]));
+        // Ping-pong passes sample only the logical content region of the
+        // previous (possibly padded) target. flip and flop share dimensions,
+        // so one vertex set serves every pass.
+        let pingpong_vertices = flip.filter_source().vertices();
+        staging_belt
+            .write_buffer(
+                draw_encoder,
+                &self.pingpong_vertex_buffer,
+                0,
+                self.vertices_size,
+                &descriptors.device,
+            )
+            .copy_from_slice(bytemuck::cast_slice(&[pingpong_vertices]));
 
         let source_view = source.texture.create_view(&Default::default());
         let mut first = true;
@@ -224,9 +250,12 @@ impl BlurFilter {
                 } else {
                     (
                         flip.color_view(),
-                        descriptors.quad.filter_vertices.slice(..),
-                        flip.width() as f32,
-                        flip.height() as f32,
+                        self.pingpong_vertex_buffer.slice(..),
+                        // The texel step is in the sampled texture's UV
+                        // space, which spans the allocated (padded)
+                        // dimensions — not the logical content size.
+                        flip.color_texture().width() as f32,
+                        flip.color_texture().height() as f32,
                     )
                 };
 
@@ -338,6 +367,7 @@ impl BlurFilter {
             ..Default::default()
         });
         render_pass.set_pipeline(pipeline);
+        destination.set_content_viewport(&mut render_pass);
 
         render_pass.set_bind_group(0, &filter_group, &[]);
 

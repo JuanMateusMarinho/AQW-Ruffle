@@ -86,6 +86,14 @@ pub trait RenderBackend: Any {
         None
     }
 
+    /// `(cumulative allocations, cumulative frees, retained bytes)` of the
+    /// backend's offscreen render-target pool, when it has one. The
+    /// allocation delta over time measures texture churn — the driver-memory
+    /// creep diagnostics watch for.
+    fn offscreen_pool_stats(&self) -> Option<(u64, u64, u64)> {
+        None
+    }
+
     fn submit_frame(
         &mut self,
         clear: swf::Color,

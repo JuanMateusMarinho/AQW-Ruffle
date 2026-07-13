@@ -67,13 +67,27 @@ impl<'a> FilterSource<'a> {
         ]
     }
 
-    pub fn vertices_with_blur_offset(&self, blur_offset: (f32, f32)) -> [FilterVertexWithBlur; 4] {
+    /// Vertices sampling both this source and a blurred companion texture.
+    /// The blurred texture is not necessarily the same size as the source
+    /// (it may be a padded pool target holding the blurred content region at
+    /// `blur_region_origin`), so its UVs are computed against its own
+    /// dimensions rather than the source's.
+    pub fn vertices_with_blur_offset(
+        &self,
+        blur_offset: (f32, f32),
+        blur_texture_dims: (f32, f32),
+        blur_region_origin: (f32, f32),
+    ) -> [FilterVertexWithBlur; 4] {
         let source_width = self.texture.width() as f32;
         let source_height = self.texture.height() as f32;
         let source_left = self.point.0;
         let source_top = self.point.1;
         let source_right = source_left + self.size.0;
         let source_bottom = source_top + self.size.1;
+        let blur_left = blur_region_origin.0 + blur_offset.0;
+        let blur_top = blur_region_origin.1 + blur_offset.1;
+        let blur_right = blur_region_origin.0 + self.size.0 as f32 + blur_offset.0;
+        let blur_bottom = blur_region_origin.1 + self.size.1 as f32 + blur_offset.1;
         [
             FilterVertexWithBlur {
                 position: [0.0, 0.0],
@@ -81,10 +95,7 @@ impl<'a> FilterSource<'a> {
                     source_left as f32 / source_width,
                     source_top as f32 / source_height,
                 ],
-                blur_uv: [
-                    (source_left as f32 + blur_offset.0) / source_width,
-                    (source_top as f32 + blur_offset.1) / source_height,
-                ],
+                blur_uv: [blur_left / blur_texture_dims.0, blur_top / blur_texture_dims.1],
             },
             FilterVertexWithBlur {
                 position: [1.0, 0.0],
@@ -93,8 +104,8 @@ impl<'a> FilterSource<'a> {
                     source_top as f32 / source_height,
                 ],
                 blur_uv: [
-                    (source_right as f32 + blur_offset.0) / source_width,
-                    (source_top as f32 + blur_offset.1) / source_height,
+                    blur_right / blur_texture_dims.0,
+                    blur_top / blur_texture_dims.1,
                 ],
             },
             FilterVertexWithBlur {
@@ -104,8 +115,8 @@ impl<'a> FilterSource<'a> {
                     source_bottom as f32 / source_height,
                 ],
                 blur_uv: [
-                    (source_right as f32 + blur_offset.0) / source_width,
-                    (source_bottom as f32 + blur_offset.1) / source_height,
+                    blur_right / blur_texture_dims.0,
+                    blur_bottom / blur_texture_dims.1,
                 ],
             },
             FilterVertexWithBlur {
@@ -115,16 +126,21 @@ impl<'a> FilterSource<'a> {
                     source_bottom as f32 / source_height,
                 ],
                 blur_uv: [
-                    (source_left as f32 + blur_offset.0) / source_width,
-                    (source_bottom as f32 + blur_offset.1) / source_height,
+                    blur_left / blur_texture_dims.0,
+                    blur_bottom / blur_texture_dims.1,
                 ],
             },
         ]
     }
 
+    /// See `vertices_with_blur_offset` for the `blur_texture_dims` /
+    /// `blur_region_origin` semantics; this variant offsets the blurred
+    /// texture both ways for bevel highlight and shadow.
     pub fn vertices_with_highlight_and_shadow(
         &self,
         blur_offset: (f32, f32),
+        blur_texture_dims: (f32, f32),
+        blur_region_origin: (f32, f32),
     ) -> [FilterVertexWithDoubleBlur; 4] {
         let source_width = self.texture.width() as f32;
         let source_height = self.texture.height() as f32;
@@ -132,53 +148,57 @@ impl<'a> FilterSource<'a> {
         let source_top = self.point.1 as f32;
         let source_right = (self.point.0 + self.size.0) as f32;
         let source_bottom = (self.point.1 + self.size.1) as f32;
+        let blur_left = blur_region_origin.0;
+        let blur_top = blur_region_origin.1;
+        let blur_right = blur_region_origin.0 + self.size.0 as f32;
+        let blur_bottom = blur_region_origin.1 + self.size.1 as f32;
         [
             FilterVertexWithDoubleBlur {
                 position: [0.0, 0.0],
                 source_uv: [source_left / source_width, source_top / source_height],
                 blur_uv_left: [
-                    (source_left + blur_offset.0) / source_width,
-                    (source_top + blur_offset.1) / source_height,
+                    (blur_left + blur_offset.0) / blur_texture_dims.0,
+                    (blur_top + blur_offset.1) / blur_texture_dims.1,
                 ],
                 blur_uv_right: [
-                    (source_left - blur_offset.0) / source_width,
-                    (source_top - blur_offset.1) / source_height,
+                    (blur_left - blur_offset.0) / blur_texture_dims.0,
+                    (blur_top - blur_offset.1) / blur_texture_dims.1,
                 ],
             },
             FilterVertexWithDoubleBlur {
                 position: [1.0, 0.0],
                 source_uv: [source_right / source_width, source_top / source_height],
                 blur_uv_left: [
-                    (source_right + blur_offset.0) / source_width,
-                    (source_top + blur_offset.1) / source_height,
+                    (blur_right + blur_offset.0) / blur_texture_dims.0,
+                    (blur_top + blur_offset.1) / blur_texture_dims.1,
                 ],
                 blur_uv_right: [
-                    (source_right - blur_offset.0) / source_width,
-                    (source_top - blur_offset.1) / source_height,
+                    (blur_right - blur_offset.0) / blur_texture_dims.0,
+                    (blur_top - blur_offset.1) / blur_texture_dims.1,
                 ],
             },
             FilterVertexWithDoubleBlur {
                 position: [1.0, 1.0],
                 source_uv: [source_right / source_width, source_bottom / source_height],
                 blur_uv_left: [
-                    (source_right + blur_offset.0) / source_width,
-                    (source_bottom + blur_offset.1) / source_height,
+                    (blur_right + blur_offset.0) / blur_texture_dims.0,
+                    (blur_bottom + blur_offset.1) / blur_texture_dims.1,
                 ],
                 blur_uv_right: [
-                    (source_right - blur_offset.0) / source_width,
-                    (source_bottom - blur_offset.1) / source_height,
+                    (blur_right - blur_offset.0) / blur_texture_dims.0,
+                    (blur_bottom - blur_offset.1) / blur_texture_dims.1,
                 ],
             },
             FilterVertexWithDoubleBlur {
                 position: [0.0, 1.0],
                 source_uv: [source_left / source_width, source_bottom / source_height],
                 blur_uv_left: [
-                    (source_left + blur_offset.0) / source_width,
-                    (source_bottom + blur_offset.1) / source_height,
+                    (blur_left + blur_offset.0) / blur_texture_dims.0,
+                    (blur_bottom + blur_offset.1) / blur_texture_dims.1,
                 ],
                 blur_uv_right: [
-                    (source_left - blur_offset.0) / source_width,
-                    (source_bottom - blur_offset.1) / source_height,
+                    (blur_left - blur_offset.0) / blur_texture_dims.0,
+                    (blur_bottom - blur_offset.1) / blur_texture_dims.1,
                 ],
             },
         ]

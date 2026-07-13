@@ -169,7 +169,7 @@ ipcMain.handle("launch-game", async (_event, game) => {
     launchFlashGame({
       swfUrl: AQW_SWF_URL,
       baseUrl: AQW_BASE_URL,
-      title: "Artix Entertainment - AdventureQuest Worlds V1.4",
+      title: "Artix Entertainment - AdventureQuest Worlds V1.5",
     });
     return { ok: true, message: "AdventureQuest Worlds started through Ruffle." };
   }

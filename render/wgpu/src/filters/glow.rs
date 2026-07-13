@@ -173,11 +173,27 @@ impl GlowFilter {
             source,
             &filter.inner_blur_filter(),
         );
-        let blurred_texture = if let Some(blurred) = &blurred {
+        // The blurred content lives at the origin of the (possibly padded)
+        // blur target; without a blur pass it's the source sub-region
+        // itself. Its UVs must be computed against the texture that's
+        // actually sampled, not the source's dimensions.
+        let (blurred_texture, blur_dims, blur_origin) = if let Some(blurred) = &blurred {
             blurred.ensure_cleared(draw_encoder);
-            blurred.color_texture()
+            let texture = blurred.color_texture();
+            (
+                texture,
+                (texture.width() as f32, texture.height() as f32),
+                (0.0, 0.0),
+            )
         } else {
-            source.texture
+            (
+                source.texture,
+                (
+                    source.texture.width() as f32,
+                    source.texture.height() as f32,
+                ),
+                (source.point.0 as f32, source.point.1 as f32),
+            )
         };
         let source_view = source.texture.create_view(&Default::default());
         let blurred_view = blurred_texture.create_view(&Default::default());
@@ -194,6 +210,7 @@ impl GlowFilter {
             sample_count,
             RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
             draw_encoder,
+            true,
         );
         staging_belt
             .write_buffer(
@@ -223,9 +240,11 @@ impl GlowFilter {
                 self.vertices_size,
                 &descriptors.device,
             )
-            .copy_from_slice(bytemuck::cast_slice(&[
-                source.vertices_with_blur_offset(blur_offset)
-            ]));
+            .copy_from_slice(bytemuck::cast_slice(&[source.vertices_with_blur_offset(
+                blur_offset,
+                blur_dims,
+                blur_origin,
+            )]));
         let filter_group = descriptors
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
@@ -258,6 +277,7 @@ impl GlowFilter {
             ..Default::default()
         });
         render_pass.set_pipeline(pipeline);
+        target.set_content_viewport(&mut render_pass);
 
         render_pass.set_bind_group(0, &filter_group, &[]);
 

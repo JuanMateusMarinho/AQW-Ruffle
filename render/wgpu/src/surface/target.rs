@@ -1,12 +1,20 @@
 use crate::Transforms;
 use crate::backend::RenderTargetMode;
-use crate::buffer_pool::{AlwaysCompatible, PoolEntry, TexturePool};
+use crate::buffer_pool::{AlwaysCompatible, PoolEntry, TexturePool, quantize_pool_dimension};
 use crate::descriptors::Descriptors;
+use crate::filters::FilterSource;
 use crate::globals::Globals;
 use crate::utils::create_buffer_with_data;
 use crate::utils::run_copy_pipeline;
 use std::cell::OnceCell;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+/// Kill-switch: `RUFFLE_AQW_NO_FILTER_PAD` restores exact-size filter render
+/// targets, for field A/B without a rebuild.
+fn filter_pad_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_FILTER_PAD").is_some())
+}
 
 #[derive(Debug)]
 pub struct ResolveBuffer {
@@ -198,6 +206,11 @@ pub struct CommandTarget {
     depth: OnceCell<StencilBuffer>,
     globals: Arc<Globals>,
     size: wgpu::Extent3d,
+    /// Dimensions of the GPU textures actually backing this target. Equal to
+    /// `size` unless the target was created with `pad_to_bucket`, in which
+    /// case the textures come from coarse pool buckets and the logical
+    /// content occupies only the top-left `size` region.
+    alloc_size: wgpu::Extent3d,
     format: wgpu::TextureFormat,
     sample_count: u32,
     whole_frame_bind_group: OnceCell<(wgpu::Buffer, wgpu::BindGroup)>,
@@ -214,14 +227,34 @@ impl CommandTarget {
         sample_count: u32,
         render_target_mode: RenderTargetMode,
         encoder: &mut wgpu::CommandEncoder,
+        pad_to_bucket: bool,
     ) -> Self {
         let globals = pool.get_globals(descriptors, size.width, size.height);
+
+        // Only fully-pooled, single-sampled fresh targets may be padded:
+        // manual textures (ExistingWithColor) and MSAA resolve pairs must
+        // keep attachment dimensions exact, and FreshWithTexture blits the
+        // prior contents 1:1. Callers of padded targets write through a
+        // logical-size viewport and read back only the logical UV sub-rect.
+        let alloc_size = if pad_to_bucket
+            && sample_count == 1
+            && matches!(render_target_mode, RenderTargetMode::FreshWithColor(_))
+            && !filter_pad_disabled()
+        {
+            wgpu::Extent3d {
+                width: quantize_pool_dimension(size.width),
+                height: quantize_pool_dimension(size.height),
+                depth_or_array_layers: size.depth_or_array_layers,
+            }
+        } else {
+            size
+        };
 
         let mut make_pooled_frame_buffer = || {
             FrameBuffer::new(
                 descriptors,
                 sample_count,
-                size,
+                alloc_size,
                 format,
                 if sample_count > 1 {
                     wgpu::TextureUsages::RENDER_ATTACHMENT
@@ -255,7 +288,7 @@ impl CommandTarget {
                     make_pooled_frame_buffer(),
                     Some(ResolveBuffer::new(
                         descriptors,
-                        size,
+                        alloc_size,
                         format,
                         wgpu::TextureUsages::COPY_SRC
                             | wgpu::TextureUsages::COPY_DST
@@ -291,6 +324,7 @@ impl CommandTarget {
                     &globals,
                     sample_count,
                     false,
+                    (1.0, 1.0),
                     encoder,
                 );
             } else {
@@ -309,6 +343,7 @@ impl CommandTarget {
             depth: OnceCell::new(),
             globals,
             size,
+            alloc_size,
             format,
             sample_count,
             whole_frame_bind_group,
@@ -323,6 +358,47 @@ impl CommandTarget {
 
     pub fn height(&self) -> u32 {
         self.size.height
+    }
+
+    pub fn is_padded(&self) -> bool {
+        self.alloc_size != self.size
+    }
+
+    /// UV scale mapping the logical content region into the allocated
+    /// texture, for consumers that sample this target with a whole-texture
+    /// quad. `(1, 1)` for unpadded targets.
+    pub fn copy_uv_scale(&self) -> (f32, f32) {
+        (
+            self.size.width as f32 / self.alloc_size.width as f32,
+            self.size.height as f32 / self.alloc_size.height as f32,
+        )
+    }
+
+    /// A `FilterSource` addressing only the logical content region of this
+    /// target's color texture. Equivalent to `for_entire_texture` on
+    /// unpadded targets.
+    pub fn filter_source(&self) -> FilterSource<'_> {
+        FilterSource {
+            texture: self.color_texture(),
+            point: (0, 0),
+            size: (self.size.width, self.size.height),
+        }
+    }
+
+    /// Confine a render pass writing into this target to the logical content
+    /// region. No-op for unpadded targets (the viewport already spans the
+    /// whole attachment).
+    pub fn set_content_viewport(&self, render_pass: &mut wgpu::RenderPass<'_>) {
+        if self.is_padded() {
+            render_pass.set_viewport(
+                0.0,
+                0.0,
+                self.size.width as f32,
+                self.size.height as f32,
+                0.0,
+                1.0,
+            );
+        }
     }
 
     pub fn ensure_cleared(&self, encoder: &mut wgpu::CommandEncoder) {
@@ -382,9 +458,10 @@ impl CommandTarget {
         pool: &mut TexturePool,
     ) -> Option<wgpu::RenderPassDepthStencilAttachment<'_>> {
         let new_buffer = self.depth.get().is_none();
-        let stencil = self
-            .depth
-            .get_or_init(|| StencilBuffer::new(descriptors, self.sample_count, self.size, pool));
+        let stencil = self.depth.get_or_init(|| {
+            // Must match the color attachment's (possibly padded) dimensions.
+            StencilBuffer::new(descriptors, self.sample_count, self.alloc_size, pool)
+        });
         Some(wgpu::RenderPassDepthStencilAttachment {
             view: stencil.view(),
             depth_ops: None,
@@ -408,7 +485,7 @@ impl CommandTarget {
         let blend_buffer = self.blend_buffer.get_or_init(|| {
             BlendBuffer::new(
                 descriptors,
-                self.size,
+                self.alloc_size,
                 self.format,
                 wgpu::TextureUsages::TEXTURE_BINDING
                     | wgpu::TextureUsages::COPY_DST

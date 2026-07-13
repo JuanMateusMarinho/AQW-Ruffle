@@ -173,11 +173,26 @@ impl BevelFilter {
             source,
             &filter.inner_blur_filter(),
         );
-        let blurred_texture = if let Some(blurred) = &blurred {
+        // See GlowFilter: the blurred texture's UVs are computed against the
+        // texture actually sampled (a possibly padded blur target with the
+        // content at its origin, or the source sub-region when no blur ran).
+        let (blurred_texture, blur_dims, blur_origin) = if let Some(blurred) = &blurred {
             blurred.ensure_cleared(draw_encoder);
-            blurred.color_texture()
+            let texture = blurred.color_texture();
+            (
+                texture,
+                (texture.width() as f32, texture.height() as f32),
+                (0.0, 0.0),
+            )
         } else {
-            source.texture
+            (
+                source.texture,
+                (
+                    source.texture.width() as f32,
+                    source.texture.height() as f32,
+                ),
+                (source.point.0 as f32, source.point.1 as f32),
+            )
         };
         let source_view = source.texture.create_view(&Default::default());
         let blurred_view = blurred_texture.create_view(&Default::default());
@@ -197,6 +212,7 @@ impl BevelFilter {
             sample_count,
             RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
             draw_encoder,
+            true,
         );
         let mut highlight_color = [
             f32::from(filter.highlight_color.r) / 255.0,
@@ -247,7 +263,7 @@ impl BevelFilter {
                 &descriptors.device,
             )
             .copy_from_slice(bytemuck::cast_slice(&[
-                source.vertices_with_highlight_and_shadow(blur_offset)
+                source.vertices_with_highlight_and_shadow(blur_offset, blur_dims, blur_origin)
             ]));
         let filter_group = descriptors
             .device
@@ -281,6 +297,7 @@ impl BevelFilter {
             ..Default::default()
         });
         render_pass.set_pipeline(pipeline);
+        target.set_content_viewport(&mut render_pass);
 
         render_pass.set_bind_group(0, &filter_group, &[]);
 

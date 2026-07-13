@@ -99,6 +99,7 @@ impl Surface {
             target.globals(),
             1,
             smooth,
+            target.copy_uv_scale(),
             draw_encoder,
         );
     }
@@ -125,6 +126,10 @@ impl Surface {
             self.sample_count,
             render_target_mode,
             draw_encoder,
+            // Never pad command-list targets: blend and alpha-mask shaders
+            // derive UVs from NDC position, which is only correct when every
+            // texture in the pass has exactly the attachment's dimensions.
+            false,
         );
 
         let mut num_masks = 0;
