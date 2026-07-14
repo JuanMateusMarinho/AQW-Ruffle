@@ -2342,8 +2342,9 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
     fn op_decrement(&mut self) -> Result<(), Error<'gc>> {
         let value = self.pop_stack().coerce_to_number(self)?;
+        let result = Value::from(value - 1.0);
 
-        self.push_stack(value - 1.0);
+        self.push_stack(result.try_promote_number());
 
         Ok(())
     }
@@ -2359,8 +2360,9 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     fn op_divide(&mut self) -> Result<(), Error<'gc>> {
         let value2 = self.pop_stack().coerce_to_number(self)?;
         let value1 = self.pop_stack().coerce_to_number(self)?;
+        let result = Value::from(value1 / value2);
 
-        self.push_stack(value1 / value2);
+        self.push_stack(result.try_promote_number());
 
         Ok(())
     }
@@ -2383,8 +2385,9 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
     fn op_increment(&mut self) -> Result<(), Error<'gc>> {
         let value = self.pop_stack().coerce_to_number(self)?;
+        let result = Value::from(value + 1.0);
 
-        self.push_stack(value + 1.0);
+        self.push_stack(result.try_promote_number());
 
         Ok(())
     }
