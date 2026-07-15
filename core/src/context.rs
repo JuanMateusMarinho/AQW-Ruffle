@@ -610,6 +610,26 @@ pub struct RenderContext<'a, 'gc> {
     pub stage: Stage<'gc>,
 }
 
+/// Pixel budget left to non-oversized large redraws after the oversized lane
+/// admits a redraw that alone exceeds the whole per-frame budget (a map-scale
+/// filtered overlay in fullscreen). Charging the oversized redraw in full
+/// zeroed the pool, and budget admission runs in painter's order — the
+/// background overlay reserved first every frame and the combat FX rendered
+/// on top of it starved into chronic deferral (stale weapon art during
+/// attacks). Ordinary FX redraws cost ~10-100k px each, so this allowance is
+/// a fraction of the oversized redraw the frame already absorbed; it matches
+/// the small bucket's per-frame pixel budget, an amount of extra fill that is
+/// already known not to hurt crowded fullscreen rooms.
+const AQW_DIRTY_CACHE_REDRAW_FOLLOWER_FLOOR_PIXELS: u64 = 1_500_000;
+
+/// Kill-switch: `RUFFLE_AQW_NO_LARGE_FLOOR` restores full charging of
+/// oversized cache redraws (followers starve for the rest of the frame), for
+/// field A/B without a rebuild.
+fn aqw_large_redraw_floor_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_LARGE_FLOOR").is_some())
+}
+
 impl<'gc> RenderContext<'_, 'gc> {
     /// Convenience method to retrieve the current GC context. Note that explicitly writing
     /// `self.gc_context` can be sometimes necessary to satisfy the borrow checker.
@@ -631,11 +651,22 @@ impl<'gc> RenderContext<'_, 'gc> {
             return false;
         }
 
+        let remaining = self.dirty_cache_redraw_pixels_remaining;
         self.dirty_cache_redraws_remaining -= 1;
         self.dirty_cache_redraws_reserved += 1;
-        self.dirty_cache_redraw_pixels_remaining = self
-            .dirty_cache_redraw_pixels_remaining
-            .saturating_sub(pixels);
+        self.dirty_cache_redraw_pixels_remaining = if pixels > remaining {
+            // Oversized lane: leave a follower allowance instead of zeroing
+            // the pool (see AQW_DIRTY_CACHE_REDRAW_FOLLOWER_FLOOR_PIXELS).
+            // Capped at what the frame had, so a braked (VRAM-pressure)
+            // budget is never topped back up.
+            if aqw_large_redraw_floor_disabled() {
+                0
+            } else {
+                AQW_DIRTY_CACHE_REDRAW_FOLLOWER_FLOOR_PIXELS.min(remaining)
+            }
+        } else {
+            remaining - pixels
+        };
         true
     }
 

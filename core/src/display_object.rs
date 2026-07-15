@@ -1140,6 +1140,14 @@ fn aqw_stale_guard_disabled() -> bool {
     *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_STALE_GUARD").is_some())
 }
 
+/// Kill-switch: `RUFFLE_AQW_NO_DRIFT_NORM` restores the fixed (~1x-calibrated)
+/// stale-anchor drift tolerance instead of scaling it by the view, for field
+/// A/B without a rebuild.
+fn aqw_drift_norm_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_DRIFT_NORM").is_some())
+}
+
 /// Kill-switch: `RUFFLE_AQW_NO_PADDED_CACHE` restores exact-size cache
 /// textures, for field A/B without a rebuild.
 fn aqw_padded_cache_disabled() -> bool {
@@ -1958,12 +1966,24 @@ pub fn render_base<'gc>(
                                 bounds.y_min - base_transform.matrix.ty
                                     + Twips::from_pixels_i32(draw_offset.y),
                             );
+                            // The tolerance is calibrated in ~1x windowed
+                            // pixels, like the large/small thresholds above,
+                            // but the offsets it is compared against are in
+                            // view-scaled surface pixels — scale it by the
+                            // view too, or fullscreen trips the guard on the
+                            // ambient motion that windowed absorbs and blinks
+                            // the object's filters off for a frame.
+                            let max_drift_twips = if aqw_drift_norm_disabled() {
+                                AQW_STALE_ANCHOR_MAX_DRIFT_TWIPS
+                            } else {
+                                (f64::from(AQW_STALE_ANCHOR_MAX_DRIFT_TWIPS) * view_scale) as i32
+                            };
                             let anchor_drifted = !aqw_stale_anchor_disabled()
                                 && !aqw_stale_guard_disabled()
                                 && ((cache.stale_anchor.x - current_offset.x).get().abs()
-                                    > AQW_STALE_ANCHOR_MAX_DRIFT_TWIPS
+                                    > max_drift_twips
                                     || (cache.stale_anchor.y - current_offset.y).get().abs()
-                                        > AQW_STALE_ANCHOR_MAX_DRIFT_TWIPS);
+                                        > max_drift_twips);
                             let offset_override =
                                 (!aqw_stale_anchor_disabled()).then_some(cache.stale_anchor);
                             cache_info = if anchor_drifted {
