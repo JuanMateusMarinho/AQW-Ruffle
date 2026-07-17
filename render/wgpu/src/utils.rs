@@ -204,6 +204,10 @@ pub fn run_copy_pipeline(
     globals: &Globals,
     sample_count: u32,
     smooth: bool,
+    // Selects the Catmull-Rom copy shader (`copy_sharp.wgsl`) instead of the
+    // plain sampled copy for scaled AQW presents. Only valid for unpadded
+    // inputs (the shader clamps its neighborhood to the allocated texture).
+    sharp: bool,
     input_uv_scale: (f32, f32),
     encoder: &mut CommandEncoder,
 ) {
@@ -253,7 +257,11 @@ pub fn run_copy_pipeline(
             label: create_debug_label!("Copy bind group").as_deref(),
         });
 
-    let pipeline = descriptors.copy_pipeline(format, sample_count);
+    let pipeline = if sharp {
+        descriptors.copy_sharp_pipeline(format, sample_count)
+    } else {
+        descriptors.copy_pipeline(format, sample_count)
+    };
 
     // We overwrite the pixels in the target texture (no blending at all),
     // so this doesn't matter.

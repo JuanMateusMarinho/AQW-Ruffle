@@ -189,6 +189,14 @@ fn aqw_supersample_fallback_factor() -> f32 {
     })
 }
 
+/// Kill-switch for the cubic present resampling: with this set, every scaled
+/// present goes back to the plain bilinear copy from `copy.wgsl`.
+/// (`RUFFLE_AQW_SHARPNESS` tunes the cubic instead; see `shaders.rs`.)
+fn aqw_sharp_upscale_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_SHARP_UPSCALE").is_some())
+}
+
 /// The SSAA factor currently in effect (post pixel-area gate), published by
 /// the renderer on every viewport resize. The desktop mouse mapping reads
 /// this instead of the configured factor so window↔stage coordinates always
@@ -855,6 +863,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     target.globals(),
                     target.color_texture().sample_count(),
                     false,
+                    false,
                     target.copy_uv_scale(),
                     &mut self.active_frame.command_encoder,
                 );
@@ -871,6 +880,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             // differ (downsample for SSAA, soft upscale for the sub-1× gate
             // fallback); an exact 1:1 present keeps the cheaper nearest copy.
             self.supersample_effective != 1.0,
+            // Use the fixed Catmull-Rom resampler for both the sub-1× fallback
+            // upscale and SSAA downsample. Exact 1:1 presents keep nearest.
+            self.supersample_effective != 1.0 && !aqw_sharp_upscale_disabled(),
             RenderTargetMode::FreshWithColor(wgpu::Color {
                 r: f64::from(clear.r) / 255.0,
                 g: f64::from(clear.g) / 255.0,
@@ -1073,6 +1085,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         );
         surface.draw_commands_and_copy_to(
             frame_output.view(),
+            false,
             false,
             RenderTargetMode::FreshWithTexture(target.get_texture()),
             &self.descriptors,

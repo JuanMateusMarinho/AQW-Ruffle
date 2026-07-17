@@ -68,6 +68,7 @@ impl Surface {
         &self,
         frame_view: &wgpu::TextureView,
         smooth: bool,
+        sharp: bool,
         render_target_mode: RenderTargetMode,
         descriptors: &'global Descriptors,
         staging_belt: &'frame mut wgpu::util::StagingBelt,
@@ -99,6 +100,7 @@ impl Surface {
             target.globals(),
             1,
             smooth,
+            sharp,
             target.copy_uv_scale(),
             draw_encoder,
         );

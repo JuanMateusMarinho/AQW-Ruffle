@@ -22,6 +22,7 @@ pub struct Descriptors {
     pub bind_layouts: BindLayouts,
     pub quad: Quad,
     copy_pipeline: Mutex<FnvHashMap<(u32, wgpu::TextureFormat), wgpu::RenderPipeline>>,
+    copy_sharp_pipeline: Mutex<FnvHashMap<(u32, wgpu::TextureFormat), wgpu::RenderPipeline>>,
     pub shaders: Shaders,
     pipelines: Mutex<FnvHashMap<(u32, wgpu::TextureFormat), Arc<Pipelines>>>,
     pub filters: Filters,
@@ -59,6 +60,7 @@ impl Descriptors {
             bind_layouts,
             quad,
             copy_pipeline: Default::default(),
+            copy_sharp_pipeline: Default::default(),
             shaders,
             pipelines: Default::default(),
             filters,
@@ -70,65 +72,94 @@ impl Descriptors {
         format: wgpu::TextureFormat,
         msaa_sample_count: u32,
     ) -> wgpu::RenderPipeline {
-        let mut pipelines = self
-            .copy_pipeline
-            .lock()
-            .expect("Pipelines should not be already locked");
+        Self::cached_copy_pipeline(
+            &self.device,
+            &self.bind_layouts,
+            &self.copy_pipeline,
+            &self.shaders.copy_shader,
+            format,
+            msaa_sample_count,
+        )
+    }
+
+    /// Variant of [`Self::copy_pipeline`] built on the Catmull-Rom resampling
+    /// shader (`copy_sharp.wgsl`); used for scaled AQW presents.
+    pub fn copy_sharp_pipeline(
+        &self,
+        format: wgpu::TextureFormat,
+        msaa_sample_count: u32,
+    ) -> wgpu::RenderPipeline {
+        Self::cached_copy_pipeline(
+            &self.device,
+            &self.bind_layouts,
+            &self.copy_sharp_pipeline,
+            &self.shaders.copy_sharp_shader,
+            format,
+            msaa_sample_count,
+        )
+    }
+
+    fn cached_copy_pipeline(
+        device: &wgpu::Device,
+        bind_layouts: &BindLayouts,
+        cache: &Mutex<FnvHashMap<(u32, wgpu::TextureFormat), wgpu::RenderPipeline>>,
+        module: &wgpu::ShaderModule,
+        format: wgpu::TextureFormat,
+        msaa_sample_count: u32,
+    ) -> wgpu::RenderPipeline {
+        let mut pipelines = cache.lock().expect("Pipelines should not be already locked");
         pipelines
             .entry((msaa_sample_count, format))
             .or_insert_with(|| {
                 let copy_texture_pipeline_layout =
-                    &self
-                        .device
-                        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                            label: create_debug_label!("Copy pipeline layout").as_deref(),
-                            bind_group_layouts: &[
-                                &self.bind_layouts.globals,
-                                &self.bind_layouts.transforms,
-                                &self.bind_layouts.bitmap,
-                            ],
-                            push_constant_ranges: &[],
-                        });
-                self.device
-                    .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                        label: create_debug_label!("Copy pipeline").as_deref(),
-                        layout: Some(copy_texture_pipeline_layout),
-                        vertex: wgpu::VertexState {
-                            module: &self.shaders.copy_shader,
-                            entry_point: Some("main_vertex"),
-                            buffers: &VERTEX_BUFFERS_DESCRIPTION_POS,
-                            compilation_options: Default::default(),
-                        },
-                        fragment: Some(wgpu::FragmentState {
-                            module: &self.shaders.copy_shader,
-                            entry_point: Some("main_fragment"),
-                            targets: &[Some(wgpu::ColorTargetState {
-                                format,
-                                // All of our blending has been done by now, so we want
-                                // to overwrite the target pixels without any blending
-                                blend: Some(wgpu::BlendState::REPLACE),
-                                write_mask: Default::default(),
-                            })],
-                            compilation_options: Default::default(),
-                        }),
-                        primitive: wgpu::PrimitiveState {
-                            topology: wgpu::PrimitiveTopology::TriangleList,
-                            strip_index_format: None,
-                            front_face: wgpu::FrontFace::Ccw,
-                            cull_mode: None,
-                            polygon_mode: wgpu::PolygonMode::default(),
-                            unclipped_depth: false,
-                            conservative: false,
-                        },
-                        depth_stencil: None,
-                        multisample: wgpu::MultisampleState {
-                            count: msaa_sample_count,
-                            mask: !0,
-                            alpha_to_coverage_enabled: false,
-                        },
-                        multiview: None,
-                        cache: None,
-                    })
+                    &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: create_debug_label!("Copy pipeline layout").as_deref(),
+                        bind_group_layouts: &[
+                            &bind_layouts.globals,
+                            &bind_layouts.transforms,
+                            &bind_layouts.bitmap,
+                        ],
+                        push_constant_ranges: &[],
+                    });
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: create_debug_label!("Copy pipeline").as_deref(),
+                    layout: Some(copy_texture_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module,
+                        entry_point: Some("main_vertex"),
+                        buffers: &VERTEX_BUFFERS_DESCRIPTION_POS,
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module,
+                        entry_point: Some("main_fragment"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format,
+                            // All of our blending has been done by now, so we want
+                            // to overwrite the target pixels without any blending
+                            blend: Some(wgpu::BlendState::REPLACE),
+                            write_mask: Default::default(),
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: None,
+                        polygon_mode: wgpu::PolygonMode::default(),
+                        unclipped_depth: false,
+                        conservative: false,
+                    },
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState {
+                        count: msaa_sample_count,
+                        mask: !0,
+                        alpha_to_coverage_enabled: false,
+                    },
+                    multiview: None,
+                    cache: None,
+                })
             })
             .clone()
     }
