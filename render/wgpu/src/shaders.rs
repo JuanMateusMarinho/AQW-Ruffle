@@ -17,6 +17,10 @@ pub struct Shaders {
     /// `copy.wgsl` with a fixed Catmull-Rom resampling fragment stage; used for
     /// scaled AQW presents (see `copy_sharp.wgsl`).
     pub copy_sharp_shader: wgpu::ShaderModule,
+    /// `copy_sharp.wgsl` plus positional scanlines and an aperture-grille
+    /// mask; used when the in-game AQW "CRT Filter" option is ON
+    /// (see `copy_crt.wgsl`).
+    pub copy_crt_shader: wgpu::ShaderModule,
     pub alpha_mask_shader: wgpu::ShaderModule,
     pub blend_shaders: EnumMap<ComplexBlend, wgpu::ShaderModule>,
     pub color_matrix_filter: wgpu::ShaderModule,
@@ -45,6 +49,105 @@ impl Shaders {
                 &format!("const SHARPNESS: f32 = {:.4};", aqw_present_sharpness()),
             );
             make_shader(device, "copy_sharp.wgsl", &source)
+        };
+        let copy_crt_shader = {
+            // Like copy_sharp, all knobs are process-wide startup settings
+            // baked into the source so the copy pipeline stays uniform-free.
+            let source = include_str!("../shaders/copy_crt.wgsl")
+                .replace(
+                    "const SHARPNESS: f32 = 0.5;",
+                    &format!("const SHARPNESS: f32 = {:.4};", aqw_present_sharpness()),
+                )
+                .replace(
+                    "const SCANLINE: f32 = 0.85;",
+                    &format!(
+                        "const SCANLINE: f32 = {:.4};",
+                        aqw_crt_env_strength("RUFFLE_AQW_CRT_SCANLINE", 0.85)
+                    ),
+                )
+                .replace(
+                    "const MASK: f32 = 0.3;",
+                    &format!(
+                        "const MASK: f32 = {:.4};",
+                        aqw_crt_env_strength("RUFFLE_AQW_CRT_MASK", 0.3)
+                    ),
+                )
+                .replace(
+                    "const MASK_TYPE: u32 = 1u;",
+                    &format!(
+                        "const MASK_TYPE: u32 = {}u;",
+                        match std::env::var("RUFFLE_AQW_CRT_MASK_TYPE").as_deref() {
+                            Ok("grille") => 0,
+                            _ => 1,
+                        }
+                    ),
+                )
+                .replace(
+                    "const HALATION: f32 = 0.12;",
+                    &format!(
+                        "const HALATION: f32 = {:.4};",
+                        aqw_crt_env_strength(
+                            "RUFFLE_AQW_CRT_HALATION",
+                            if artix_game_is_dragonfable() { 0.08 } else { 0.12 }
+                        )
+                    ),
+                )
+                .replace(
+                    "const GLOW: f32 = 0.45;",
+                    &format!(
+                        "const GLOW: f32 = {:.4};",
+                        aqw_crt_env_strength(
+                            "RUFFLE_AQW_CRT_GLOW",
+                            if artix_game_is_dragonfable() { 0.3 } else { 0.45 }
+                        )
+                    ),
+                )
+                .replace(
+                    "const BRIGHT: f32 = 1.0;",
+                    &format!(
+                        "const BRIGHT: f32 = {:.4};",
+                        std::env::var("RUFFLE_AQW_CRT_BRIGHTNESS")
+                            .ok()
+                            .and_then(|v| v.trim().parse::<f32>().ok())
+                            .filter(|n| n.is_finite())
+                            .map(|n| n.clamp(0.0, 1.5))
+                            .unwrap_or(if artix_game_is_dragonfable() { 0.85 } else { 1.0 })
+                    ),
+                )
+                .replace(
+                    "const SOFTNESS: f32 = 0.16;",
+                    &format!(
+                        "const SOFTNESS: f32 = {:.4};",
+                        aqw_crt_env_strength("RUFFLE_AQW_CRT_SOFTNESS", 0.16)
+                    ),
+                )
+                .replace(
+                    "const VIGNETTE: f32 = 0.2;",
+                    &format!(
+                        "const VIGNETTE: f32 = {:.4};",
+                        aqw_crt_env_strength("RUFFLE_AQW_CRT_VIGNETTE", 0.2)
+                    ),
+                )
+                .replace(
+                    "const WARP: f32 = 0.04;",
+                    &format!(
+                        "const WARP: f32 = {:.4};",
+                        ruffle_render::backend::aqw_crt_warp_strength()
+                    ),
+                )
+                .replace(
+                    "const ABERRATION: f32 = 0.7;",
+                    &format!(
+                        "const ABERRATION: f32 = {:.4};",
+                        std::env::var("RUFFLE_AQW_CRT_ABERRATION")
+                            .ok()
+                            .and_then(|v| v.trim().parse::<f32>().ok())
+                            .filter(|n| n.is_finite())
+                            .map(|n| n.clamp(0.0, 4.0))
+                            .unwrap_or(0.7)
+                    ),
+                );
+            make_shader(device, "copy_crt.wgsl", &source)
         };
         let color_matrix_filter = make_filter_shader(
             device,
@@ -100,6 +203,7 @@ impl Shaders {
             gradient_shader,
             copy_shader,
             copy_sharp_shader,
+            copy_crt_shader,
             alpha_mask_shader,
             blend_shaders,
             color_matrix_filter,
@@ -121,6 +225,26 @@ fn aqw_present_sharpness() -> f32 {
         .filter(|n| n.is_finite())
         .map(|n| n.clamp(0.0, 1.0))
         .unwrap_or(0.5)
+}
+
+/// Whether this process is running DragonFable, from the env the launcher
+/// (and the test scripts) set per game. DF's bright parchment art clips
+/// with the CRT tuning approved on AQW's darker palette, so a few CRT
+/// defaults bake lower there; explicit `RUFFLE_AQW_CRT_*` envs still win.
+fn artix_game_is_dragonfable() -> bool {
+    std::env::var("ARTIX_RUFFLE_GAME").is_ok_and(|v| v == "df")
+        || std::env::var("ARTIX_RUFFLE_GAME_ICON").is_ok_and(|v| v == "dragonfable")
+}
+
+/// CRT strength knobs (0..1), read once at startup and baked into
+/// `copy_crt.wgsl`.
+fn aqw_crt_env_strength(var: &str, default: f32) -> f32 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|n| n.is_finite())
+        .map(|n| n.clamp(0.0, 1.0))
+        .unwrap_or(default)
 }
 
 fn make_shader(device: &wgpu::Device, name: &str, source: &str) -> wgpu::ShaderModule {

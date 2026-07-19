@@ -292,6 +292,52 @@ impl GuiController {
         }
     }
 
+    /// Forward CRT barrel warp in movie-area window coordinates. The CRT
+    /// present shader shows the content of warp(uv) at screen uv, so a
+    /// click at uv is aiming at warp(uv) — the SAME function (and shared
+    /// strength constant) maps mouse coordinates. No-op when the filter is
+    /// off.
+    fn crt_warp_window_position(&self, x: f64, y: f64) -> (f64, f64) {
+        let k = f64::from(ruffle_render::backend::aqw_crt_warp_strength());
+        if k <= 0.0 || !ruffle_render::backend::aqw_crt_filter_enabled() {
+            return (x, y);
+        }
+        let w = f64::from(self.size.width);
+        let h = f64::from(self.size.height) - self.height_offset();
+        if w <= 0.0 || h <= 0.0 {
+            return (x, y);
+        }
+        let cx = x / w * 2.0 - 1.0;
+        let cy = y / h * 2.0 - 1.0;
+        let f = 1.0 + k * (cx * cx + cy * cy);
+        (((cx * f) + 1.0) * 0.5 * w, ((cy * f) + 1.0) * 0.5 * h)
+    }
+
+    /// Inverse of [`Self::crt_warp_window_position`] (fixed-point
+    /// iteration; the warp is gentle so two rounds converge well below a
+    /// pixel).
+    fn crt_unwarp_window_position(&self, x: f64, y: f64) -> (f64, f64) {
+        let k = f64::from(ruffle_render::backend::aqw_crt_warp_strength());
+        if k <= 0.0 || !ruffle_render::backend::aqw_crt_filter_enabled() {
+            return (x, y);
+        }
+        let w = f64::from(self.size.width);
+        let h = f64::from(self.size.height) - self.height_offset();
+        if w <= 0.0 || h <= 0.0 {
+            return (x, y);
+        }
+        let tx = x / w * 2.0 - 1.0;
+        let ty = y / h * 2.0 - 1.0;
+        let mut cx = tx;
+        let mut cy = ty;
+        for _ in 0..3 {
+            let f = 1.0 + k * (cx * cx + cy * cy);
+            cx = tx / f;
+            cy = ty / f;
+        }
+        ((cx + 1.0) * 0.5 * w, (cy + 1.0) * 0.5 * h)
+    }
+
     pub fn window_to_movie_position(&self, position: PhysicalPosition<f64>) -> (f64, f64) {
         // When the renderer supersamples, it reports an N× viewport to the player, so
         // stage hit-testing expects window coordinates scaled up by the same N.
@@ -299,15 +345,14 @@ impl GuiController {
         // Reads the factor currently in effect — the renderer may gate SSAA off
         // for large windows — so clicks track whatever is actually rendering.
         let ss = f64::from(aqw_current_supersample());
-        let x = position.x * ss;
-        let y = (position.y - self.height_offset()) * ss;
-        (x, y)
+        let (wx, wy) = self.crt_warp_window_position(position.x, position.y - self.height_offset());
+        (wx * ss, wy * ss)
     }
 
     pub fn movie_to_window_position(&self, x: f64, y: f64) -> PhysicalPosition<f64> {
         let ss = f64::from(aqw_current_supersample());
-        let y = y / ss + self.height_offset();
-        PhysicalPosition::new(x / ss, y)
+        let (ux, uy) = self.crt_unwarp_window_position(x / ss, y / ss);
+        PhysicalPosition::new(ux, uy + self.height_offset())
     }
 
     pub fn render(&mut self, mut player: Option<MutexGuard<Player>>) {
@@ -333,13 +378,16 @@ impl GuiController {
                 tracing::warn!("Surface became unavailable: {:?}, skipping a frame", e);
                 return;
             }
-            Err(SurfaceError::OutOfMemory) => {
-                // Cannot help with that :(
-                panic!("wgpu: Out of memory: no more memory left to allocate a new frame");
-            }
-            Err(SurfaceError::Other) => {
-                // Generic error, not much we can do.
-                panic!("wgpu: Acquiring a texture failed with a generic error");
+            Err(e @ (SurfaceError::OutOfMemory | SurfaceError::Other)) => {
+                // Vulkan can return a generic acquire failure from inside a
+                // window-message callback (modal resize/move loop, DPI change)
+                // that clears by the next frame, and OOM here is as transient
+                // as it is in the AQW render path (the VRAM valve drains it).
+                // Neither is worth killing the game over: treat both like
+                // Lost/Outdated — reconfigure and skip this frame.
+                tracing::error!("Surface acquire failed: {e:?}; reconfiguring and skipping a frame");
+                self.reconfigure_surface();
+                return;
             }
         };
 

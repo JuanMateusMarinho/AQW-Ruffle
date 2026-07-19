@@ -1868,6 +1868,12 @@ impl Player {
                         if let Some(down_object) = context.mouse_data.pressed(button) {
                             if button == MouseButton::Left {
                                 new_cursor = down_object.mouse_cursor(context);
+                                // AQW: clicks on the injected "CRT Filter"
+                                // Options row (no AVM2 listeners of its own).
+                                crate::display_object::aqw_crt_maybe_toggle(
+                                    context,
+                                    down_object.as_displayobject(),
+                                );
                             }
                             events.push((down_object, event));
                         } else {
@@ -2080,6 +2086,11 @@ impl Player {
             // TODO: Is this order correct?
             run_all_phases_avm2(context);
             Avm1::run_frame(context);
+            // Artix "CRT Filter" option row injected into the game's own
+            // options menu (no-op outside AQW/DragonFable; kill-switch
+            // RUFFLE_AQW_NO_CRT_MENU). After both AVMs' frame phases so
+            // freshly built panels are fully constructed when scanned.
+            crate::display_object::aqw_crt_menu_tick(context);
             AudioManager::update_sounds(context);
             LocalConnections::update_connections(context);
 

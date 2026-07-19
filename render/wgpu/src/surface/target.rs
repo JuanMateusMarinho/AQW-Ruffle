@@ -325,6 +325,7 @@ impl CommandTarget {
                     sample_count,
                     false,
                     false,
+                    false,
                     (1.0, 1.0),
                     encoder,
                 );

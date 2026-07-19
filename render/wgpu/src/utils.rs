@@ -208,6 +208,10 @@ pub fn run_copy_pipeline(
     // plain sampled copy for scaled AQW presents. Only valid for unpadded
     // inputs (the shader clamps its neighborhood to the allocated texture).
     sharp: bool,
+    // Selects the CRT present shader (`copy_crt.wgsl`, Catmull-Rom +
+    // scanlines + phosphor mask); takes precedence over `sharp`. Present-only
+    // (same unpadded-input requirement as `sharp`).
+    crt: bool,
     input_uv_scale: (f32, f32),
     encoder: &mut CommandEncoder,
 ) {
@@ -257,7 +261,9 @@ pub fn run_copy_pipeline(
             label: create_debug_label!("Copy bind group").as_deref(),
         });
 
-    let pipeline = if sharp {
+    let pipeline = if crt {
+        descriptors.copy_crt_pipeline(format, sample_count)
+    } else if sharp {
         descriptors.copy_sharp_pipeline(format, sample_count)
     } else {
         descriptors.copy_pipeline(format, sample_count)

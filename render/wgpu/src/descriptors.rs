@@ -23,6 +23,7 @@ pub struct Descriptors {
     pub quad: Quad,
     copy_pipeline: Mutex<FnvHashMap<(u32, wgpu::TextureFormat), wgpu::RenderPipeline>>,
     copy_sharp_pipeline: Mutex<FnvHashMap<(u32, wgpu::TextureFormat), wgpu::RenderPipeline>>,
+    copy_crt_pipeline: Mutex<FnvHashMap<(u32, wgpu::TextureFormat), wgpu::RenderPipeline>>,
     pub shaders: Shaders,
     pipelines: Mutex<FnvHashMap<(u32, wgpu::TextureFormat), Arc<Pipelines>>>,
     pub filters: Filters,
@@ -61,6 +62,7 @@ impl Descriptors {
             quad,
             copy_pipeline: Default::default(),
             copy_sharp_pipeline: Default::default(),
+            copy_crt_pipeline: Default::default(),
             shaders,
             pipelines: Default::default(),
             filters,
@@ -94,6 +96,24 @@ impl Descriptors {
             &self.bind_layouts,
             &self.copy_sharp_pipeline,
             &self.shaders.copy_sharp_shader,
+            format,
+            msaa_sample_count,
+        )
+    }
+
+    /// Variant of [`Self::copy_pipeline`] built on the CRT shader
+    /// (`copy_crt.wgsl`); used for AQW presents with the in-game
+    /// "CRT Filter" option ON.
+    pub fn copy_crt_pipeline(
+        &self,
+        format: wgpu::TextureFormat,
+        msaa_sample_count: u32,
+    ) -> wgpu::RenderPipeline {
+        Self::cached_copy_pipeline(
+            &self.device,
+            &self.bind_layouts,
+            &self.copy_crt_pipeline,
+            &self.shaders.copy_crt_shader,
             format,
             msaa_sample_count,
         )

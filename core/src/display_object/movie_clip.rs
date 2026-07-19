@@ -126,6 +126,526 @@ fn aqw_subtree_has_avatar_asset<'gc>(obj: DisplayObject<'gc>, budget: &mut u32) 
     false
 }
 
+/// Kill-switch for the injected "CRT Filter" Options-menu row, so it can be
+/// turned off in the field without a rebuild if it ever misbehaves.
+fn aqw_crt_menu_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_CRT_MENU").is_some())
+}
+
+/// Which Artix game the CRT-filter option row is being managed for. Each
+/// game runs as its own process, so one global flag/config per process.
+#[derive(Copy, Clone)]
+enum AqwCrtGame {
+    Aqw,
+    DragonFable,
+}
+
+fn aqw_crt_game(url: &str) -> Option<AqwCrtGame> {
+    if super::is_aqw_movie_url(url) {
+        Some(AqwCrtGame::Aqw)
+    } else if url.contains("dragonfable") {
+        Some(AqwCrtGame::DragonFable)
+    } else {
+        None
+    }
+}
+
+/// Where the CRT toggle persists between sessions (the injected row has no
+/// server-side preference to piggyback on, unlike the game's own options).
+/// Resolved once at init; the click hook reuses it.
+static AQW_CRT_CONFIG: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+
+fn aqw_crt_config_path(game: AqwCrtGame) -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("APPDATA")?;
+    let mut path = std::path::PathBuf::from(base);
+    path.push("aqw_ruffle");
+    path.push(match game {
+        AqwCrtGame::Aqw => "crt_filter.cfg",
+        AqwCrtGame::DragonFable => "crt_filter_df.cfg",
+    });
+    Some(path)
+}
+
+/// One-time init of the CRT flag: `RUFFLE_AQW_CRT=1/0` overrides, otherwise
+/// the persisted choice from the last session, otherwise off.
+fn aqw_crt_init_state(game: AqwCrtGame) {
+    AQW_CRT_CONFIG.get_or_init(|| {
+        let path = aqw_crt_config_path(game);
+        let on = match std::env::var("RUFFLE_AQW_CRT").ok().as_deref().map(str::trim) {
+            Some("1") => true,
+            Some("0") => false,
+            _ => path
+                .as_ref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .is_some_and(|s| s.trim() == "1"),
+        };
+        ruffle_render::backend::set_aqw_crt_filter(on);
+        path
+    });
+}
+
+fn aqw_crt_persist(on: bool) {
+    if let Some(Some(path)) = AQW_CRT_CONFIG.get() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, if on { "1" } else { "0" });
+    }
+}
+
+/// Injected-child depths on the options panels. Far above anything the
+/// panels' own timelines place, so no authored frame ever collides.
+const AQW_CRT_DEPTH_LABEL: Depth = 16200;
+const AQW_CRT_DEPTH_VALUE: Depth = 16202;
+const AQW_CRT_DEPTH_LEFT: Depth = 16204;
+const AQW_CRT_DEPTH_RIGHT: Depth = 16206;
+const AQW_CRT_DEPTH_DF_CHECK: Depth = 16390;
+const AQW_CRT_DEPTH_DF_LABEL: Depth = 16392;
+
+/// Find a game's options panel: the only container whose children include
+/// both `marker_a` and `marker_b` (instance names unique to that panel).
+fn aqw_find_options_panel<'gc>(
+    stage: crate::display_object::Stage<'gc>,
+    marker_a: &WStr,
+    marker_b: &WStr,
+) -> Option<MovieClip<'gc>> {
+    let mut stack: SmallVec<[(DisplayObject<'gc>, u32); 32]> =
+        SmallVec::from_iter([(stage.into(), 0u32)]);
+    let mut budget = 4000u32;
+    while let Some((obj, depth)) = stack.pop() {
+        if budget == 0 {
+            return None;
+        }
+        budget -= 1;
+        if let Some(container) = obj.as_container() {
+            if container.child_by_name(marker_a, false).is_some()
+                && container.child_by_name(marker_b, false).is_some()
+            {
+                return obj.as_movie_clip();
+            }
+            if depth < 8 {
+                for child in container.iter_render_list() {
+                    if child.as_container().is_some() {
+                        stack.push((child, depth + 1));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Instantiate one library symbol as a named child of the Options panel,
+/// mirroring `instantiate_child`'s timeline placement path (so the clone gets
+/// the full AVM2 construction and renders like an authored child).
+fn aqw_crt_spawn_child<'gc>(
+    context: &mut UpdateContext<'gc>,
+    panel: MovieClip<'gc>,
+    id: CharacterId,
+    depth: Depth,
+    matrix: Matrix,
+    name: &'static str,
+) -> Option<DisplayObject<'gc>> {
+    if panel.has_child_at_depth(depth) {
+        return None;
+    }
+    let movie = panel.movie();
+    let library = context.library.library_for_movie_mut(movie.clone());
+    let child = library.instantiate_by_id(id, context.gc_context)?;
+    panel.replace_at_depth(context, child, depth);
+    child.set_instantiated_by_timeline(true);
+    child.set_depth(depth);
+    child.set_parent(context, Some(panel.into()));
+    child.set_place_frame(panel.current_frame());
+    child.set_matrix(matrix);
+    let name = AvmString::new_utf8(context.gc(), name);
+    child.set_name(context.gc(), name);
+    // Deliberately NOT `set_has_explicit_name(true)`: that flag makes AVM2
+    // construction try to bind the child as a property on the (sealed)
+    // panel class, which fails with a logged #1056. `child_by_name` (all we
+    // need) matches on the display name alone.
+    child.post_instantiation(context, None, Instantiator::Movie, false);
+    if movie.is_action_script_3() {
+        crate::frame_lifecycle::catchup_display_object_to_frame(context, child);
+    } else {
+        // AVM1 path (DragonFable): mirror `instantiate_child`'s tail so the
+        // clone's first frame (and any frame-1 DoAction) runs this tick.
+        child.enter_frame(context);
+        if let Some(clip) = child.as_movie_clip() {
+            clip.run_frame_avm1(context);
+        }
+    }
+    Some(child)
+}
+
+fn aqw_crt_set_row_text<'gc>(
+    context: &mut UpdateContext<'gc>,
+    child: DisplayObject<'gc>,
+    text: &WStr,
+) {
+    if let Some(edit) = child.as_edit_text() {
+        // Recenter around the authored bounds so longer strings ("CRT
+        // Filter") don't clip in the narrow quality-value field we cloned.
+        edit.set_autosize(super::edit_text::AutoSizeMode::Center, context);
+        if edit.text() != text {
+            edit.set_text(text, context);
+        }
+    }
+}
+
+/// Periodic hook (from `run_all_phases_avm2`): keeps a "CRT Filter  < ON >"
+/// row injected into AQW's Options panel, built from the panel's own assets
+/// (the Visuals row's value TextField and arrow symbols - same art, same
+/// embedded font) so it reads as native UI. The row sits on the panel's
+/// bottom strip (next to the latency/version readouts), the one spot with
+/// free space that persists across all four tabs. Symbol ids and geometry
+/// are derived from the live `mcVis` row, never hardcoded, so game updates
+/// that renumber characters don't break it - the row simply requires one
+/// visit to the General tab (where `mcVis` lives) to appear.
+pub fn aqw_crt_menu_tick(context: &mut UpdateContext<'_>) {
+    if aqw_crt_menu_disabled() {
+        return;
+    }
+    let Some(game) = aqw_crt_game(context.stage.movie().url()) else {
+        return;
+    };
+    // Cheap cadence: a full scan four times a second is plenty for UI.
+    static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 6 != 0 {
+        return;
+    }
+    aqw_crt_init_state(game);
+
+    match game {
+        AqwCrtGame::Aqw => aqw_crt_aqw_tick(context),
+        AqwCrtGame::DragonFable => aqw_crt_df_tick(context),
+    }
+}
+
+fn aqw_crt_aqw_tick(context: &mut UpdateContext<'_>) {
+    let Some(panel) = aqw_find_options_panel(
+        context.stage,
+        WStr::from_units(b"txtLatency"),
+        WStr::from_units(b"btnLogout"),
+    ) else {
+        return;
+    };
+    let on = ruffle_render::backend::aqw_crt_filter_enabled();
+    let value_text: &WStr = if on {
+        WStr::from_units(b"ON")
+    } else {
+        WStr::from_units(b"OFF")
+    };
+
+    if let Some(value) = panel.child_by_name(WStr::from_units(b"aqwCrtValue"), false) {
+        // Already injected: just keep the value label in sync.
+        aqw_crt_set_row_text(context, value, value_text);
+        return;
+    }
+
+    // Not injected yet: needs the General tab's Visuals row on screen to
+    // clone from. All geometry below is in twips, panel-local.
+    let Some(vis_obj) = panel.child_by_name(WStr::from_units(b"mcVis"), false) else {
+        return;
+    };
+    let Some(vis) = vis_obj.as_container() else {
+        return;
+    };
+    let (Some(quality), Some(left), Some(right), Some(latency)) = (
+        vis.child_by_name(WStr::from_units(b"txtQuality"), false),
+        vis.child_by_name(WStr::from_units(b"btnLeftQual"), false),
+        vis.child_by_name(WStr::from_units(b"btnRightQual"), false),
+        panel.child_by_name(WStr::from_units(b"txtLatency"), false),
+    ) else {
+        return;
+    };
+    let text_id = quality.id();
+    let arrow_id = left.id();
+    if text_id == 0 || arrow_id == 0 {
+        return;
+    }
+
+    let vis_matrix = vis_obj.base().matrix();
+    let left_matrix = left.base().matrix();
+    let right_matrix = right.base().matrix();
+    let quality_matrix = quality.base().matrix();
+    // The value field is placed by its bounds origin; its visual center sits
+    // this far right of the placement point (authored bounds are stable
+    // under the autosize-center we apply to the clones).
+    let text_bounds = quality.self_bounds(BoundsMode::Engine);
+    let text_center_off = (text_bounds.x_min.get() + text_bounds.x_max.get()) / 2;
+
+    // Anchor the row's right edge to the panel's shared arrow column and its
+    // baseline to the bottom strip's latency text; keep the arrows' offset
+    // below their value text exactly as authored in the Visuals row. The
+    // arrow gap must clear the value text plus the arrow art itself (the
+    // arrows' registration point is their center, art ~400 twips wide).
+    let right_tx = vis_matrix.tx.get() + right_matrix.tx.get();
+    let left_tx = right_tx - 1120;
+    let row_ty = latency.base().matrix().ty.get();
+    let arrow_dy = left_matrix.ty.get() - quality_matrix.ty.get();
+    let value_tx = right_tx - 560 - text_center_off;
+    let label_tx = right_tx - 2100 - text_center_off;
+
+    // The strip's version readout ("3.11") is a wide centered field whose
+    // text lands exactly where the row's label needs to go; nudge it left
+    // beside the latency readout. Absolute-from-latency (not relative to its
+    // own position) so re-running after a tab switch can't drift it.
+    if let Some(version) = panel.child_by_name(WStr::from_units(b"txtCVersion"), false) {
+        let version_matrix = version.base().matrix();
+        version.set_matrix(Matrix {
+            tx: Twips::new(latency.base().matrix().tx.get() - 1527),
+            ..version_matrix
+        });
+    }
+
+    let text_at = |tx: i32| Matrix {
+        tx: Twips::new(tx),
+        ty: Twips::new(row_ty),
+        ..quality_matrix
+    };
+    let arrow_at = |source: Matrix, tx: i32| Matrix {
+        tx: Twips::new(tx),
+        ty: Twips::new(row_ty + arrow_dy),
+        ..source
+    };
+
+    if let Some(label) = aqw_crt_spawn_child(
+        context,
+        panel,
+        text_id,
+        AQW_CRT_DEPTH_LABEL,
+        text_at(label_tx),
+        "aqwCrtLabel",
+    ) {
+        aqw_crt_set_row_text(context, label, WStr::from_units(b"CRT Filter"));
+    }
+    if let Some(value) = aqw_crt_spawn_child(
+        context,
+        panel,
+        text_id,
+        AQW_CRT_DEPTH_VALUE,
+        text_at(value_tx),
+        "aqwCrtValue",
+    ) {
+        aqw_crt_set_row_text(context, value, value_text);
+    }
+    aqw_crt_spawn_child(
+        context,
+        panel,
+        arrow_id,
+        AQW_CRT_DEPTH_LEFT,
+        arrow_at(left_matrix, left_tx),
+        "aqwCrtLeft",
+    );
+    aqw_crt_spawn_child(
+        context,
+        panel,
+        arrow_id,
+        AQW_CRT_DEPTH_RIGHT,
+        arrow_at(right_matrix, right_tx),
+        "aqwCrtRight",
+    );
+    if aqw_diagnostics_enabled() {
+        tracing::info!(target: "aqw_diag", "AQW_CRT: options row injected");
+    }
+}
+
+/// DragonFable: inject a "CRT Filter" checkbox row into the Options book's
+/// GRAPHICS column, just below the last authored row. The checkbox
+/// symbol is cloned from a live row (same art), and it is self-contained in
+/// AVM1: its internal button toggles `bitChecked` and the checkmark on its
+/// own (the `onReleaseEvent` callback stays undefined and is skipped), so
+/// the native click hook only has to flip the filter flag. The label is a
+/// Noto-Serif EditText from the game's library, matching the authored
+/// static labels.
+fn aqw_crt_df_tick(context: &mut UpdateContext<'_>) {
+    let Some(panel) = aqw_find_options_panel(
+        context.stage,
+        WStr::from_units(b"chkWeather"),
+        WStr::from_units(b"VolumeControl"),
+    ) else {
+        return;
+    };
+    let on = ruffle_render::backend::aqw_crt_filter_enabled();
+
+    if let Some(check) = panel.child_by_name(WStr::from_units(b"aqwCrtCheck"), false) {
+        // Already injected: keep the checkmark in sync (the checkbox's own
+        // button script and our click hook flip together, so this only
+        // corrects drift, e.g. right after injection).
+        if let Some(mark) = check
+            .as_container()
+            .and_then(|c| c.child_by_name(WStr::from_units(b"checkmark"), false))
+            && mark.visible() != on
+        {
+            mark.set_visible(context, on);
+        }
+        return;
+    }
+
+    let (Some(chk_ui), Some(chk_fps), Some(chk_weather)) = (
+        panel.child_by_name(WStr::from_units(b"chkUIToggle"), false),
+        panel.child_by_name(WStr::from_units(b"chkFPS"), false),
+        panel.child_by_name(WStr::from_units(b"chkWeather"), false),
+    ) else {
+        return;
+    };
+    let checkbox_id = chk_ui.id();
+    if checkbox_id == 0 {
+        return;
+    }
+    let ui_matrix = chk_ui.base().matrix();
+    let pitch = chk_fps.base().matrix().ty.get() - chk_weather.base().matrix().ty.get();
+    if pitch <= 0 {
+        return;
+    }
+    let row_x = ui_matrix.tx.get();
+    // DF starts the SOUND heading before another full graphics-row pitch
+    // fits. Keep a compact gap here so the injected checkbox clears both the
+    // Seasonal Borders row above and the SOUND heading below.
+    let row_y = ui_matrix.ty.get() + pitch * 4 / 5;
+
+    let Some(label_id) = aqw_crt_df_label_id(context, panel) else {
+        return;
+    };
+
+    if let Some(check) = aqw_crt_spawn_child(
+        context,
+        panel,
+        checkbox_id,
+        AQW_CRT_DEPTH_DF_CHECK,
+        Matrix {
+            tx: Twips::new(row_x),
+            ty: Twips::new(row_y),
+            ..ui_matrix
+        },
+        "aqwCrtCheck",
+    ) {
+        // Initialize the checkbox's own AVM1 state so its internal button
+        // stays in parity with the filter flag from the first click on.
+        if let Some(obj) = check.object1() {
+            let name = AvmString::new_utf8(context.gc(), "bitChecked");
+            obj.define_value(
+                context.gc(),
+                name,
+                on.into(),
+                crate::avm1::Attribute::empty(),
+            );
+        }
+        if let Some(mark) = check
+            .as_container()
+            .and_then(|c| c.child_by_name(WStr::from_units(b"checkmark"), false))
+        {
+            mark.set_visible(context, on);
+        }
+    }
+    if let Some(label) = aqw_crt_spawn_child(
+        context,
+        panel,
+        label_id,
+        AQW_CRT_DEPTH_DF_LABEL,
+        Matrix {
+            tx: Twips::new(row_x + 480),
+            ty: Twips::new(row_y - 165),
+            ..Matrix::IDENTITY
+        },
+        "aqwCrtLabel",
+    ) && let Some(edit) = label.as_edit_text()
+    {
+        edit.set_text(WStr::from_units(b"CRT Filter"), context);
+    }
+    if aqw_diagnostics_enabled() {
+        tracing::info!(target: "aqw_diag", "AQW_CRT: DF options row injected");
+    }
+}
+
+/// Library id of a Noto-Serif EditText to clone for the DF row label.
+/// Prefers the known id from the current DF build (type-checked before
+/// use, since game updates renumber characters); falls back to any
+/// EditText inside the panel's live VolumeControl (Noto Serif Bold - the
+/// volume number), which survives renumbering.
+fn aqw_crt_df_label_id<'gc>(
+    context: &mut UpdateContext<'gc>,
+    panel: MovieClip<'gc>,
+) -> Option<CharacterId> {
+    const DF_LABEL_EDIT_TEXT: CharacterId = 4658;
+    let movie = panel.movie();
+    if let Some(library) = context.library.library_for_movie(movie)
+        && matches!(
+            library.character_by_id(DF_LABEL_EDIT_TEXT),
+            Some(Character::EditText(_))
+        )
+    {
+        return Some(DF_LABEL_EDIT_TEXT);
+    }
+    let volume = panel.child_by_name(WStr::from_units(b"VolumeControl"), false)?;
+    let mut budget = 64u32;
+    fn find_edit_text<'gc>(obj: DisplayObject<'gc>, budget: &mut u32) -> Option<CharacterId> {
+        if *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+        if obj.as_edit_text().is_some() && obj.id() != 0 {
+            return Some(obj.id());
+        }
+        if let Some(container) = obj.as_container() {
+            for child in container.iter_render_list() {
+                if let Some(id) = find_edit_text(child, budget) {
+                    return Some(id);
+                }
+            }
+        }
+        None
+    }
+    find_edit_text(volume, &mut budget)
+}
+
+/// Click hook (from the player's left-release dispatch): if the released
+/// object is part of the injected CRT row, toggle the filter, persist the
+/// choice and refresh the row's ON/OFF label.
+pub fn aqw_crt_maybe_toggle<'gc>(context: &mut UpdateContext<'gc>, target: DisplayObject<'gc>) {
+    if aqw_crt_menu_disabled() {
+        return;
+    }
+    let marker = WStr::from_units(b"aqwCrt");
+    let mut cur = Some(target);
+    let mut hops = 0;
+    let hit = loop {
+        let Some(obj) = cur else {
+            return;
+        };
+        if let Some(name) = obj.name()
+            && name.len() >= marker.len()
+            && &name[..marker.len()] == marker
+        {
+            break obj;
+        }
+        if hops == 4 {
+            return;
+        }
+        hops += 1;
+        cur = obj.parent();
+    };
+
+    let on = !ruffle_render::backend::aqw_crt_filter_enabled();
+    ruffle_render::backend::set_aqw_crt_filter(on);
+    aqw_crt_persist(on);
+    if let Some(panel) = hit.parent().and_then(|p| p.as_container())
+        && let Some(value) = panel.child_by_name(WStr::from_units(b"aqwCrtValue"), false)
+    {
+        let text: &WStr = if on {
+            WStr::from_units(b"ON")
+        } else {
+            WStr::from_units(b"OFF")
+        };
+        aqw_crt_set_row_text(context, value, text);
+    }
+    if aqw_diagnostics_enabled() {
+        tracing::info!(target: "aqw_diag", "AQW_CRT: toggled {}", if on { "ON" } else { "OFF" });
+    }
+}
+
 /// Indication of what frame `run_frame` should jump to next.
 #[derive(PartialEq, Eq)]
 enum NextFrame {

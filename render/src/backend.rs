@@ -660,3 +660,44 @@ pub struct ViewportDimensions {
     /// to device-scale pixels.
     pub scale_factor: f64,
 }
+
+/// Whether the AQW CRT present filter is active. Written by the player when
+/// the in-game "CRT Filter" option row (injected into AQW's Options panel)
+/// is toggled, and read by the renderer each frame when choosing the final
+/// present pipeline. Lives here because it must be shared between `core`
+/// (which owns the toggle) and the wgpu backend (which owns the present),
+/// and both already depend on this crate.
+static AQW_CRT_FILTER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn aqw_crt_filter_enabled() -> bool {
+    AQW_CRT_FILTER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_aqw_crt_filter(enabled: bool) {
+    AQW_CRT_FILTER.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Barrel-warp strength of the CRT present filter (`RUFFLE_AQW_CRT_WARP`
+/// overrides). Shared here because the wgpu backend bakes it into the
+/// present shader while the desktop host applies the SAME forward warp to
+/// mouse coordinates - the screen shows content from warp(uv), so a click
+/// at uv is aiming at warp(uv); using one constant keeps clicks and pixels
+/// in lockstep.
+///
+/// Per-game default (from the launcher's env): AQW's wide 16:9 window made
+/// the 0.04 curvature read oddly (field feedback), so it gets a gentler
+/// 0.025; DragonFable keeps 0.04.
+pub fn aqw_crt_warp_strength() -> f32 {
+    use std::sync::OnceLock;
+    static WARP: OnceLock<f32> = OnceLock::new();
+    *WARP.get_or_init(|| {
+        let is_df = std::env::var("ARTIX_RUFFLE_GAME").is_ok_and(|v| v == "df")
+            || std::env::var("ARTIX_RUFFLE_GAME_ICON").is_ok_and(|v| v == "dragonfable");
+        std::env::var("RUFFLE_AQW_CRT_WARP")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|n| n.is_finite())
+            .map(|n| n.clamp(0.0, 0.25))
+            .unwrap_or(if is_df { 0.04 } else { 0.025 })
+    })
+}

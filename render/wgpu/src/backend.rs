@@ -864,6 +864,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     target.color_texture().sample_count(),
                     false,
                     false,
+                    false,
                     target.copy_uv_scale(),
                     &mut self.active_frame.command_encoder,
                 );
@@ -874,15 +875,20 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             self.active_frame.maybe_flush(&self.descriptors);
         }
 
+        // In-game "CRT Filter" option (toggled by core, present-only effect).
+        // Its shader embeds the Catmull-Rom resample, so it needs the linear
+        // sampler even on 1:1 presents and supersedes the sharp path.
+        let crt = ruffle_render::backend::aqw_crt_filter_enabled();
         self.surface.draw_commands_and_copy_to(
             frame_output.view(),
             // Linear filtering whenever the render surface and swapchain sizes
             // differ (downsample for SSAA, soft upscale for the sub-1× gate
             // fallback); an exact 1:1 present keeps the cheaper nearest copy.
-            self.supersample_effective != 1.0,
+            self.supersample_effective != 1.0 || crt,
             // Use the fixed Catmull-Rom resampler for both the sub-1× fallback
             // upscale and SSAA downsample. Exact 1:1 presents keep nearest.
-            self.supersample_effective != 1.0 && !aqw_sharp_upscale_disabled(),
+            self.supersample_effective != 1.0 && !aqw_sharp_upscale_disabled() && !crt,
+            crt,
             RenderTargetMode::FreshWithColor(wgpu::Color {
                 r: f64::from(clear.r) / 255.0,
                 g: f64::from(clear.g) / 255.0,
@@ -1085,6 +1091,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         );
         surface.draw_commands_and_copy_to(
             frame_output.view(),
+            false,
             false,
             false,
             RenderTargetMode::FreshWithTexture(target.get_texture()),
