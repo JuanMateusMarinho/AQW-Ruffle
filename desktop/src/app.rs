@@ -18,9 +18,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize, Size};
-use winit::event::{ElementState, Ime, KeyEvent, Modifiers, StartCause, WindowEvent};
+use winit::event::{ElementState, Ime, Modifiers, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Icon, WindowAttributes, WindowId};
 
 struct MainWindow {
@@ -219,18 +218,9 @@ impl MainWindow {
                     return;
                 }
 
-                // Handle escaping from fullscreen.
-                if let KeyEvent {
-                    state: ElementState::Pressed,
-                    logical_key: Key::Named(NamedKey::Escape),
-                    ..
-                } = event
-                {
-                    let _ = self
-                        .event_loop_proxy
-                        .send_event(RuffleEvent::ExitFullScreen);
-                }
-
+                // Escape deliberately does NOT exit fullscreen here: AQW uses
+                // Escape to clear the combat target, so only F11 (menu_bar
+                // shortcut) toggles fullscreen.
                 let key = winit_input_to_ruffle_key_descriptor(&event);
                 match event.state {
                     ElementState::Pressed => {
