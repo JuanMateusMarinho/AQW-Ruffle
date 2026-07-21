@@ -1,3 +1,4 @@
+use crate::artix::CursorKind;
 use crate::cli::OpenUrlMode;
 use crate::custom_event::RuffleEvent;
 use crate::gui::dialogs::message_dialog::MessageDialogConfiguration;
@@ -179,6 +180,20 @@ impl DesktopUiBackend {
             }
         } else {
             egui::CursorIcon::None
+        }
+    }
+
+    /// Which piece of custom artwork should stand in for the system cursor, if
+    /// any. Text keeps the system I-beam: it's a precision cursor whose shape
+    /// tells you where the caret lands, and the artwork has no equivalent.
+    pub fn artix_cursor(&self) -> Option<CursorKind> {
+        if !self.cursor_visible {
+            return None;
+        }
+        match self.preferred_cursor {
+            MouseCursor::Arrow => Some(CursorKind::Arrow),
+            MouseCursor::Hand | MouseCursor::Grab => Some(CursorKind::Hand),
+            MouseCursor::IBeam => None,
         }
     }
 }

@@ -1,3 +1,4 @@
+use crate::artix::CursorKind;
 use crate::backends::DesktopUiBackend;
 use crate::custom_event::RuffleEvent;
 use crate::gui::movie::{MovieView, MovieViewRenderer};
@@ -25,9 +26,9 @@ use url::Url;
 use wgpu::SurfaceError;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::WindowEvent;
-use winit::event_loop::EventLoopProxy;
+use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{ImePurpose as WinitImePurpose, Theme, Window};
+use winit::window::{CursorIcon, CustomCursor, ImePurpose as WinitImePurpose, Theme, Window};
 
 use super::dialogs::export_bundle_dialog::ExportBundleDialogConfiguration;
 use super::{DialogDescriptor, FilePicker};
@@ -50,6 +51,28 @@ pub struct GuiController {
     /// If this is set, we should not render the main menu.
     no_gui: bool,
     theme_controller: ThemeController,
+    /// Artwork standing in for the system cursors, built once at startup.
+    artix_cursors: Option<ArtixCursors>,
+    /// The custom cursor currently pushed to the window. `set_cursor` on every
+    /// frame flickers on Windows, so we only push it when it changes.
+    applied_cursor: Option<CustomCursor>,
+    /// egui pushes its own cursor only when its icon changes — and that clobbers
+    /// ours, so we watch for it and re-apply.
+    last_egui_cursor: Option<egui::CursorIcon>,
+}
+
+struct ArtixCursors {
+    arrow: CustomCursor,
+    hand: CustomCursor,
+}
+
+impl ArtixCursors {
+    fn get(&self, kind: CursorKind) -> &CustomCursor {
+        match kind {
+            CursorKind::Arrow => &self.arrow,
+            CursorKind::Hand => &self.hand,
+        }
+    }
 }
 
 impl GuiController {
@@ -175,7 +198,36 @@ impl GuiController {
             size,
             no_gui,
             theme_controller,
+            artix_cursors: None,
+            applied_cursor: None,
+            last_egui_cursor: None,
         })
+    }
+
+    /// Build the custom cursors. Separate from `new` because creating them needs
+    /// the `ActiveEventLoop`, which only the application handler holds.
+    pub fn init_custom_cursors(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(set) = crate::artix::custom_cursors() else {
+            return;
+        };
+        let build = |art: &crate::artix::CursorArt| {
+            match CustomCursor::from_rgba(
+                art.rgba.to_vec(),
+                art.size,
+                art.size,
+                art.hotspot_x,
+                art.hotspot_y,
+            ) {
+                Ok(source) => Some(event_loop.create_custom_cursor(source)),
+                Err(e) => {
+                    tracing::warn!("Custom cursor rejected, keeping the system one: {e}");
+                    None
+                }
+            }
+        };
+        if let (Some(arrow), Some(hand)) = (build(&set.arrow), build(&set.hand)) {
+            self.artix_cursors = Some(ArtixCursors { arrow, hand });
+        }
     }
 
     pub fn set_theme(&self, theme: Theme) {
@@ -412,16 +464,39 @@ impl GuiController {
             .repaint_delay;
 
         // If we're not in a UI, tell egui which cursor we prefer to use instead
+        let mut desired_cursor = None;
         if !self.egui_winit.egui_ctx().wants_pointer_input()
             && let Some(player) = player.as_deref()
         {
-            full_output.platform_output.cursor_icon =
-                <dyn Any>::downcast_ref::<DesktopUiBackend>(player.ui())
-                    .unwrap_or_else(|| panic!("UI Backend should be DesktopUiBackend"))
-                    .cursor();
+            let ui = <dyn Any>::downcast_ref::<DesktopUiBackend>(player.ui())
+                .unwrap_or_else(|| panic!("UI Backend should be DesktopUiBackend"));
+            full_output.platform_output.cursor_icon = ui.cursor();
+            desired_cursor = self
+                .artix_cursors
+                .as_ref()
+                .zip(ui.artix_cursor())
+                .map(|(cursors, kind)| cursors.get(kind).clone());
         }
+
+        let egui_cursor = full_output.platform_output.cursor_icon;
+        let egui_pushed_cursor = self.last_egui_cursor != Some(egui_cursor);
+        self.last_egui_cursor = Some(egui_cursor);
         self.egui_winit
             .handle_platform_output(&self.window, full_output.platform_output);
+
+        // egui just pushed its own icon if it changed, so re-apply ours over it.
+        // On release we hand the cursor back: either egui already pushed the icon
+        // it wants this frame, or it didn't change, in which case it's the
+        // default it drew the movie area with.
+        if desired_cursor != self.applied_cursor || (desired_cursor.is_some() && egui_pushed_cursor)
+        {
+            match &desired_cursor {
+                Some(cursor) => self.window.set_cursor(cursor.clone()),
+                None if !egui_pushed_cursor => self.window.set_cursor(CursorIcon::Default),
+                None => {}
+            }
+            self.applied_cursor = desired_cursor;
+        }
 
         let clipped_primitives = self
             .egui_winit

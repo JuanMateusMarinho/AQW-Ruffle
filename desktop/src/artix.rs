@@ -107,6 +107,123 @@ pub fn window_title() -> String {
         .unwrap_or_else(|| ArtixGame::Aqw.title().to_string())
 }
 
+/// A pre-baked mouse cursor bitmap: `size` x `size` straight (non-premultiplied)
+/// RGBA with a top-left origin, and the hotspot in that same pixel space.
+pub struct CursorArt {
+    pub rgba: &'static [u8],
+    pub size: u16,
+    pub hotspot_x: u16,
+    pub hotspot_y: u16,
+}
+
+/// The two shapes the player's `MouseCursor` is drawn with.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CursorKind {
+    Arrow,
+    Hand,
+}
+
+pub struct CursorSet {
+    /// Nominal size the set is picked by. The arrow's own bitmap is smaller: fit
+    /// to the same height it reads as much bigger than the hand, being a solid
+    /// triangle against a narrow gauntlet.
+    pub size: u16,
+    pub arrow: CursorArt,
+    pub hand: CursorArt,
+}
+
+/// Baked from the source artwork by `.agents-local/make_cursor_rgba.py`, which
+/// also prints these sizes and hotspots (the arrow's tip and the gauntlet's
+/// fingertip). The OS draws cursors at their bitmap size, so the sizes here are
+/// the whole scale range on offer rather than a DPI ladder.
+const CURSOR_SETS: &[CursorSet] = &[
+    CursorSet {
+        size: 32,
+        arrow: CursorArt {
+            rgba: include_bytes!("../assets/aqw-cursor-arrow-32.rgba"),
+            size: 26,
+            hotspot_x: 3,
+            hotspot_y: 0,
+        },
+        hand: CursorArt {
+            rgba: include_bytes!("../assets/aqw-cursor-hand-32.rgba"),
+            size: 32,
+            hotspot_x: 13,
+            hotspot_y: 0,
+        },
+    },
+    CursorSet {
+        size: 40,
+        arrow: CursorArt {
+            rgba: include_bytes!("../assets/aqw-cursor-arrow-40.rgba"),
+            size: 32,
+            hotspot_x: 3,
+            hotspot_y: 0,
+        },
+        hand: CursorArt {
+            rgba: include_bytes!("../assets/aqw-cursor-hand-40.rgba"),
+            size: 40,
+            hotspot_x: 16,
+            hotspot_y: 0,
+        },
+    },
+    CursorSet {
+        size: 48,
+        arrow: CursorArt {
+            rgba: include_bytes!("../assets/aqw-cursor-arrow-48.rgba"),
+            size: 38,
+            hotspot_x: 5,
+            hotspot_y: 0,
+        },
+        hand: CursorArt {
+            rgba: include_bytes!("../assets/aqw-cursor-hand-48.rgba"),
+            size: 48,
+            hotspot_x: 20,
+            hotspot_y: 0,
+        },
+    },
+    CursorSet {
+        size: 64,
+        arrow: CursorArt {
+            rgba: include_bytes!("../assets/aqw-cursor-arrow-64.rgba"),
+            size: 51,
+            hotspot_x: 7,
+            hotspot_y: 0,
+        },
+        hand: CursorArt {
+            rgba: include_bytes!("../assets/aqw-cursor-hand-64.rgba"),
+            size: 64,
+            hotspot_x: 27,
+            hotspot_y: 0,
+        },
+    },
+];
+
+const DEFAULT_CURSOR_SIZE: u16 = 48;
+
+/// The cursor artwork for the running game, or `None` to leave the system
+/// cursors alone. `RUFFLE_AQW_NO_CUSTOM_CURSOR` (or a size of `0`) turns it off
+/// without a rebuild; `RUFFLE_AQW_CURSOR_SIZE` picks the closest baked size.
+pub fn custom_cursors() -> Option<&'static CursorSet> {
+    // Unknown means the test build, which stands in for AQW like the title does.
+    if !matches!(current_game().unwrap_or(ArtixGame::Aqw), ArtixGame::Aqw) {
+        return None;
+    }
+    if env::var_os("RUFFLE_AQW_NO_CUSTOM_CURSOR").is_some() {
+        return None;
+    }
+    let wanted = env::var("RUFFLE_AQW_CURSOR_SIZE")
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .unwrap_or(DEFAULT_CURSOR_SIZE);
+    if wanted == 0 {
+        return None;
+    }
+    CURSOR_SETS
+        .iter()
+        .min_by_key(|set| set.size.abs_diff(wanted))
+}
+
 pub fn window_icon_rgba() -> &'static [u8] {
     match current_game() {
         Some(ArtixGame::Aqw) => include_bytes!("../assets/aqw-window-32.rgba").as_slice(),

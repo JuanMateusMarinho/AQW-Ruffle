@@ -522,6 +522,7 @@ impl ApplicationHandler<RuffleEvent> for App {
                 no_gui,
             )
             .expect("GUI controller should be created");
+            gui.init_custom_cursors(event_loop);
 
             let mut player = PlayerController::new(
                 event_loop_proxy.clone(),
