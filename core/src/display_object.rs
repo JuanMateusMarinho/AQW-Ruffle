@@ -1191,14 +1191,33 @@ fn aqw_vram_valve_disabled() -> bool {
 }
 
 /// Refresh `AQW_VRAM_PRESSURE` from the renderer's process GPU-memory report.
+/// Offscreen render-target pool retention, in MB, that drives the GPU-pressure
+/// valve. Measured in the field: a full room with event FX retains 118-255 MB,
+/// while `castleparty` (the pathological map) retains 2458 MB - a ~10x gap, so
+/// the engage/release band sits in the empty valley between the two regimes and
+/// no observed scenario idles inside it.
+const AQW_POOL_SOFT_MB: u64 = 600;
+const AQW_POOL_SOFT_RELEASE_MB: u64 = 450;
+const AQW_POOL_HARD_MB: u64 = 1500;
+const AQW_POOL_HARD_RELEASE_MB: u64 = 1200;
+
 /// Returns `(used_mb, budget_mb)` for the sweep log (`(0, 0)` if unavailable).
-/// Hysteresis keeps the valve from flapping: soft engages at 92% of the OS
-/// budget and releases below 87%; hard engages at 96% and drops back to soft
-/// below 92%. The thresholds sit deliberately close to the cliff: the driver
-/// keeps freed memory cached in its arenas, so a session idles near 90% all
-/// the time without actually paging - engaging there would leave combat FX
-/// permanently stale (weapon art drawn at its stale anchor, visibly detached
-/// from the swing).
+///
+/// The valve is driven by how many bytes the offscreen render-target pool is
+/// retaining, NOT by the OS video-memory percentage. The DXGI reading is kept
+/// for the log only: `CurrentUsage` reports the driver's committed arena, which
+/// parks at a constant (measured: 4281 MB for a whole session, unmoved by room
+/// changes) while `Budget` fluctuates with unrelated system load. Dividing a
+/// parked constant by a noisy denominator made the valve engage on noise, and
+/// engaging clamps large redraws to zero - which is what left combat FX stale
+/// in ordinary full rooms (measured: `redraw_deferred` 736-1300 and
+/// `stale_fallback` 160-430 while engaged, both 0 with the valve released).
+/// Pool retention, by contrast, is our own number, responds to actual load, and
+/// separates the two regimes cleanly.
+///
+/// Hysteresis keeps the valve from flapping: the squeeze it triggers lowers the
+/// very quantity being measured, so engage and release thresholds are kept a
+/// wide band apart.
 fn update_aqw_vram_pressure(renderer: &mut dyn RenderBackend) -> (u64, u64) {
     use std::sync::atomic::Ordering;
 
@@ -1206,39 +1225,41 @@ fn update_aqw_vram_pressure(renderer: &mut dyn RenderBackend) -> (u64, u64) {
         AQW_VRAM_PRESSURE.store(0, Ordering::Relaxed);
         return (0, 0);
     }
-    let Some((used, budget)) = renderer.gpu_memory_info() else {
+    // Diagnostics only - see the note above on why this is not the trigger.
+    let (used_mb, budget_mb) = renderer
+        .gpu_memory_info()
+        .map(|(used, budget)| (used / (1024 * 1024), budget / (1024 * 1024)))
+        .unwrap_or((0, 0));
+
+    let Some((_allocs, _frees, retained)) = renderer.offscreen_pool_stats() else {
         AQW_VRAM_PRESSURE.store(0, Ordering::Relaxed);
-        return (0, 0);
+        return (used_mb, budget_mb);
     };
-    let pct = if budget == 0 {
-        0
-    } else {
-        used.saturating_mul(100) / budget
-    };
+    let retained_mb = retained / (1024 * 1024);
     let previous = AQW_VRAM_PRESSURE.load(Ordering::Relaxed);
     let level = match previous {
         0 => {
-            if pct >= 96 {
+            if retained_mb >= AQW_POOL_HARD_MB {
                 2
-            } else if pct >= 92 {
+            } else if retained_mb >= AQW_POOL_SOFT_MB {
                 1
             } else {
                 0
             }
         }
         1 => {
-            if pct >= 96 {
+            if retained_mb >= AQW_POOL_HARD_MB {
                 2
-            } else if pct < 87 {
+            } else if retained_mb < AQW_POOL_SOFT_RELEASE_MB {
                 0
             } else {
                 1
             }
         }
         _ => {
-            if pct < 87 {
+            if retained_mb < AQW_POOL_SOFT_RELEASE_MB {
                 0
-            } else if pct < 92 {
+            } else if retained_mb < AQW_POOL_HARD_RELEASE_MB {
                 1
             } else {
                 2
@@ -1247,15 +1268,15 @@ fn update_aqw_vram_pressure(renderer: &mut dyn RenderBackend) -> (u64, u64) {
     };
     if level != previous {
         tracing::warn!(
-            used_mb = used / (1024 * 1024),
-            budget_mb = budget / (1024 * 1024),
-            pct,
+            pool_mb = retained_mb,
+            used_mb,
+            budget_mb,
             level,
             "GPU memory pressure changed; adjusting cache redraw quotas"
         );
     }
     AQW_VRAM_PRESSURE.store(level, Ordering::Relaxed);
-    (used / (1024 * 1024), budget / (1024 * 1024))
+    (used_mb, budget_mb)
 }
 
 /// Per-sweep-window counters for the AQW dirty-cache budget, reported by

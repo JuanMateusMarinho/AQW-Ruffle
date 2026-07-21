@@ -260,6 +260,22 @@ const OFFSCREEN_POOL_EVICT_BYTES_PER_FRAME: u64 = 32 * 1024 * 1024;
 /// pressure at all; see `TexturePool::maintain`.
 const OFFSCREEN_POOL_PRESSURE_EVICT_BYTES_PER_FRAME: u64 = 128 * 1024 * 1024;
 
+/// Pool retention (MB) that engages the GPU-pressure valve. Mirrors the core
+/// redraw valve in `display_object.rs` - keep both sides in step.
+///
+/// Measured in the field: an ordinary full room with event FX retains
+/// 118-255 MB (at or under `OFFSCREEN_POOL_BUDGET_BYTES`), while `castleparty`
+/// - the pathological map - retains 2458 MB, roughly 10x the budget. The
+/// engage/release band therefore sits in the empty valley between the two
+/// regimes. Retention replaced the OS video-memory percentage as the trigger:
+/// DXGI `CurrentUsage` parks at a constant while `Budget` moves with unrelated
+/// system load, so the old valve engaged on noise and starved combat FX in
+/// rooms that were never under real pressure.
+const POOL_PRESSURE_SOFT_MB: u64 = 600;
+const POOL_PRESSURE_SOFT_RELEASE_MB: u64 = 450;
+const POOL_PRESSURE_HARD_MB: u64 = 1500;
+const POOL_PRESSURE_HARD_RELEASE_MB: u64 = 1200;
+
 impl WgpuRenderBackend<SwapChainTarget> {
     #[cfg(target_family = "wasm")]
     pub async fn for_canvas(
@@ -917,26 +933,42 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         // whole pool at once, which stalled a single frame.
         let pool_budget = OFFSCREEN_POOL_BUDGET_BYTES;
         let mut evict_per_frame = OFFSCREEN_POOL_EVICT_BYTES_PER_FRAME;
-        #[cfg(windows)]
-        if !vram_valve_disabled()
-            && let Some((used, budget)) = gpu_memory::query_cached()
-            && budget > 0
-        {
-            // Hysteresis (engage 96/92, release 92/87, mirroring the core
-            // redraw valve): the drain itself moves the VRAM reading, so a
-            // raw threshold flaps — squeeze, reading falls, squeeze releases,
-            // everything reallocates, reading spikes, repeat (the 13/07
-            // oscillation).
-            let pct = used.saturating_mul(100) / budget;
+        if !vram_valve_disabled() {
+            // Driven by what the pool itself retains (see the constants above),
+            // mirroring the core redraw valve so both sides agree. Hysteresis
+            // stays wide because the squeeze lowers the very quantity measured:
+            // squeeze, retention falls, squeeze releases, everything
+            // reallocates, retention spikes, repeat (the 13/07 oscillation).
+            let retained_mb = self.offscreen_texture_pool.retained_bytes() / (1024 * 1024);
             let prev = self.pool_vram_pressure;
-            self.pool_vram_pressure = if pct >= 96 {
-                2
-            } else if pct >= 92 {
-                if prev == 2 { 2 } else { 1 }
-            } else if pct >= 87 {
-                prev.min(1)
-            } else {
-                0
+            self.pool_vram_pressure = match prev {
+                0 => {
+                    if retained_mb >= POOL_PRESSURE_HARD_MB {
+                        2
+                    } else if retained_mb >= POOL_PRESSURE_SOFT_MB {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                1 => {
+                    if retained_mb >= POOL_PRESSURE_HARD_MB {
+                        2
+                    } else if retained_mb < POOL_PRESSURE_SOFT_RELEASE_MB {
+                        0
+                    } else {
+                        1
+                    }
+                }
+                _ => {
+                    if retained_mb < POOL_PRESSURE_SOFT_RELEASE_MB {
+                        0
+                    } else if retained_mb < POOL_PRESSURE_HARD_RELEASE_MB {
+                        1
+                    } else {
+                        2
+                    }
+                }
             };
             if self.pool_vram_pressure > 0 {
                 evict_per_frame = OFFSCREEN_POOL_PRESSURE_EVICT_BYTES_PER_FRAME;

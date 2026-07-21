@@ -34,6 +34,13 @@ const POOL_HARD_RESET_AFTER_TICKS: u64 = 96;
 /// repeating it faster just turns the hitch periodic.
 const POOL_HARD_RESET_COOLDOWN_TICKS: u64 = 600;
 
+/// How long pressure must stay released before the escape reset re-arms.
+/// The reset drains the pool, and pool retention is exactly what the valve
+/// measures, so the reading always dips right after a reset — even a futile
+/// one that live demand is about to undo. Requiring a sustained release keeps
+/// a one-shot escape from becoming a periodic drain.
+const POOL_EPISODE_END_TICKS: u64 = 240;
+
 /// Round an offscreen render-target dimension up to a coarse bucket (powers
 /// of two up to 1024, multiples of 512 above). Animated filtered content
 /// changes bounds by a few pixels every frame; exact-size pool keys make
@@ -73,7 +80,15 @@ pub struct TexturePool {
     /// back under budget) pressure releases and re-arms it; when the live
     /// demand instantly refills the pool it does NOT re-fire — a futile
     /// reset repeated on cooldown is just a periodic 2 GB hitch.
+    ///
+    /// Re-arming requires a *sustained* release (`POOL_EPISODE_END_TICKS`),
+    /// not an instantaneous one: the reset drains the pool, and the valve now
+    /// measures pool retention, so the tick right after a reset always looks
+    /// like a success.
     hard_reset_fired_this_episode: bool,
+    /// Consecutive maintenance ticks spent below hard pressure; gates
+    /// re-arming `hard_reset_fired_this_episode`.
+    low_pressure_streak: u64,
 }
 
 impl TexturePool {
@@ -151,6 +166,7 @@ impl TexturePool {
         // At most once per pressure episode — see `hard_reset_fired_this_episode`.
         if vram_pressure == 2 {
             self.hard_pressure_streak += 1;
+            self.low_pressure_streak = 0;
             if !self.hard_reset_fired_this_episode
                 && self.hard_pressure_streak >= POOL_HARD_RESET_AFTER_TICKS
                 && now >= self.hard_reset_cooldown_until
@@ -165,7 +181,18 @@ impl TexturePool {
             }
         } else {
             self.hard_pressure_streak = 0;
-            self.hard_reset_fired_this_episode = false;
+            // Re-arm only after pressure has STAYED released. Draining the pool
+            // is what the reset does, and pool retention is what the valve
+            // reads, so the instant after a reset the signal always says
+            // "recovered" — even when the reset was futile and live demand is
+            // about to refill it. Re-arming on that reading turns the one-shot
+            // escape into a periodic drain, and recycling a drained target that
+            // a deferred cache still references paints one object with
+            // another's art.
+            self.low_pressure_streak += 1;
+            if self.low_pressure_streak >= POOL_EPISODE_END_TICKS {
+                self.hard_reset_fired_this_episode = false;
+            }
         }
 
         let mut free_left = max_free_bytes;
