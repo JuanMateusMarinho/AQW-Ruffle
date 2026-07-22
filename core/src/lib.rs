@@ -9,7 +9,7 @@
 mod display_object;
 pub use display_object::{
     DisplayObject, DisplayObjectContainer, Stage, StageAlign, StageDisplayState, StageScaleMode,
-    TDisplayObject, TDisplayObjectContainer,
+    TDisplayObject, TDisplayObjectContainer, aqw_crt_toggle_external,
 };
 
 #[macro_use]

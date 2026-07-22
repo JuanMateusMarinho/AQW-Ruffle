@@ -1,5 +1,6 @@
 use crate::buffer_builder::BufferBuilder;
-use crate::buffer_pool::{BufferPool, TexturePool};
+use crate::buffer_pool::{BufferPool, POOL_IDLE_EVICT_TICKS, TexturePool};
+use crate::content_bounds::ContentBounds;
 use crate::context3d::WgpuContext3D;
 use crate::dynamic_transforms::DynamicTransforms;
 use crate::filters::FilterSource;
@@ -38,9 +39,27 @@ use swf::Color;
 use tracing::instrument;
 use wgpu::SubmissionIndex;
 
-fn aqw_diagnostics_enabled() -> bool {
+pub(crate) fn aqw_diagnostics_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
+}
+
+/// Wall time spent building the frame's command buffers, and then handing them
+/// to the driver, since the last read. Separating the two says which side is
+/// the cap: encoding is CPU (hundreds of blend passes each cost a render pass
+/// and a bind group), while submit absorbs the GPU actually being behind.
+static RENDER_ENCODE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RENDER_SUBMIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RENDER_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+fn process_commit_mb() -> u64 {
+    gpu_memory::process_commit().unwrap_or(0) / (1024 * 1024)
+}
+
+#[cfg(not(windows))]
+fn process_commit_mb() -> u64 {
+    0
 }
 
 /// Process GPU-memory usage and OS-granted budget, in bytes, sampled via DXGI
@@ -97,6 +116,30 @@ mod gpu_memory {
             best
         }
     }
+
+    /// This process's private commit, in bytes -- the number Task Manager's
+    /// "Memory" column understates and that the field notes insist on reading
+    /// instead. A GPU that is well inside its budget says nothing about this:
+    /// the two ran out independently in the crowded-room case.
+    #[cfg(windows)]
+    pub fn process_commit() -> Option<u64> {
+        use windows::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        };
+        use windows::Win32::System::Threading::GetCurrentProcess;
+
+        unsafe {
+            let mut counters = PROCESS_MEMORY_COUNTERS::default();
+            GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                &mut counters,
+                size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            )
+            .ok()?;
+            Some(counters.PagefileUsage as u64)
+        }
+    }
+
 }
 
 /// Kill-switch shared with the core-side valve: `RUFFLE_AQW_NO_VRAM_VALVE`
@@ -271,6 +314,71 @@ const OFFSCREEN_POOL_PRESSURE_EVICT_BYTES_PER_FRAME: u64 = 128 * 1024 * 1024;
 /// DXGI `CurrentUsage` parks at a constant while `Budget` moves with unrelated
 /// system load, so the old valve engaged on noise and starved combat FX in
 /// rooms that were never under real pressure.
+/// Retention budget for the main-surface pool.
+///
+/// What that pool actually needs at once is small — the scene target plus the
+/// blend/mask/filter targets live in the frame being drawn, a few tens of MB.
+/// The gigabytes it accumulated were idle entries in sizes no longer asked
+/// for, kept because nothing ever trimmed it. This is set at the offscreen
+/// pool's budget: far above the live working set, so ordinary reuse still
+/// hits, and far below the point where the process threatens its OS grant.
+///
+/// Deliberately not lower. Trimming to near the live set would re-allocate the
+/// same sizes on the next frame and feed the driver's deferred-destruction
+/// backlog — the drain/realloc treadmill documented in `TexturePool::maintain`.
+///
+/// 256 MB was tried first and was too tight: a crowded room's live set measured
+/// 1.4-1.8 GB, so the pool spent every frame cutting below what it was about to
+/// need again, and `tex_allocs` went from ~0 per sweep window to dozens. The
+/// budget only has to beat the ratchet (4.4 GB retained, which pushed the
+/// process over its ~7 GB video-memory grant and started WDDM paging); it does
+/// not have to squeeze. This leaves room for the working set to sit
+/// undisturbed while still capping growth well under the grant.
+/// `RUFFLE_AQW_SURFACE_POOL_BUDGET_MB` overrides, for tuning without a rebuild.
+fn surface_pool_budget_bytes() -> u64 {
+    static BUDGET: OnceLock<u64> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("RUFFLE_AQW_SURFACE_POOL_BUDGET_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(2048)
+            * 1024
+            * 1024
+    })
+}
+
+/// How long a main-surface entry may sit unused before the long-idle pass
+/// frees it, in maintenance ticks (≈ frames).
+///
+/// The offscreen pool's 120 (5s at 24fps) is wrong here. That pass runs
+/// *regardless of the retention budget*, and this pool's sizes recur: a target
+/// goes unused while a player walks off or an animation changes, then is
+/// wanted again. Freeing on a 5s timer produced continuous
+/// allocate/free — `tex_allocs` per sweep window went from ~0 to dozens — which
+/// is the expensive path, since allocating against the driver's
+/// deferred-destruction backlog stalls synchronously. Raising the budget does
+/// not help, because this pass ignores it.
+///
+/// So hold sizes for much longer and let the budget alone cap growth: the goal
+/// was never to reclaim aggressively, only to stop the unbounded ratchet.
+/// `RUFFLE_AQW_SURFACE_POOL_IDLE_TICKS` overrides.
+fn surface_pool_idle_ticks() -> u64 {
+    static TICKS: OnceLock<u64> = OnceLock::new();
+    *TICKS.get_or_init(|| {
+        std::env::var("RUFFLE_AQW_SURFACE_POOL_IDLE_TICKS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(1800)
+    })
+}
+
+/// Kill-switch: `RUFFLE_AQW_NO_SURFACE_POOL_TRIM` restores the previous
+/// behavior, where the main-surface pool was never trimmed.
+fn surface_pool_trim_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_SURFACE_POOL_TRIM").is_some())
+}
+
 const POOL_PRESSURE_SOFT_MB: u64 = 600;
 const POOL_PRESSURE_SOFT_RELEASE_MB: u64 = 450;
 const POOL_PRESSURE_HARD_MB: u64 = 1500;
@@ -479,8 +587,13 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             ));
         }
 
+        let mut bounds = ContentBounds::EMPTY;
         for draw in lyon_mesh.draws {
             let draw_id = draws.len();
+            // Taken before the draw is moved into `PendingDraw`. Vertices are
+            // already in pixels, so this is the shape's local extent as-is.
+            let draw_bounds =
+                ContentBounds::from_points(draw.vertices.iter().map(|v| (v.x, v.y)));
             if let Some(draw) = PendingDraw::new(
                 self,
                 bitmap_source,
@@ -492,6 +605,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
                 &mut index_buffer,
             ) {
                 draws.push(draw);
+                bounds.union(draw_bounds);
             }
         }
 
@@ -520,6 +634,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             draws,
             vertex_buffer,
             index_buffer,
+            bounds,
         }
     }
 
@@ -752,6 +867,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         commands: CommandList,
         cache_entries: Vec<BitmapCacheEntry>,
     ) {
+        let encode_started = std::time::Instant::now();
         let frame_output = match self.target.get_next_texture() {
             Ok(frame) => frame,
             Err(e) => {
@@ -922,8 +1038,19 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         );
         self.active_frame.staging_belt.finish();
 
+        let submit_started = std::time::Instant::now();
         self.active_frame
             .submit_for_target(&self.descriptors, &self.target, frame_output);
+        {
+            use std::sync::atomic::Ordering;
+            let submit_ns = submit_started.elapsed().as_nanos() as u64;
+            RENDER_ENCODE_NS.fetch_add(
+                (encode_started.elapsed().as_nanos() as u64).saturating_sub(submit_ns),
+                Ordering::Relaxed,
+            );
+            RENDER_SUBMIT_NS.fetch_add(submit_ns, Ordering::Relaxed);
+            RENDER_FRAMES.fetch_add(1, Ordering::Relaxed);
+        }
         // Reuse offscreen render targets across frames instead of reallocating
         // them every frame; recreating the pool every frame caused dozens of
         // large targets to be allocated per frame, ballooning driver memory to
@@ -974,8 +1101,39 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 evict_per_frame = OFFSCREEN_POOL_PRESSURE_EVICT_BYTES_PER_FRAME;
             }
         }
-        self.offscreen_texture_pool
-            .maintain(pool_budget, evict_per_frame, self.pool_vram_pressure);
+        self.offscreen_texture_pool.maintain(
+            pool_budget,
+            evict_per_frame,
+            self.pool_vram_pressure,
+            POOL_IDLE_EVICT_TICKS,
+        );
+
+        // The main-surface pool needs the same treatment, and until now got
+        // none: it was only ever rebuilt on a viewport change, so across a
+        // session it ratcheted upwards and never returned a texture. Measured
+        // in a crowded room: 4.4 GB retained here against 96-248 MB in the
+        // offscreen pool, with `tex_free` at zero for the entire session — the
+        // process ended up over its OS video-memory budget (7.9 GB used
+        // against a ~7.0 GB grant) and WDDM paged it back to system RAM, which
+        // is what dropped the room to 3-4 fps.
+        //
+        // Always at pressure 0, i.e. the gradual stance only: age out the
+        // long-idle, then trim back to the budget while sparing anything used
+        // in the last few frames. The aggressive stances (and the full escape
+        // drain) exist for the offscreen pool, where the redraw valve's
+        // deferred caches keep references the pool can't see. Nothing survives
+        // a frame here — the scene target and its nested blend/mask/filter
+        // targets are all built and dropped within one — so there is no
+        // deferred reference to recycle out from under, and no reason to reach
+        // for a stance that trades correctness for reclaim.
+        if !surface_pool_trim_disabled() {
+            self.texture_pool.maintain(
+                surface_pool_budget_bytes(),
+                OFFSCREEN_POOL_EVICT_BYTES_PER_FRAME,
+                0,
+                surface_pool_idle_ticks(),
+            );
+        }
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -1171,6 +1329,40 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
 
     fn offscreen_pool_stats(&self) -> Option<(u64, u64, u64)> {
         Some(self.offscreen_texture_pool.stats())
+    }
+
+    fn surface_pool_stats(&self) -> Option<(u64, u64, u64)> {
+        Some(self.texture_pool.stats())
+    }
+
+    fn surface_pool_largest(&self, limit: usize) -> Vec<(u32, u32, usize, u64)> {
+        self.texture_pool.largest_buckets(limit)
+    }
+
+    fn take_complex_blend_counts(&mut self) -> Vec<(&'static str, u64)> {
+        crate::blend::take_complex_blend_counts()
+    }
+
+    fn take_blend_coverage(&mut self) -> (u64, [u64; 4]) {
+        crate::blend::take_blend_coverage()
+    }
+
+    fn take_blend_alloc(&mut self) -> u64 {
+        crate::blend::take_blend_alloc()
+    }
+
+    fn take_blend_grouping(&mut self) -> (u64, u64, u64) {
+        crate::blend::take_blend_grouping()
+    }
+
+    fn take_render_timings(&mut self) -> (u64, u64, u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            RENDER_ENCODE_NS.swap(0, Ordering::Relaxed) / 1_000_000,
+            RENDER_SUBMIT_NS.swap(0, Ordering::Relaxed) / 1_000_000,
+            RENDER_FRAMES.swap(0, Ordering::Relaxed),
+            process_commit_mb(),
+        )
     }
 
     fn apply_filter(

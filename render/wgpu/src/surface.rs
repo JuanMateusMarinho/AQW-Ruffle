@@ -1,8 +1,10 @@
 mod commands;
 pub mod target;
 
+use crate::Transforms;
 use crate::backend::RenderTargetMode;
 use crate::blend::ComplexBlend;
+use crate::buffer_builder::BufferBuilder;
 use crate::buffer_pool::TexturePool;
 use crate::dynamic_transforms::DynamicTransforms;
 use crate::filters::FilterSource;
@@ -14,9 +16,16 @@ use crate::{Descriptors, MaskState, Pipelines};
 use ruffle_render::commands::CommandList;
 use ruffle_render::pixel_bender_support::{ImageInputTexture, PixelBenderShaderArgument};
 use ruffle_render::quality::StageQuality;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use target::CommandTarget;
 use tracing::instrument;
+
+/// Kill-switch: `RUFFLE_AQW_NO_BLEND_SCISSOR` restores full-surface complex
+/// blend passes, for field A/B without a rebuild.
+fn blend_scissor_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_BLEND_SCISSOR").is_some())
+}
 
 use crate::utils::run_copy_pipeline;
 
@@ -31,6 +40,10 @@ pub struct Surface {
     sample_count: u32,
     pipelines: Arc<Pipelines>,
     format: wgpu::TextureFormat,
+    /// Where this surface sits inside the coordinate space its commands are
+    /// expressed in. Non-zero for a blend target sized to its content instead
+    /// of the whole screen, so that drawing subtracts it to land in range.
+    origin: (u32, u32),
 }
 
 impl Surface {
@@ -59,7 +72,14 @@ impl Surface {
             sample_count,
             pipelines,
             format: frame_buffer_format,
+            origin: (0, 0),
         }
+    }
+
+    /// Places this surface at `origin` in its commands' coordinate space.
+    pub fn with_origin(mut self, origin: (u32, u32)) -> Self {
+        self.origin = origin;
+        self
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -138,7 +158,21 @@ impl Surface {
 
         let mut num_masks = 0;
         let mut mask_state = MaskState::NoMask;
-        let chunks = chunk_blends(
+        // Simulation of merging complex blend passes, measured before any of it
+        // is built. A run of blends that do not overlap could share one pass and
+        // one parent snapshot; anything overlapping has to stay ordered.
+        // Diagnostics-only: costs nothing in normal play, since the numbers are
+        // only ever read from the sweep, which needs the same flag.
+        let measure_blend_groups = crate::backend::aqw_diagnostics_enabled();
+        let mut blend_group: Vec<(u32, u32, u32, u32)> = Vec::new();
+        let mut blend_group_stencil = false;
+        let close_blend_group = |group: &mut Vec<(u32, u32, u32, u32)>| {
+            if !group.is_empty() {
+                crate::blend::note_blend_group(group.len() as u64);
+                group.clear();
+            }
+        };
+        let (chunks, content_bounds) = chunk_blends(
             commands,
             descriptors,
             staging_belt,
@@ -153,7 +187,9 @@ impl Surface {
                 layer => layer,
             },
             texture_pool,
+            self.origin,
         );
+        target.set_content_bounds(content_bounds);
 
         for chunk in chunks {
             match chunk {
@@ -162,6 +198,9 @@ impl Surface {
                     needs_stencil,
                     transforms,
                 } => {
+                    // Anything drawn between blends has to be visible to the
+                    // next one, so it ends the run.
+                    close_blend_group(&mut blend_group);
                     transforms.copy_to(
                         staging_belt,
                         &descriptors.device,
@@ -209,10 +248,16 @@ impl Surface {
                     texture,
                     blend_mode: ChunkBlendMode::Shader(shader),
                     needs_stencil,
+                    bounds: _,
+                    rect: _,
                 } => {
+                    close_blend_group(&mut blend_group);
                     assert!(!needs_stencil, "Shader blend mode not implemented in masks");
+                    // Not bounded: a PixelBender blend is arbitrary user code,
+                    // with no guarantee it leaves transparent source alone the
+                    // way the built-in blends do.
                     let parent_blend_buffer =
-                        target.update_blend_buffer(descriptors, texture_pool, draw_encoder);
+                        target.update_blend_buffer(descriptors, texture_pool, draw_encoder, None);
                     run_pixelbender_shader_impl(
                         descriptors,
                         shader,
@@ -245,6 +290,8 @@ impl Surface {
                     texture,
                     blend_mode: ChunkBlendMode::Complex(blend_mode),
                     needs_stencil,
+                    bounds,
+                    rect,
                 } => {
                     let parent = match blend_mode {
                         ComplexBlend::Alpha | ComplexBlend::Erase => {
@@ -260,8 +307,80 @@ impl Surface {
                         _ => &target,
                     };
 
-                    let parent_blend_buffer =
-                        parent.update_blend_buffer(descriptors, texture_pool, draw_encoder);
+                    // How much of the surface this pass is really about, logged
+                    // whether or not it gets bounded so the two can be compared
+                    // in the field.
+                    crate::blend::note_blend_coverage(
+                        bounds.clipped_area(target.width(), target.height()),
+                        target.width() as u64 * target.height() as u64,
+                    );
+
+                    // Confine the pass to the blended object instead of the
+                    // whole surface. Every complex blend shader discards where
+                    // `src.a <= 0`, and the source target was cleared to
+                    // transparent, so nothing outside `bounds` could ever have
+                    // been written -- this drops the fill, not the result. A
+                    // crowded room runs hundreds of these per frame, each
+                    // otherwise costing a full screen of blending.
+                    //
+                    // A pixel of slack absorbs rounding in the NDC-to-UV round
+                    // trip the blend shaders do.
+                    //
+                    // A content-sized target already covers only `rect`, so the
+                    // scissor is then just a clamp; it still matters for a
+                    // full-size one, and for narrowing the parent snapshot.
+                    //
+                    // `bounds` is in the commands' own coordinates, so it is
+                    // shifted into this target's space before clamping.
+                    let scissor = if blend_scissor_disabled() {
+                        // Kill-switch: the whole target, as before.
+                        Some((0, 0, target.width(), target.height()))
+                    } else {
+                        bounds
+                            .translated(-(self.origin.0 as f32), -(self.origin.1 as f32))
+                            .to_scissor(target.width(), target.height(), 1)
+                    };
+                    let Some(scissor) = scissor else {
+                        // Nothing covered: every fragment would have discarded.
+                        continue;
+                    };
+
+                    // Could this join the run, or does it have to read what the
+                    // run already wrote? Alpha and Erase composite against a
+                    // different target, so they never join.
+                    let overlaps = |a: &(u32, u32, u32, u32), b: &(u32, u32, u32, u32)| {
+                        a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3
+                    };
+                    let separate_parent =
+                        matches!(blend_mode, ComplexBlend::Alpha | ComplexBlend::Erase);
+                    if measure_blend_groups {
+                        if separate_parent
+                            // A pass is configured with or without a stencil
+                            // attachment; members have to agree.
+                            || (!blend_group.is_empty() && blend_group_stencil != needs_stencil)
+                            || blend_group.iter().any(|other| overlaps(other, &scissor))
+                            // Bound the pairwise scan; a run this long already
+                            // got the win, and the cost is quadratic.
+                            || blend_group.len() >= 128
+                        {
+                            close_blend_group(&mut blend_group);
+                        }
+                        if separate_parent {
+                            crate::blend::note_blend_group(1);
+                        } else {
+                            blend_group_stencil = needs_stencil;
+                            blend_group.push(scissor);
+                        }
+                    }
+
+                    // Only the scissored region is read back, so only it needs
+                    // snapshotting for the shader's `dst`.
+                    let parent_blend_buffer = parent.update_blend_buffer(
+                        descriptors,
+                        texture_pool,
+                        draw_encoder,
+                        Some(scissor),
+                    );
 
                     let blend_bind_group =
                         descriptors
@@ -300,6 +419,31 @@ impl Surface {
                                 ],
                             });
 
+                    // The quad covers exactly the source's footprint, which is
+                    // what makes the unit-quad coordinate usable as its texture
+                    // coordinate however the target was sized.
+                    let mut blend_transforms =
+                        BufferBuilder::new_for_uniform(&descriptors.limits);
+                    blend_transforms.set_buffer_limit(dynamic_transforms.buffer.size());
+                    let blend_transform_offset = blend_transforms
+                        .add(&[Transforms {
+                            world_matrix: [
+                                [rect.2 as f32, 0.0, 0.0, 0.0],
+                                [0.0, rect.3 as f32, 0.0, 0.0],
+                                [0.0, 0.0, 1.0, 0.0],
+                                [rect.0 as f32, rect.1 as f32, 0.0, 1.0],
+                            ],
+                            mult_color: [1.0, 1.0, 1.0, 1.0],
+                            add_color: [0.0, 0.0, 0.0, 0.0],
+                        }])
+                        .expect("A single transform always fits an empty buffer");
+                    blend_transforms.copy_to(
+                        staging_belt,
+                        &descriptors.device,
+                        draw_encoder,
+                        &dynamic_transforms.buffer,
+                    );
+
                     let mut render_pass =
                         draw_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: create_debug_label!(
@@ -321,6 +465,8 @@ impl Surface {
                             ..Default::default()
                         });
                     render_pass.set_bind_group(0, target.globals().bind_group(), &[]);
+                    let (scissor_x, scissor_y, scissor_w, scissor_h) = scissor;
+                    render_pass.set_scissor_rect(scissor_x, scissor_y, scissor_w, scissor_h);
 
                     if needs_stencil {
                         match mask_state {
@@ -344,7 +490,11 @@ impl Surface {
                         );
                     }
 
-                    render_pass.set_bind_group(1, target.whole_frame_bind_group(descriptors), &[0]);
+                    render_pass.set_bind_group(
+                        1,
+                        &dynamic_transforms.bind_group,
+                        &[blend_transform_offset.start as wgpu::DynamicOffset],
+                    );
                     render_pass.set_bind_group(2, &blend_bind_group, &[]);
 
                     render_pass.set_vertex_buffer(0, descriptors.quad.vertices_pos.slice(..));
@@ -357,6 +507,8 @@ impl Surface {
                 }
             }
         }
+
+        close_blend_group(&mut blend_group);
 
         // If nothing happened, ensure it's cleared so we don't operate on garbage data
         target.ensure_cleared(draw_encoder);

@@ -1,4 +1,5 @@
 use enum_map::Enum;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ruffle_render::{commands::RenderBlendMode, pixel_bender::PixelBenderShaderHandle};
 use swf::BlendMode;
@@ -14,6 +15,176 @@ pub enum ComplexBlend {
     Erase,      // Can't be trivial, requires layer tracking
     Overlay,    // Can't be trivial, big math expression
     HardLight,  // Can't be trivial, big math expression
+}
+
+/// Per-mode tally of the blend chunks that had to be split into their own
+/// render pass, since the last [`take_complex_blend_counts`].
+///
+/// Every one of these allocates a target the size of the whole surface and
+/// composites across it, whatever area the object actually covers — measured
+/// at ~145 per frame in a crowded room, which is where the frame time goes.
+/// Flash rasterized the same blends on the CPU over the object's bounds only,
+/// so its cost scaled with the object, not the screen; that difference is why
+/// two players in particular gear can cost more than a room full of plain
+/// ones.
+///
+/// Which modes dominate decides the fix: `Multiply`/`Lighten`/`Darken` are
+/// candidates for GPU blend state with no intermediate target at all (see the
+/// notes on [`ComplexBlend`]), while `Alpha`/`Erase` need layer tracking and
+/// leave no cheap way out.
+static COMPLEX_BLEND_COUNTS: [AtomicU64; 10] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+fn complex_blend_index(blend: ComplexBlend) -> usize {
+    match blend {
+        ComplexBlend::Multiply => 0,
+        ComplexBlend::Lighten => 1,
+        ComplexBlend::Darken => 2,
+        ComplexBlend::Difference => 3,
+        ComplexBlend::Invert => 4,
+        ComplexBlend::Alpha => 5,
+        ComplexBlend::Erase => 6,
+        ComplexBlend::Overlay => 7,
+        ComplexBlend::HardLight => 8,
+    }
+}
+
+pub fn note_complex_blend(blend: ComplexBlend) {
+    COMPLEX_BLEND_COUNTS[complex_blend_index(blend)].fetch_add(1, Ordering::Relaxed);
+}
+
+/// PixelBender blends share the same full-surface cost; slot 9 keeps them
+/// visible without implying they have the same fix.
+pub fn note_shader_blend() {
+    COMPLEX_BLEND_COUNTS[9].fetch_add(1, Ordering::Relaxed);
+}
+
+/// How much of the surface complex blend passes actually cover, since the last
+/// [`take_blend_coverage`]: summed content area, summed full-surface area, and
+/// a histogram of per-layer coverage in the buckets <=1%, <=5%, <=25%, >25%.
+///
+/// This is the number that decides whether bounding those passes is worth
+/// anything. The layer *count* cannot answer it -- scissoring removes no
+/// passes, it shrinks them -- so a drop in [`take_complex_blend_counts`] would
+/// mean blends went missing, not that the fill got cheaper.
+static BLEND_COVERED_PX: AtomicU64 = AtomicU64::new(0);
+static BLEND_SURFACE_PX: AtomicU64 = AtomicU64::new(0);
+static BLEND_COVER_HIST: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Pixels actually allocated for complex blend targets, against what a
+/// full-surface target would have cost. This is the memory side: a crowded
+/// room keeps hundreds of these alive at once, and at full surface size that
+/// alone pushed VRAM past the OS grant.
+static BLEND_ALLOC_PX: AtomicU64 = AtomicU64::new(0);
+static BLEND_ALLOC_FULL_PX: AtomicU64 = AtomicU64::new(0);
+
+pub fn note_blend_alloc(alloc_px: u64, surface_px: u64) {
+    BLEND_ALLOC_PX.fetch_add(alloc_px, Ordering::Relaxed);
+    BLEND_ALLOC_FULL_PX.fetch_add(surface_px, Ordering::Relaxed);
+}
+
+/// Drains the allocation tally as a percentage of full-surface targets.
+pub fn take_blend_alloc() -> u64 {
+    let alloc = BLEND_ALLOC_PX.swap(0, Ordering::Relaxed);
+    let full = BLEND_ALLOC_FULL_PX.swap(0, Ordering::Relaxed);
+    alloc.saturating_mul(100).checked_div(full).unwrap_or(0)
+}
+
+/// Complex blend passes, against how few passes they could be merged into.
+///
+/// Blends that overlap must stay sequential -- the later one has to read the
+/// earlier one's output -- so only a run of mutually disjoint ones can share a
+/// pass and a single parent snapshot. Chunks arrive in render order, which
+/// means consecutive ones tend to be pieces of the same avatar, and those
+/// overlap. This counts what merging would actually achieve before any of it
+/// is built: `passes / groups` is the speedup ceiling.
+static BLEND_PASSES: AtomicU64 = AtomicU64::new(0);
+static BLEND_GROUPS: AtomicU64 = AtomicU64::new(0);
+static BLEND_BIGGEST_GROUP: AtomicU64 = AtomicU64::new(0);
+
+pub fn note_blend_group(members: u64) {
+    BLEND_PASSES.fetch_add(members, Ordering::Relaxed);
+    BLEND_GROUPS.fetch_add(1, Ordering::Relaxed);
+    BLEND_BIGGEST_GROUP.fetch_max(members, Ordering::Relaxed);
+}
+
+/// Drains the grouping tally as `(passes, groups, biggest_group)`.
+pub fn take_blend_grouping() -> (u64, u64, u64) {
+    (
+        BLEND_PASSES.swap(0, Ordering::Relaxed),
+        BLEND_GROUPS.swap(0, Ordering::Relaxed),
+        BLEND_BIGGEST_GROUP.swap(0, Ordering::Relaxed),
+    )
+}
+
+pub fn note_blend_coverage(covered_px: u64, surface_px: u64) {
+    BLEND_COVERED_PX.fetch_add(covered_px, Ordering::Relaxed);
+    BLEND_SURFACE_PX.fetch_add(surface_px, Ordering::Relaxed);
+
+    let permille = covered_px
+        .saturating_mul(1000)
+        .checked_div(surface_px)
+        .unwrap_or(0);
+    let bucket = match permille {
+        0..=10 => 0,
+        11..=50 => 1,
+        51..=250 => 2,
+        _ => 3,
+    };
+    BLEND_COVER_HIST[bucket].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Drains the coverage tally as `(covered_percent, [hist; 4])`.
+pub fn take_blend_coverage() -> (u64, [u64; 4]) {
+    let covered = BLEND_COVERED_PX.swap(0, Ordering::Relaxed);
+    let surface = BLEND_SURFACE_PX.swap(0, Ordering::Relaxed);
+    let percent = covered
+        .saturating_mul(100)
+        .checked_div(surface)
+        .unwrap_or(0);
+    let hist = std::array::from_fn(|i| BLEND_COVER_HIST[i].swap(0, Ordering::Relaxed));
+    (percent, hist)
+}
+
+/// Drains the tally into `mode=count` pairs, busiest first, omitting zeros.
+pub fn take_complex_blend_counts() -> Vec<(&'static str, u64)> {
+    const NAMES: [&str; 10] = [
+        "multiply",
+        "lighten",
+        "darken",
+        "difference",
+        "invert",
+        "alpha",
+        "erase",
+        "overlay",
+        "hardlight",
+        "pixelbender",
+    ];
+    let mut counts: Vec<(&'static str, u64)> = NAMES
+        .iter()
+        .zip(COMPLEX_BLEND_COUNTS.iter())
+        .filter_map(|(name, slot)| {
+            let count = slot.swap(0, Ordering::Relaxed);
+            (count > 0).then_some((*name, count))
+        })
+        .collect();
+    counts.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    counts
 }
 
 #[derive(Debug, Clone)]

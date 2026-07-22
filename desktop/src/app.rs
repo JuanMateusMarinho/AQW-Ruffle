@@ -20,6 +20,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize, Size};
 use winit::event::{ElementState, Ime, Modifiers, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Fullscreen, Icon, WindowAttributes, WindowId};
 
 struct MainWindow {
@@ -224,6 +225,14 @@ impl MainWindow {
                 let key = winit_input_to_ruffle_key_descriptor(&event);
                 match event.state {
                     ElementState::Pressed => {
+                        // F9 toggles the CRT filter. The row injected into the
+                        // game's own options menu is the normal way in, but it
+                        // is found by that menu's instance names, so keep a way
+                        // in that doesn't depend on the game's UI at all. No-op
+                        // in the games without the filter.
+                        if event.physical_key == PhysicalKey::Code(KeyCode::F9) {
+                            ruffle_core::aqw_crt_toggle_external();
+                        }
                         self.player.handle_event(PlayerEvent::KeyDown { key });
                         if let Some(control_code) =
                             winit_to_ruffle_text_control(&event, self.modifiers)

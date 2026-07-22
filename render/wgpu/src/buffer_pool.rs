@@ -13,7 +13,7 @@ type Constructor<Type, Description> = Box<dyn Fn(&Descriptors, &Description) -> 
 /// the maintenance pass frees it regardless of the retention budget. Long
 /// enough to survive deferred cache redraws that skip a texture for a couple
 /// of seconds, short enough to drain the piles left behind by map changes.
-const POOL_IDLE_EVICT_TICKS: u64 = 120;
+pub(crate) const POOL_IDLE_EVICT_TICKS: u64 = 120;
 
 /// Entries idle for fewer ticks than this are never evicted, even when the
 /// pool is over budget. This protects the recent working set: evicting a
@@ -113,6 +113,38 @@ impl TexturePool {
             .sum()
     }
 
+    /// The buckets holding the most bytes, as `(width, height, count, bytes)`,
+    /// largest first.
+    ///
+    /// Retention totals say how much is held but not what shape it is, and the
+    /// two lead to opposite fixes: a handful of very large targets (a filtered
+    /// item drawn at big bounds) is a size problem, while thousands of small
+    /// ones is a variety problem. Filter/blend/mask targets take their size
+    /// from the content's bounds, so an unusually large or heavily filtered
+    /// item costs far more than an ordinary one — which is what the field
+    /// report of two specific players dominating a crowded room suggests.
+    pub fn largest_buckets(&self, limit: usize) -> Vec<(u32, u32, usize, u64)> {
+        let mut buckets: Vec<(u32, u32, usize, u64)> = self
+            .pools
+            .iter()
+            .filter_map(|(key, pool)| {
+                let count = pool.available_len();
+                if count == 0 {
+                    return None;
+                }
+                Some((
+                    key.size.width,
+                    key.size.height,
+                    count,
+                    count as u64 * Self::bytes_per_texture(key),
+                ))
+            })
+            .collect();
+        buckets.sort_unstable_by(|a, b| b.3.cmp(&a.3));
+        buckets.truncate(limit);
+        buckets
+    }
+
     /// `(cumulative allocations, cumulative frees, retained bytes)` — the
     /// allocation delta per second is the churn measurement the diagnostics
     /// sweep reports.
@@ -153,10 +185,23 @@ impl TexturePool {
     /// leaves every block fragmented and returns nothing. So under pressure
     /// the pool only tightens its long-idle pass, and if hard pressure
     /// *persists* it fires one full reset (one hitch), then cools down.
-    pub fn maintain(&mut self, budget: u64, max_free_bytes: u64, vram_pressure: u8) {
+    /// `healthy_idle_ticks` is how long an entry may sit unused before the
+    /// long-idle pass frees it while VRAM is healthy; pressure overrides it
+    /// downwards. Callers pass their own because the two pools have opposite
+    /// needs: the offscreen pool wants piles from map changes drained
+    /// promptly, while the main-surface pool's sizes recur as players move and
+    /// animate, so freeing them on a timer just buys a reallocation a moment
+    /// later.
+    pub fn maintain(
+        &mut self,
+        budget: u64,
+        max_free_bytes: u64,
+        vram_pressure: u8,
+        healthy_idle_ticks: u64,
+    ) {
         let now = self.clock.fetch_add(1, Ordering::Relaxed) + 1;
         let idle_ticks = match vram_pressure {
-            0 => POOL_IDLE_EVICT_TICKS,
+            0 => healthy_idle_ticks,
             1 => 48,
             _ => 32,
         };

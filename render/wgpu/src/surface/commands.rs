@@ -2,7 +2,8 @@ use crate::backend::RenderTargetMode;
 use crate::blend::TrivialBlend;
 use crate::blend::{BlendType, ComplexBlend};
 use crate::buffer_builder::BufferBuilder;
-use crate::buffer_pool::TexturePool;
+use crate::buffer_pool::{TexturePool, quantize_pool_dimension};
+use crate::content_bounds::ContentBounds;
 use crate::dynamic_transforms::DynamicTransforms;
 use crate::mesh::{DrawType, Mesh, as_mesh};
 use crate::surface::Surface;
@@ -10,15 +11,48 @@ use crate::surface::target::CommandTarget;
 use crate::{Descriptors, MaskState, Pipelines, Transforms, as_texture};
 use ruffle_render::backend::ShapeHandle;
 use ruffle_render::bitmap::{BitmapHandle, PixelSnapping};
-use ruffle_render::commands::{CommandHandler, CommandList, RenderBlendMode};
+use ruffle_render::commands::{Command, CommandHandler, CommandList, RenderBlendMode};
 use ruffle_render::lines::{emulate_line, emulate_line_rect};
 use ruffle_render::matrix::Matrix;
 use ruffle_render::pixel_bender::PixelBenderShaderHandle;
 use ruffle_render::quality::StageQuality;
 use ruffle_render::transform::Transform;
 use std::mem;
+use std::sync::OnceLock;
 use swf::{BlendMode, Color, ColorTransform, Twips};
 use wgpu::Backend;
+
+/// Kill-switch: `RUFFLE_AQW_NO_BLEND_TARGET_SHRINK` restores full-surface
+/// complex blend targets, for field A/B without a rebuild.
+fn blend_target_shrink_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_BLEND_TARGET_SHRINK").is_some())
+}
+
+/// MEASUREMENT ONLY -- `RUFFLE_AQW_BLEND_AS_NORMAL` demotes every complex blend
+/// to a plain one, which is visually wrong but keeps the art on screen.
+///
+/// A complex blend costs a render pass of its own to composite; a trivial one
+/// folds into the batched draw chunk. Toggling this therefore prices the
+/// compositing passes alone, with the per-blend target and its sub-render
+/// unchanged, which is what says whether collapsing those passes is worth
+/// building. Never a fix: it is the wrong blend maths.
+fn blend_measured_as_normal() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_BLEND_AS_NORMAL").is_some())
+}
+
+/// MEASUREMENT ONLY -- `RUFFLE_AQW_SKIP_COMPLEX_BLEND` drops complex blends
+/// entirely: no target, no sub-render, no composite. The blended art simply
+/// does not appear.
+///
+/// This is the floor. Whatever frame time remains belongs to the rest of the
+/// scene, so it says how much of the budget attacking blends could ever
+/// recover -- and therefore whether any amount of that work reaches 24fps.
+fn blend_measured_skipped() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_SKIP_COMPLEX_BLEND").is_some())
+}
 
 use super::target::PoolOrArcTexture;
 
@@ -444,6 +478,20 @@ pub enum Chunk {
         texture: PoolOrArcTexture,
         blend_mode: ChunkBlendMode,
         needs_stencil: bool,
+        /// Extent of the content drawn into `texture`, in surface pixels.
+        ///
+        /// The rest of `texture` is the clear colour, which is transparent for
+        /// every blend mode, and every complex blend shader discards on
+        /// `src.a <= 0`. So the pass can be scissored to this without changing
+        /// a pixel — see `Surface::draw_commands`.
+        bounds: ContentBounds,
+        /// Footprint of `texture` in the target being composited into, as
+        /// `(x, y, width, height)`.
+        ///
+        /// The whole target unless the blend was sized to its content, in which
+        /// case the pass draws only this rect and `texture` covers exactly it —
+        /// so the unit quad doubles as the source's texture coordinate.
+        rect: (u32, u32, u32, u32),
     },
 }
 
@@ -502,6 +550,10 @@ pub enum LayerRef<'a> {
 
 /// Replaces every blend with a RenderBitmap, with the subcommands rendered out to a temporary texture
 /// Every complex blend will be its own item, but every other draw will be chunked together
+///
+/// Also returns the extent of everything drawn, in target pixels, which is what
+/// lets a caller bound its own blend pass when these commands are themselves the
+/// contents of a blend.
 #[expect(clippy::too_many_arguments)]
 pub fn chunk_blends<'a>(
     commands: CommandList,
@@ -515,7 +567,8 @@ pub fn chunk_blends<'a>(
     height: u32,
     nearest_layer: LayerRef,
     texture_pool: &mut TexturePool,
-) -> Vec<Chunk> {
+    origin: (u32, u32),
+) -> (Vec<Chunk>, ContentBounds) {
     WgpuCommandHandler::new(
         descriptors,
         staging_belt,
@@ -527,8 +580,70 @@ pub fn chunk_blends<'a>(
         height,
         nearest_layer,
         texture_pool,
+        origin,
     )
     .chunk_blends(commands)
+}
+
+/// Extent a command list will cover, without rendering any of it.
+///
+/// A blend target has to be sized before its contents are drawn, so the bounds
+/// the chunker accumulates as a side effect come too late. This walks the same
+/// geometry ahead of time: matrices are already in surface pixels, quad-shaped
+/// draws cover the unit square, and shapes carry their tessellated extent.
+///
+/// Conservative on purpose -- masks bound by their masker rather than the
+/// intersection, and anything unbounded poisons the result to the full surface,
+/// which just means a pass keeps its old full-size target.
+pub fn command_list_bounds(commands: &CommandList) -> ContentBounds {
+    fn visit(commands: &CommandList, out: &mut ContentBounds, depth: u32) {
+        // Matches the recursion guard in `CommandList::execute`; a list too
+        // deep to render should not be measured either.
+        if depth > 64 {
+            *out = ContentBounds::UNBOUNDED;
+            return;
+        }
+
+        for command in &commands.commands {
+            match command {
+                Command::RenderBitmap {
+                    bitmap, transform, ..
+                }
+                | Command::RenderStage3D { bitmap, transform } => {
+                    let texture = as_texture(bitmap);
+                    let mut matrix = transform.matrix;
+                    matrix *= Matrix::scale(
+                        texture.texture.width() as f32,
+                        texture.texture.height() as f32,
+                    );
+                    out.union_transformed(&matrix, ContentBounds::UNIT);
+                }
+                Command::RenderShape { shape, transform } => {
+                    out.union_transformed(&transform.matrix, as_mesh(shape).bounds);
+                }
+                Command::DrawRect { matrix, .. }
+                | Command::DrawLine { matrix, .. }
+                | Command::DrawLineRect { matrix, .. } => {
+                    out.union_transformed(matrix, ContentBounds::UNIT);
+                }
+                Command::Blend(inner, _) => visit(inner, out, depth + 1),
+                Command::RenderAlphaMask {
+                    maskee_commands, ..
+                } => {
+                    // Output is `maskee.rgb * mask.a`, so the maskee bounds it.
+                    visit(maskee_commands, out, depth + 1)
+                }
+                Command::PushMask
+                | Command::ActivateMask
+                | Command::DeactivateMask
+                | Command::PopMask => {}
+            }
+        }
+    }
+
+    let mut bounds = ContentBounds::EMPTY;
+    visit(commands, &mut bounds, 0);
+    bounds
 }
 
 struct WgpuCommandHandler<'a> {
@@ -549,6 +664,13 @@ struct WgpuCommandHandler<'a> {
     transforms: BufferBuilder,
     needs_stencil: bool,
     num_masks: i32,
+    /// Extent of everything drawn so far, in the commands' own (surface)
+    /// coordinates -- taken before `origin` is subtracted, so it stays
+    /// meaningful to whoever composites this target.
+    content_bounds: ContentBounds,
+    /// Subtracted from every draw's translation, placing surface coordinates
+    /// inside a target that covers only part of the surface.
+    origin: (f32, f32),
 }
 
 impl<'a> WgpuCommandHandler<'a> {
@@ -564,6 +686,7 @@ impl<'a> WgpuCommandHandler<'a> {
         height: u32,
         nearest_layer: LayerRef<'a>,
         texture_pool: &'a mut TexturePool,
+        origin: (u32, u32),
     ) -> Self {
         let transforms = Self::new_transforms(descriptors, dynamic_transforms);
 
@@ -590,6 +713,8 @@ impl<'a> WgpuCommandHandler<'a> {
             transforms,
             needs_stencil: false,
             num_masks: 0,
+            content_bounds: ContentBounds::EMPTY,
+            origin: (origin.0 as f32, origin.1 as f32),
         }
     }
 
@@ -604,12 +729,13 @@ impl<'a> WgpuCommandHandler<'a> {
 
     /// Replaces every blend with a RenderBitmap, with the subcommands rendered out to a temporary texture
     /// Every complex blend will be its own item, but every other draw will be chunked together
-    fn chunk_blends(&mut self, commands: CommandList) -> Vec<Chunk> {
+    fn chunk_blends(&mut self, commands: CommandList) -> (Vec<Chunk>, ContentBounds) {
         commands.execute(self);
 
         let current = mem::take(&mut self.current);
         let mut result = mem::take(&mut self.result);
         let needs_stencil = mem::take(&mut self.needs_stencil);
+        let content_bounds = mem::take(&mut self.content_bounds);
         let transforms = mem::replace(
             &mut self.transforms,
             Self::new_transforms(self.descriptors, self.dynamic_transforms),
@@ -623,23 +749,35 @@ impl<'a> WgpuCommandHandler<'a> {
             });
         }
 
-        result
+        (result, content_bounds)
+    }
+
+    /// Grows the content extent by a draw of `local_bounds` placed by `matrix`.
+    ///
+    /// `local_bounds` is the geometry in the draw's own space: the unit square
+    /// for everything quad-shaped, the mesh extent for shapes.
+    fn note_bounds(&mut self, matrix: &Matrix, local_bounds: ContentBounds) {
+        self.content_bounds.union_transformed(matrix, local_bounds);
     }
 
     fn add_to_current(
         &mut self,
         matrix: Matrix,
         color_transform: ColorTransform,
+        local_bounds: ContentBounds,
         command_builder: impl FnOnce(wgpu::DynamicOffset) -> DrawCommand,
     ) {
+        self.note_bounds(&matrix, local_bounds);
+        // Bounds are recorded in surface coordinates above; only what the GPU
+        // draws is shifted into the target.
         let transform = Transforms {
             world_matrix: [
                 [matrix.a, matrix.b, 0.0, 0.0],
                 [matrix.c, matrix.d, 0.0, 0.0],
                 [0.0, 0.0, 1.0, 0.0],
                 [
-                    matrix.tx.to_pixels() as f32,
-                    matrix.ty.to_pixels() as f32,
+                    matrix.tx.to_pixels() as f32 - self.origin.0,
+                    matrix.ty.to_pixels() as f32 - self.origin.1,
                     0.0,
                     1.0,
                 ],
@@ -675,19 +813,83 @@ impl<'a> WgpuCommandHandler<'a> {
 
 impl CommandHandler for WgpuCommandHandler<'_> {
     fn blend(&mut self, commands: CommandList, blend_mode: RenderBlendMode) {
-        let surface = Surface::new(
-            self.descriptors,
-            self.quality,
-            self.width,
-            self.height,
-            wgpu::TextureFormat::Rgba8Unorm,
-        );
         let target_layer = if let RenderBlendMode::Builtin(BlendMode::Layer) = &blend_mode {
             LayerRef::Current
         } else {
             self.nearest_layer
         };
         let blend_type = BlendType::from(blend_mode);
+
+        // We currently do not support shader blends in masks. In order not to
+        // break other parts of the scene, we just fall back to a normal blend.
+        //
+        // TODO Add support for shader blends in masks.
+        let is_shader_blend_in_mask =
+            self.num_masks > 0 && matches!(blend_type, BlendType::Shader(_));
+        // Whether this blend composites through a pass of its own, decided
+        // before any measurement demotion below so that toggling the
+        // measurement changes one thing and not two.
+        let is_complex = matches!(blend_type, BlendType::Complex(_));
+
+        if is_complex && blend_measured_skipped() {
+            return;
+        }
+
+        let blend_type = if is_shader_blend_in_mask || (blend_measured_as_normal() && is_complex) {
+            BlendType::Trivial(TrivialBlend::Normal)
+        } else {
+            blend_type
+        };
+
+        // A complex blend composites through its own render target. Sized to
+        // the whole surface that is by far the biggest thing this renderer
+        // holds -- a crowded room keeps hundreds alive at once, measured at
+        // 843 x 1600x841 = 4.3GB, which is what pushes VRAM past the OS grant
+        // and starts the paging that collapses the frame rate. Sizing it to
+        // the content instead is the same picture in a fraction of the memory,
+        // since everything outside the content is transparent either way.
+        //
+        // Measured ahead of drawing, because the target has to exist first.
+        // Trivial blends feed a plain bitmap draw and shader blends run
+        // arbitrary code, so both keep the full-size target.
+        let bounded = is_complex && !blend_target_shrink_disabled();
+        let rect = bounded
+            .then(|| {
+                command_list_bounds(&commands)
+                    .translated(-self.origin.0, -self.origin.1)
+                    .to_snapped_rect(self.width, self.height, quantize_pool_dimension)
+            })
+            .flatten();
+
+        let (surface_origin, surface_width, surface_height) = match rect {
+            Some((x, y, width, height)) => (
+                (self.origin.0 as u32 + x, self.origin.1 as u32 + y),
+                width,
+                height,
+            ),
+            None => (
+                (self.origin.0 as u32, self.origin.1 as u32),
+                self.width,
+                self.height,
+            ),
+        };
+
+        if is_complex {
+            crate::blend::note_blend_alloc(
+                surface_width as u64 * surface_height as u64,
+                self.width as u64 * self.height as u64,
+            );
+        }
+
+        let surface = Surface::new(
+            self.descriptors,
+            self.quality,
+            surface_width,
+            surface_height,
+            wgpu::TextureFormat::Rgba8Unorm,
+        )
+        .with_origin(surface_origin);
+
         let clear_color = blend_type.default_color();
         let target = surface.draw_commands(
             RenderTargetMode::FreshWithColor(clear_color),
@@ -701,18 +903,9 @@ impl CommandHandler for WgpuCommandHandler<'_> {
             self.texture_pool,
         );
         target.ensure_cleared(self.draw_encoder);
-
-        // We currently do not support shader blends in masks. In order not to
-        // break other parts of the scene, we just fall back to a normal blend.
-        //
-        // TODO Add support for shader blends in masks.
-        let is_shader_blend_in_mask =
-            self.num_masks > 0 && matches!(blend_type, BlendType::Shader(_));
-        let blend_type = if is_shader_blend_in_mask {
-            BlendType::Trivial(TrivialBlend::Normal)
-        } else {
-            blend_type
-        };
+        // Recorded in surface coordinates, so it carries over untransformed
+        // however the target was sized.
+        let blend_bounds = target.content_bounds();
 
         match blend_type {
             BlendType::Trivial(blend_mode) => {
@@ -749,9 +942,13 @@ impl CommandHandler for WgpuCommandHandler<'_> {
                             ],
                             label: None,
                         });
+                // The matrix covers the whole surface, but only `blend_bounds`
+                // of it was actually drawn into; carry that up rather than
+                // letting a nested blend widen an enclosing one to full screen.
                 self.add_to_current(
                     transform.matrix,
                     transform.color_transform,
+                    ContentBounds::EMPTY,
                     |transform_buffer| DrawCommand::RenderTexture {
                         _texture: texture,
                         binds: bind_group,
@@ -759,6 +956,7 @@ impl CommandHandler for WgpuCommandHandler<'_> {
                         blend_mode,
                     },
                 );
+                self.content_bounds.union_pixels(blend_bounds);
             }
             blend_type => {
                 if !self.current.is_empty() {
@@ -774,16 +972,30 @@ impl CommandHandler for WgpuCommandHandler<'_> {
                 self.transforms
                     .set_buffer_limit(self.dynamic_transforms.buffer.size());
                 let chunk_blend_mode = match blend_type {
-                    BlendType::Complex(complex) => ChunkBlendMode::Complex(complex),
-                    BlendType::Shader(shader) => ChunkBlendMode::Shader(shader),
+                    BlendType::Complex(complex) => {
+                        crate::blend::note_complex_blend(complex);
+                        ChunkBlendMode::Complex(complex)
+                    }
+                    BlendType::Shader(shader) => {
+                        crate::blend::note_shader_blend();
+                        ChunkBlendMode::Shader(shader)
+                    }
                     _ => unreachable!(),
                 };
                 self.result.push(Chunk::Blend {
                     texture: target.take_color_texture(),
                     blend_mode: chunk_blend_mode,
                     needs_stencil: self.num_masks > 0,
+                    bounds: blend_bounds,
+                    // Where this target sits in the target being composited
+                    // into. The pass draws exactly this rect, so the unit quad
+                    // doubles as the source texture's coordinate.
+                    rect: rect.unwrap_or((0, 0, self.width, self.height)),
                 });
                 self.needs_stencil = self.num_masks > 0;
+                // The blend writes wherever its source is opaque, so this chunk
+                // contributes the same extent to any enclosing blend.
+                self.content_bounds.union_pixels(blend_bounds);
             }
         }
     }
@@ -804,15 +1016,20 @@ impl CommandHandler for WgpuCommandHandler<'_> {
                 texture.texture.height() as f32,
             );
         }
-        self.add_to_current(matrix, transform.color_transform, |transform_buffer| {
-            DrawCommand::RenderBitmap {
+        // The texture size is already folded into `matrix`, so the drawn
+        // geometry is the unit quad.
+        self.add_to_current(
+            matrix,
+            transform.color_transform,
+            ContentBounds::UNIT,
+            |transform_buffer| DrawCommand::RenderBitmap {
                 bitmap,
                 transform_buffer,
                 smoothing,
                 blend_mode: TrivialBlend::Normal,
                 render_stage3d: false,
-            }
-        });
+            },
+        );
     }
     fn render_stage3d(&mut self, bitmap: BitmapHandle, transform: Transform) {
         let mut matrix = transform.matrix;
@@ -823,21 +1040,28 @@ impl CommandHandler for WgpuCommandHandler<'_> {
                 texture.texture.height() as f32,
             );
         }
-        self.add_to_current(matrix, transform.color_transform, |transform_buffer| {
-            DrawCommand::RenderBitmap {
+        self.add_to_current(
+            matrix,
+            transform.color_transform,
+            ContentBounds::UNIT,
+            |transform_buffer| DrawCommand::RenderBitmap {
                 bitmap,
                 transform_buffer,
                 smoothing: false,
                 blend_mode: TrivialBlend::Normal,
                 render_stage3d: true,
-            }
-        });
+            },
+        );
     }
 
     fn render_shape(&mut self, shape: ShapeHandle, transform: Transform) {
+        // Tessellated vertices are in pixels, same as the matrix, so the mesh
+        // extent is the local geometry.
+        let mesh_bounds = as_mesh(&shape).bounds;
         self.add_to_current(
             transform.matrix,
             transform.color_transform,
+            mesh_bounds,
             |transform_buffer| DrawCommand::RenderShape {
                 shape,
                 transform_buffer,
@@ -849,6 +1073,7 @@ impl CommandHandler for WgpuCommandHandler<'_> {
         self.add_to_current(
             matrix,
             ColorTransform::multiply_from(color),
+            ContentBounds::UNIT,
             |transform_buffer| DrawCommand::DrawRect { transform_buffer },
         );
     }
@@ -864,6 +1089,7 @@ impl CommandHandler for WgpuCommandHandler<'_> {
             self.add_to_current(
                 matrix,
                 ColorTransform::multiply_from(color),
+                ContentBounds::UNIT,
                 |transform_buffer| DrawCommand::DrawLine { transform_buffer },
             );
         }
@@ -880,6 +1106,7 @@ impl CommandHandler for WgpuCommandHandler<'_> {
             self.add_to_current(
                 matrix,
                 ColorTransform::multiply_from(color),
+                ContentBounds::UNIT,
                 |transform_buffer| DrawCommand::DrawLineRect { transform_buffer },
             );
         }
@@ -929,6 +1156,9 @@ impl CommandHandler for WgpuCommandHandler<'_> {
         );
         maskee.ensure_cleared(self.draw_encoder);
         let matrix = Matrix::scale(maskee.width() as f32, maskee.height() as f32);
+        // `alpha_mask.wgsl` outputs `maskee.rgb * mask.a`, so nothing can show
+        // outside the maskee's own extent. Same coordinate system, no transform.
+        let maskee_bounds = maskee.content_bounds();
         let maskee = maskee.take_color_texture();
 
         let mask = surface.draw_commands(
@@ -969,13 +1199,17 @@ impl CommandHandler for WgpuCommandHandler<'_> {
                 label: None,
             });
 
-        self.add_to_current(matrix, Default::default(), |transform_buffer| {
-            DrawCommand::RenderAlphaMask {
+        self.add_to_current(
+            matrix,
+            Default::default(),
+            ContentBounds::EMPTY,
+            |transform_buffer| DrawCommand::RenderAlphaMask {
                 maskee,
                 mask,
                 binds,
                 transform_buffer,
-            }
-        });
+            },
+        );
+        self.content_bounds.union_pixels(maskee_bounds);
     }
 }

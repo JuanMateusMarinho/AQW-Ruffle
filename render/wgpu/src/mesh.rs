@@ -1,4 +1,5 @@
 use crate::backend::WgpuRenderBackend;
+use crate::content_bounds::ContentBounds;
 use crate::target::RenderTarget;
 use crate::{
     Descriptors, GradientUniforms, PosColorVertex, PosVertex, TextureTransforms, as_texture,
@@ -21,6 +22,13 @@ pub struct Mesh {
     pub draws: Vec<Draw>,
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
+    /// Extent of this shape's geometry in its own (pixel) coordinate space.
+    ///
+    /// Tessellated vertices are already in pixels, so a draw's on-screen extent
+    /// is just this run through the command's matrix. Only used to bound
+    /// complex blend passes, which would otherwise composite across the whole
+    /// surface however small the shape is.
+    pub bounds: ContentBounds,
 }
 
 impl ShapeHandleImpl for Mesh {}

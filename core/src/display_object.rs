@@ -61,6 +61,7 @@ pub use loader_display::LoaderDisplay;
 pub use morph_shape::MorphShape;
 pub use movie_clip::{
     MovieClip, MovieClipHandle, MovieClipWeak, Scene, aqw_crt_maybe_toggle, aqw_crt_menu_tick,
+    aqw_crt_toggle_external,
 };
 use ruffle_render::backend::{BitmapCacheEntry, RenderBackend};
 use ruffle_render::bitmap::{BitmapHandle, BitmapInfo, PixelSnapping};
@@ -145,8 +146,148 @@ fn aqw_diagnostics_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
 }
 
+/// True when `url` has `segment` as a whole path segment, ignoring case, the
+/// query string and the fragment.
+fn url_path_has_segment(url: &str, segment: &str) -> bool {
+    url.split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .split('/')
+        .any(|part| part.eq_ignore_ascii_case(segment))
+}
+
+/// Host of an absolute URL, without the port.
+fn url_host(url: &str) -> Option<&str> {
+    let after_scheme = url.split_once("://")?.1;
+    let authority = after_scheme.split(['/', '?', '#']).next()?;
+    Some(authority.split(':').next().unwrap_or(authority))
+}
+
 fn is_aqw_movie_url(url: &str) -> bool {
-    url.contains("/game/gamefiles/")
+    // Only the `gamefiles` segment is load-bearing: matching the segment rather
+    // than the literal `/game/gamefiles/` keeps this working if the path in
+    // front of it ever moves.
+    url_path_has_segment(url, "gamefiles")
+}
+
+/// Report the URL gates that every game-specific path here hangs off.
+///
+/// All of them fail closed and silent, so a game update that moved its asset
+/// tree would show up only as performance quietly regressing months later. This
+/// says it out loud instead, and runs before the gate itself so it still fires
+/// when the gate is the thing that broke.
+fn aqw_report_gates(context: &mut UpdateContext<'_>) {
+    if !aqw_diagnostics_enabled() {
+        return;
+    }
+    static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let frames = FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // ~10s in, once the first room's assets are up, then once a minute.
+    if frames < 240 || (frames - 240) % 1440 != 0 {
+        return;
+    }
+
+    let movie = context.stage.movie();
+    let url = movie.url();
+    let (mut movies, mut avatar_assets) = (0u32, 0u32);
+    for known in context.library.known_movies() {
+        movies += 1;
+        if movie_clip::is_aqw_avatar_asset_movie_url(known.url()) {
+            avatar_assets += 1;
+        }
+    }
+    let line = format!(
+        "AQW gates: root_match={} crt_game={} crt_panel={} crt_row={} avatar_assets={avatar_assets}/{movies} root_url={url}",
+        is_aqw_movie_url(url),
+        movie_clip::aqw_crt_game_name(url),
+        movie_clip::aqw_crt_panel_seen(),
+        movie_clip::aqw_crt_row_injected(),
+    );
+    tracing::info!(target: "aqw_diag", "{line}");
+
+    // Alongside the sweep, for the same reason: the launcher spawns the game
+    // detached and discards stdout, so the file is the channel that survives.
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::env::temp_dir().join("aqw-memory.log"))
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+/// Temporary probe for the detached/uncoloured AQW item art.
+///
+/// Every item art piece runs, in its first frame,
+/// `MovieClip(stage.getChildAt(0)).mcSetColor(this, ...)` — it reaches up to
+/// the stage to have the game colour and place it. `mcSetColor` is defined on
+/// `Game`, the document class of `Game3097.swf`, and `Loader3.swf` puts that
+/// object at index 0 (`stage.removeChildAt(0)` then
+/// `stage.addChild(MovieClip(loader.content))`).
+///
+/// In the field that coercion fails with #1034 against a `Loader`, so the call
+/// never happens and the piece keeps its default colour and position. This
+/// reports what is actually sitting on the stage, to find out where the
+/// `Loader` comes from. Logged at warn so it survives the default `RUST_LOG`.
+///
+/// Diagnostic scaffolding — remove once the display-list question is answered.
+fn aqw_report_stage_children(context: &mut UpdateContext<'_>) {
+    let stage = context.stage;
+
+    // Describe index 0 as the item art would find it: the display object kind
+    // plus the AVM2 class the coercion would be tested against.
+    let describe = |child: DisplayObject<'_>| {
+        let kind = match child {
+            DisplayObject::LoaderDisplay(_) => "Loader",
+            DisplayObject::MovieClip(_) => "MovieClip",
+            DisplayObject::Bitmap(_) => "Bitmap",
+            DisplayObject::Graphic(_) => "Graphic",
+            DisplayObject::EditText(_) => "EditText",
+            _ => "other",
+        };
+        let class = child
+            .object2()
+            .map(|o| {
+                use crate::avm2::object::TObject;
+                o.instance_class().name().local_name().to_string()
+            })
+            .unwrap_or_else(|| "<no avm2 object>".to_string());
+        format!("{kind}/{class}")
+    };
+
+    // Watchdog rather than a periodic sample: a snapshot at the character
+    // screen showed a MovieClip at index 0, so whatever the failing item art
+    // sees is transient and sampling on a timer would miss it.
+    //
+    // Identity is the child's pointer, compared against the last one seen. This
+    // runs every frame, before the sweep's one-per-second throttle, so it must
+    // not allocate: resolving the class name and formatting only happen on the
+    // frame where index 0 actually changes.
+    static LAST_PTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let child = stage.child_by_index(0);
+    let ptr = child.map(|c| c.as_ptr() as usize).unwrap_or(0);
+    if LAST_PTR.swap(ptr, std::sync::atomic::Ordering::Relaxed) == ptr {
+        return;
+    }
+
+    let current = match child {
+        Some(child) => describe(child),
+        None => "<empty stage>".to_string(),
+    };
+
+    let siblings = stage.num_children();
+    let others: Vec<String> = (1..siblings.min(6))
+        .filter_map(|index| stage.child_by_index(index).map(describe))
+        .collect();
+    tracing::warn!(
+        "AQW stage probe: getChildAt(0) is now {current} ({siblings} children on stage{})",
+        if others.is_empty() {
+            String::new()
+        } else {
+            format!("; others: {}", others.join(", "))
+        }
+    );
 }
 
 impl BitmapCache {
@@ -1109,6 +1250,11 @@ struct DrawCacheInfo {
     /// matches the texture contents (see `BitmapCache::stale_anchor`), instead
     /// of the one derived from the live bounds/draw_offset.
     offset_override: Option<Point<Twips>>,
+    /// This cache was switched on by us for AQW avatar art, not requested by
+    /// the content. Such a cache must not inherit `cacheAsBitmap`'s pixel
+    /// snapping, and must not be deferred: the object moves, so a stale or
+    /// snapped draw is visible as shaking or as art left behind.
+    aqw_auto_cache: bool,
 }
 
 const SCALING_GRID_EPSILON: f32 = 0.0001;
@@ -1289,6 +1435,63 @@ static AQW_CACHE_REDRAWS_DEFERRED: std::sync::atomic::AtomicU64 =
 static AQW_CACHE_STALE_FALLBACKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static AQW_BLEND_LAYERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Avatar-asset subtrees switched to a bitmap cache, cumulative.
+pub(crate) static AQW_AVATAR_CACHES_ENABLED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Kill-switch: `RUFFLE_AQW_NO_AVATAR_CACHE` restores live re-rendering of
+/// avatar art every frame, for field A/B without a rebuild.
+pub(crate) fn aqw_avatar_cache_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_AVATAR_CACHE").is_some())
+}
+
+/// Blend commands tallied by the SWF that emitted them, so a single expensive
+/// item can be named rather than inferred.
+///
+/// The field report is that frame rate tracks *which* items are on screen, not
+/// how many players are: one character page in a browser stutters on its own.
+/// Attributing blends to their source file is what turns that into a number.
+/// Diagnostics-only -- it allocates and locks per blend.
+static AQW_BLEND_BY_SWF: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+    std::sync::Mutex::new(None);
+
+fn note_blend_source(url: &str) {
+    // Just the file name; the directory is the same for every item.
+    let name = url
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(url)
+        .split('?')
+        .next()
+        .unwrap_or(url);
+    if name.is_empty() {
+        return;
+    }
+    if let Ok(mut guard) = AQW_BLEND_BY_SWF.lock() {
+        let counts = guard.get_or_insert_with(std::collections::HashMap::new);
+        // A room only ever holds so many distinct items; the cap is just to
+        // keep a pathological case from growing without bound.
+        if counts.len() < 512 || counts.contains_key(name) {
+            *counts.entry(name.to_owned()).or_insert(0) += 1;
+        }
+    }
+}
+
+/// Drains the per-SWF tally as `name:count`, busiest first, capped to `limit`.
+fn take_blend_sources(limit: usize) -> Vec<(String, u64)> {
+    let Ok(mut guard) = AQW_BLEND_BY_SWF.lock() else {
+        return Vec::new();
+    };
+    let Some(counts) = guard.take() else {
+        return Vec::new();
+    };
+    let mut counts: Vec<(String, u64)> = counts.into_iter().collect();
+    counts.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    counts.truncate(limit);
+    counts
+}
 /// Frame-tick phase accounting (nanoseconds per sweep window) filled in by
 /// `run_all_phases_avm2`, plus how many orphan subtrees the orphan freeze
 /// skipped. Splits the tick cost between orphan processing, the on-stage
@@ -1399,16 +1602,20 @@ fn render_aqw_scaling_grid<'gc>(
     if aqw_scale9_disabled() || aqw_recently_resized() {
         return false;
     }
-    if !is_aqw_movie_url(this.movie().url())
-        || !options.apply_transform
-        || !options.apply_matrix
-        || !options.apply_scaling_grid
-    {
+    // Ordered cheapest-first. This runs for every display object on every
+    // frame, and virtually none of them have a scaling grid, so the tests that
+    // reject them should be the free ones: `options` is `Copy` and the grid is
+    // a `Cell` read, while the URL test clones an `Arc` and scans a string.
+    if !options.apply_transform || !options.apply_matrix || !options.apply_scaling_grid {
         return false;
     }
 
     let grid = this.scaling_grid();
     if !grid.is_valid() {
+        return false;
+    }
+
+    if !is_aqw_movie_url(this.movie().url()) {
         return false;
     }
 
@@ -1580,6 +1787,10 @@ fn aqw_cache_budget_mb() -> u64 {
 pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
     let diagnostics = aqw_diagnostics_enabled();
     let budget_mb = aqw_cache_budget_mb();
+    aqw_report_gates(context);
+    // Before the AQW gate: the probe has to report even if the root movie is
+    // not what we expect, since that is one of the things it could reveal.
+    aqw_report_stage_children(context);
     if !is_aqw_movie_url(context.stage.movie().url()) {
         return;
     }
@@ -1681,6 +1892,86 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
             } else {
                 (0, 0, 0)
             };
+        // Same three numbers for the main-surface pool. That pool feeds the
+        // scene draw and every blend/mask/filter target nested in it, whose
+        // sizes follow on-screen content — so a crowded room asks it for many
+        // distinct sizes. It is reported separately because the columns above
+        // cover only the offscreen pool, which can look idle while this one
+        // grows.
+        static LAST_TEX_ALLOCS: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        static LAST_TEX_FREES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let (tex_allocs, tex_free, tex_mb) =
+            if let Some((allocs, frees, retained)) = context.renderer.surface_pool_stats() {
+                (
+                    allocs.saturating_sub(LAST_TEX_ALLOCS.swap(allocs, Ordering::Relaxed)),
+                    frees.saturating_sub(LAST_TEX_FREES.swap(frees, Ordering::Relaxed)),
+                    retained / (1024 * 1024),
+                )
+            } else {
+                (0, 0, 0)
+            };
+        // What shape the surface-pool retention has. A crowded room where two
+        // particular players dominate the cost points at a few oversized
+        // filter/blend targets rather than sheer count, and only the size
+        // breakdown can tell those apart.
+        let tex_top = context
+            .renderer
+            .surface_pool_largest(4)
+            .iter()
+            .map(|(w, h, count, bytes)| format!("{w}x{h}x{count}={}MB", bytes / (1024 * 1024)))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        // Which blend modes are paying for their own full-surface pass. The
+        // `blend_layers` count above says how many there were; this says which,
+        // and that decides whether there is a cheap fix (modes expressible as
+        // GPU blend state) or only the structural one.
+        let blend_modes = context
+            .renderer
+            .take_complex_blend_counts()
+            .iter()
+            .map(|(name, count)| format!("{name}:{count}"))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        // How much of the surface those passes actually covered. The counts
+        // above cannot show this: bounding a blend pass removes no passes, it
+        // shrinks them, so `blend_layers`/`blend_modes` stay put either way and
+        // only `blend_cover` moves. `blend_cover_hist` is the per-layer spread
+        // (<=1%, <=5%, <=25%, >25%), so a few full-screen overlays cannot hide
+        // a good median.
+        // `blend_alloc` is the memory side: how big those targets were, against
+        // full-surface ones. Hundreds are alive at once in a crowded room, so
+        // this is what decides whether VRAM clears the OS grant.
+        let blend_alloc = context.renderer.take_blend_alloc();
+        // Where the frame actually goes. `render_frames` is how many frames the
+        // other two cover, so they read as ms/frame against the 41.7ms budget
+        // at 24fps. `commit_mb` is system memory, which hit 98% of the machine
+        // while VRAM sat well inside its budget -- they run out separately.
+        let (render_encode_ms, render_submit_ms, render_frames, commit_mb) =
+            context.renderer.take_render_timings();
+        // What merging those blend passes could buy, simulated without changing
+        // any rendering: `blend_passes / blend_groups` is the ceiling, because
+        // overlapping blends have to stay sequential.
+        let (blend_passes, blend_groups, blend_group_max) =
+            context.renderer.take_blend_grouping();
+        // Which files those blends came from. If one item dominates, the cost
+        // is that item's art, not the number of players -- which is what the
+        // field reports and what a stuttering single-character page implies.
+        let avatar_caches = AQW_AVATAR_CACHES_ENABLED.load(Ordering::Relaxed);
+        let blend_swfs = take_blend_sources(6)
+            .iter()
+            .map(|(name, count)| format!("{name}:{count}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let (blend_cover, blend_cover_buckets) = context.renderer.take_blend_coverage();
+        let blend_cover_hist = blend_cover_buckets
+            .iter()
+            .map(|count| count.to_string())
+            .collect::<Vec<_>>()
+            .join("/");
+
         tracing::info!(
             target: "aqw_diag",
             orphans,
@@ -1708,6 +1999,23 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
             pool_allocs,
             pool_free,
             pool_mb,
+            tex_allocs,
+            tex_free,
+            tex_mb,
+            tex_top = tex_top.as_str(),
+            blend_modes = blend_modes.as_str(),
+            blend_cover,
+            blend_cover_hist = blend_cover_hist.as_str(),
+            blend_alloc,
+            render_encode_ms,
+            render_submit_ms,
+            render_frames,
+            commit_mb,
+            blend_passes,
+            blend_groups,
+            blend_group_max,
+            blend_swfs = blend_swfs.as_str(),
+            avatar_caches,
             "AQW memory sweep"
         );
 
@@ -1721,7 +2029,7 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         {
             let _ = writeln!(
                 file,
-                "AQW sweep: orphans={orphans} loaders={loaders} cached_objects={cached_objects} cache_mb={cache_mb} evicted_mb={evicted_mb} over_budget={over_budget} movie_libs_total={movie_libs_total} movie_libs_aqw={movie_libs_aqw} avatar_roots={avatar_roots} redraw_large={redraw_large} redraw_small={redraw_small} redraw_aged={redraw_aged} redraw_deferred={redraw_deferred} stale_fallback={stale_fallback} blend_layers={blend_layers} tick_orphan_ms={tick_orphan_ms} tick_stage_ms={tick_stage_ms} tick_bcast_ms={tick_bcast_ms} orphans_frozen={orphans_frozen} vram_mb={vram_mb} vram_budget_mb={vram_budget_mb} vram_pressure={vram_pressure} pool_allocs={pool_allocs} pool_free={pool_free} pool_mb={pool_mb}"
+                "AQW sweep: orphans={orphans} loaders={loaders} cached_objects={cached_objects} cache_mb={cache_mb} evicted_mb={evicted_mb} over_budget={over_budget} movie_libs_total={movie_libs_total} movie_libs_aqw={movie_libs_aqw} avatar_roots={avatar_roots} redraw_large={redraw_large} redraw_small={redraw_small} redraw_aged={redraw_aged} redraw_deferred={redraw_deferred} stale_fallback={stale_fallback} blend_layers={blend_layers} tick_orphan_ms={tick_orphan_ms} tick_stage_ms={tick_stage_ms} tick_bcast_ms={tick_bcast_ms} orphans_frozen={orphans_frozen} vram_mb={vram_mb} vram_budget_mb={vram_budget_mb} vram_pressure={vram_pressure} pool_allocs={pool_allocs} pool_free={pool_free} pool_mb={pool_mb} tex_allocs={tex_allocs} tex_free={tex_free} tex_mb={tex_mb} tex_top={tex_top} blend_modes={blend_modes} blend_cover={blend_cover}% blend_cover_hist={blend_cover_hist} blend_alloc={blend_alloc}% render_encode_ms={render_encode_ms} render_submit_ms={render_submit_ms} render_frames={render_frames} commit_mb={commit_mb} blend_passes={blend_passes} blend_groups={blend_groups} blend_group_max={blend_group_max} blend_swfs={blend_swfs} avatar_caches={avatar_caches}"
             );
         }
     }
@@ -1800,6 +2108,9 @@ pub fn render_base<'gc>(
     let blend_mode = this.blend_mode();
     let original_commands = if blend_mode != ExtendedBlendMode::Normal {
         AQW_BLEND_LAYERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if aqw_diagnostics_enabled() {
+            note_blend_source(&this.movie().url());
+        }
         Some(std::mem::take(&mut context.commands))
     } else {
         None
@@ -1809,6 +2120,15 @@ pub fn render_base<'gc>(
         let mut cache_info: Option<DrawCacheInfo> = None;
         let base_transform = context.transform_stack.transform();
         let allow_aqw_large_cache = is_aqw_movie_url(this.movie().url());
+        // A cache we switched on for avatar art, rather than one the content
+        // asked for. These belong to objects that move, so they get neither
+        // pixel snapping nor deferral -- both are only safe for art that holds
+        // still, and here they show up as shaking and as art left behind during
+        // a zoom.
+        let aqw_auto_cache = !aqw_avatar_cache_disabled()
+            && this
+                .as_movie_clip()
+                .is_some_and(|clip| clip.is_aqw_avatar_asset_root());
         // A non-finite or absurdly-scaled transform can't yield a usable cache (it
         // would be rejected as "incredibly large" further down anyway). Detect it
         // from the matrix up front so we skip the bounds traversal and the cache
@@ -1908,7 +2228,12 @@ pub fn render_base<'gc>(
                         // the swarm is what melts FPS. They now draw from their own
                         // per-frame quota instead.
                         let mut admitted_aged = false;
-                        let mut can_redraw_cache = if !allow_aqw_large_cache {
+                        let mut can_redraw_cache = if !allow_aqw_large_cache || aqw_auto_cache {
+                            // Deferral trades freshness for frame time, which
+                            // only works when the art is standing still. An
+                            // avatar cache that misses its redraw during a zoom
+                            // composites at the previous scale and visibly
+                            // detaches, so these always redraw.
                             true
                         } else if is_large {
                             context.try_reserve_dirty_cache_redraw(redraw_pixels)
@@ -1964,6 +2289,7 @@ pub fn render_base<'gc>(
                                 draw_offset,
                                 filters,
                                 offset_override: None,
+                                aqw_auto_cache,
                             });
                         } else {
                             // Prefer an existing cache while the redraw is deferred.
@@ -2022,6 +2348,7 @@ pub fn render_base<'gc>(
                                     draw_offset,
                                     filters,
                                     offset_override,
+                                    aqw_auto_cache,
                                 })
                             };
 
@@ -2048,6 +2375,7 @@ pub fn render_base<'gc>(
                             draw_offset,
                             filters,
                             offset_override: None,
+                            aqw_auto_cache,
                         });
                     }
                 } else {
@@ -2128,6 +2456,18 @@ pub fn render_base<'gc>(
         }
 
         // When rendering it back, ensure we're only keeping the translation - scale/rotation is within the image already
+        //
+        // Snapping a cache to whole pixels is what Flash does, and it is right
+        // for a cache the content asked for. The AQW avatar caches are ours,
+        // not the content's: an avatar walking at sub-pixel speed would jump
+        // half a pixel every frame, which reads as the art shaking. Those draw
+        // at their true position instead -- the drift guard only reacts above
+        // 16px, so nothing else catches this.
+        let pixel_snapping = if cache_info.aqw_auto_cache {
+            PixelSnapping::Never
+        } else {
+            PixelSnapping::Always
+        };
         apply_standard_mask_and_scroll(
             this,
             context,
@@ -2144,7 +2484,7 @@ pub fn render_base<'gc>(
                         perspective_projection: cache_info.base_transform.perspective_projection,
                     },
                     true,
-                    PixelSnapping::Always, // cacheAsBitmap forces pixel snapping
+                    pixel_snapping,
                 )
             },
             &options,
@@ -4377,5 +4717,40 @@ impl<'gc> DisplayObjectWeak<'gc> {
             DisplayObjectWeak::LoaderDisplay(ld) => ld.upgrade(mc).map(|ld| ld.into()),
             DisplayObjectWeak::Bitmap(b) => b.upgrade(mc).map(|ld| ld.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::{url_host, url_path_has_segment};
+
+    #[test]
+    fn segments_match_whole_and_ignore_case_and_query() {
+        assert!(url_path_has_segment(
+            "https://game.aq.com/game/gamefiles/Loader3.swf",
+            "gamefiles"
+        ));
+        // The path in front of the segment is free to move.
+        assert!(url_path_has_segment(
+            "https://cdn.example.com/GameFiles/items/Sword.swf",
+            "gamefiles"
+        ));
+        assert!(url_path_has_segment(
+            "https://game.aq.com/game/gamefiles/items/Sword.swf?v=2",
+            "items"
+        ));
+        // A partial name is not a segment, and neither is a query value.
+        assert!(!url_path_has_segment("https://a/gamefiles2/x.swf", "gamefiles"));
+        assert!(!url_path_has_segment("https://a/b/x.swf?dir=items", "items"));
+    }
+
+    #[test]
+    fn hosts_drop_the_port_and_the_path() {
+        assert_eq!(
+            url_host("https://game.aq.com/game/gamefiles/Loader3.swf"),
+            Some("game.aq.com")
+        );
+        assert_eq!(url_host("http://localhost:8080/movie.swf"), Some("localhost"));
+        assert_eq!(url_host("relative/movie.swf"), None);
     }
 }

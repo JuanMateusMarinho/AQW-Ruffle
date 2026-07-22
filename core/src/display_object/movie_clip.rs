@@ -52,6 +52,7 @@ use std::borrow::Cow;
 use std::cell::{Cell, OnceCell, Ref, RefCell, RefMut};
 use std::cmp::max;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use swf::extensions::ReadSwfExt;
 use swf::{ClipEventFlag, DefineBitsLossless, FrameLabelData, TagCode, UTF_8};
@@ -86,10 +87,27 @@ fn aqw_hidden_freeze_disabled() -> bool {
     *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_HIDDEN_FREEZE").is_some())
 }
 
-fn is_aqw_avatar_asset_movie_url(url: &str) -> bool {
-    url.contains("/gamefiles/items/")
-        || url.contains("/gamefiles/classes/")
-        || url.contains("/gamefiles/hair/")
+pub(super) fn is_aqw_avatar_asset_movie_url(url: &str) -> bool {
+    // Single pass over the path segments. Testing each folder name separately
+    // re-split the whole URL once per name (up to four scans of the same
+    // string); this is called for every node of the orphan subtree probe, so
+    // the repeats multiplied by the orphan count.
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let (mut under_gamefiles, mut avatar_folder) = (false, false);
+    for segment in path.split('/') {
+        if segment.eq_ignore_ascii_case("gamefiles") {
+            under_gamefiles = true;
+        } else if segment.eq_ignore_ascii_case("items")
+            || segment.eq_ignore_ascii_case("classes")
+            || segment.eq_ignore_ascii_case("hair")
+        {
+            avatar_folder = true;
+        }
+        if under_gamefiles && avatar_folder {
+            return true;
+        }
+    }
+    false
 }
 
 /// Kill-switch for the orphan (off-display-list) avatar freeze, so it can be
@@ -141,14 +159,75 @@ enum AqwCrtGame {
     DragonFable,
 }
 
+/// Which game this process is running, decided by host rather than by path.
+/// `/game/gamefiles/` is also MechQuest's layout, so keying on it handed
+/// MechQuest AQW's persisted filter state with no row to turn it back off. The
+/// host is also what survives the game moving its files around.
 fn aqw_crt_game(url: &str) -> Option<AqwCrtGame> {
-    if super::is_aqw_movie_url(url) {
+    let host = super::url_host(url)?;
+    if host == "aq.com" || host.ends_with(".aq.com") {
         Some(AqwCrtGame::Aqw)
-    } else if url.contains("dragonfable") {
+    } else if host.contains("dragonfable") {
         Some(AqwCrtGame::DragonFable)
     } else {
         None
     }
+}
+
+/// Diagnostics for the injected row, which is the most game-shaped thing here:
+/// it is found by the panel's own instance names, so a rebuilt options menu
+/// would silently stop producing it. Seeing "panel" without "row" in the gate
+/// report is the signal that the panel's insides changed.
+static AQW_CRT_PANEL_SEEN: AtomicBool = AtomicBool::new(false);
+static AQW_CRT_ROW_INJECTED: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn aqw_crt_panel_seen() -> bool {
+    AQW_CRT_PANEL_SEEN.load(Ordering::Relaxed)
+}
+
+pub(super) fn aqw_crt_row_injected() -> bool {
+    AQW_CRT_ROW_INJECTED.load(Ordering::Relaxed)
+}
+
+pub(super) fn aqw_crt_game_name(url: &str) -> &'static str {
+    match aqw_crt_game(url) {
+        Some(AqwCrtGame::Aqw) => "aqw",
+        Some(AqwCrtGame::DragonFable) => "dragonfable",
+        None => "none",
+    }
+}
+
+fn aqw_crt_note_panel_found() {
+    if !AQW_CRT_PANEL_SEEN.swap(true, Ordering::Relaxed) && aqw_diagnostics_enabled() {
+        tracing::info!(target: "aqw_diag", "AQW_CRT: options panel found");
+    }
+}
+
+fn aqw_crt_note_row_injected() {
+    AQW_CRT_ROW_INJECTED.store(true, Ordering::Relaxed);
+    if aqw_diagnostics_enabled() {
+        tracing::info!(target: "aqw_diag", "AQW_CRT: options row injected");
+    }
+}
+
+/// Toggle the filter from outside the game's own UI.
+///
+/// The injected row is the normal way in, but it hangs off the game's panel
+/// structure; this keeps a way in that doesn't. `None` outside the games that
+/// have the filter, whose state is the only state that gets armed.
+pub fn aqw_crt_toggle_external() -> Option<bool> {
+    AQW_CRT_CONFIG.get()?;
+    let on = !ruffle_render::backend::aqw_crt_filter_enabled();
+    ruffle_render::backend::set_aqw_crt_filter(on);
+    aqw_crt_persist(on);
+    if aqw_diagnostics_enabled() {
+        tracing::info!(
+            target: "aqw_diag",
+            "AQW_CRT: toggled {} from the hotkey",
+            if on { "ON" } else { "OFF" }
+        );
+    }
+    Some(on)
 }
 
 /// Where the CRT toggle persists between sessions (the injected row has no
@@ -304,9 +383,6 @@ fn aqw_crt_set_row_text<'gc>(
 /// that renumber characters don't break it - the row simply requires one
 /// visit to the General tab (where `mcVis` lives) to appear.
 pub fn aqw_crt_menu_tick(context: &mut UpdateContext<'_>) {
-    if aqw_crt_menu_disabled() {
-        return;
-    }
     let Some(game) = aqw_crt_game(context.stage.movie().url()) else {
         return;
     };
@@ -315,7 +391,12 @@ pub fn aqw_crt_menu_tick(context: &mut UpdateContext<'_>) {
     if TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 6 != 0 {
         return;
     }
+    // Ahead of the row's kill-switch: it also arms the persisted state and the
+    // hotkey that writes it, neither of which is about the row.
     aqw_crt_init_state(game);
+    if aqw_crt_menu_disabled() {
+        return;
+    }
 
     match game {
         AqwCrtGame::Aqw => aqw_crt_aqw_tick(context),
@@ -331,6 +412,7 @@ fn aqw_crt_aqw_tick(context: &mut UpdateContext<'_>) {
     ) else {
         return;
     };
+    aqw_crt_note_panel_found();
     let on = ruffle_render::backend::aqw_crt_filter_enabled();
     let value_text: &WStr = if on {
         WStr::from_units(b"ON")
@@ -447,9 +529,7 @@ fn aqw_crt_aqw_tick(context: &mut UpdateContext<'_>) {
         arrow_at(right_matrix, right_tx),
         "aqwCrtRight",
     );
-    if aqw_diagnostics_enabled() {
-        tracing::info!(target: "aqw_diag", "AQW_CRT: options row injected");
-    }
+    aqw_crt_note_row_injected();
 }
 
 /// DragonFable: inject a "CRT Filter" checkbox row into the Options book's
@@ -468,6 +548,7 @@ fn aqw_crt_df_tick(context: &mut UpdateContext<'_>) {
     ) else {
         return;
     };
+    aqw_crt_note_panel_found();
     let on = ruffle_render::backend::aqw_crt_filter_enabled();
 
     if let Some(check) = panel.child_by_name(WStr::from_units(b"aqwCrtCheck"), false) {
@@ -555,9 +636,7 @@ fn aqw_crt_df_tick(context: &mut UpdateContext<'_>) {
     {
         edit.set_text(WStr::from_units(b"CRT Filter"), context);
     }
-    if aqw_diagnostics_enabled() {
-        tracing::info!(target: "aqw_diag", "AQW_CRT: DF options row injected");
-    }
+    aqw_crt_note_row_injected();
 }
 
 /// Library id of a Noto-Serif EditText to clone for the DF row label.
@@ -3174,7 +3253,7 @@ impl<'gc> MovieClip<'gc> {
     /// are class instances, not loaded roots. "Topmost" = my movie is an
     /// avatar-asset SWF and my parent isn't a clip from an avatar-asset SWF
     /// (clips further down are covered by the topmost node's early return).
-    fn is_aqw_avatar_asset_root(self) -> bool {
+    pub(super) fn is_aqw_avatar_asset_root(self) -> bool {
         let movie = self.movie();
         match self.parent() {
             None => is_aqw_avatar_asset_movie_url(movie.url()),
@@ -3220,6 +3299,27 @@ impl<'gc> MovieClip<'gc> {
     ) -> bool {
         if !self.is_aqw_avatar_asset_root() {
             return false;
+        }
+
+        // AQW item and class SWFs shade their art with dozens to hundreds of
+        // separately blended pieces, and none of them asks for a bitmap cache:
+        // a measured class file carries 139 blend placements against about 13
+        // in an ordinary helm, and declares `cacheAsBitmap` zero times. Every
+        // one of those becomes its own render target and pair of render passes,
+        // rebuilt each frame for art that did not change -- the per-file blend
+        // tally repeats to the unit between sweeps.
+        //
+        // Flash never paid that, because it only re-rasterized regions that
+        // actually changed. A cache is the equivalent: the blends resolve once
+        // into a texture and are reused until the art really moves. Set here,
+        // in the tick, rather than mid-render, because enabling it takes a
+        // mutable borrow of the object. Kill-switch `RUFFLE_AQW_NO_AVATAR_CACHE`.
+        if !crate::display_object::aqw_avatar_cache_disabled()
+            && !self.is_bitmap_cached_preference()
+        {
+            self.set_bitmap_cached_preference(true);
+            crate::display_object::AQW_AVATAR_CACHES_ENABLED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         self.0.aqw_skip_timeline_frame.set(false);
@@ -5905,5 +6005,44 @@ impl ClipEventHandler {
             key_code,
             action_data,
         }
+    }
+}
+
+#[cfg(test)]
+mod avatar_asset_url_tests {
+    use super::is_aqw_avatar_asset_movie_url;
+
+    #[test]
+    fn needs_both_gamefiles_and_an_avatar_folder() {
+        assert!(is_aqw_avatar_asset_movie_url(
+            "https://game.aq.com/game/gamefiles/items/Sword.swf"
+        ));
+        assert!(is_aqw_avatar_asset_movie_url(
+            "https://game.aq.com/game/gamefiles/classes/Rogue.swf"
+        ));
+        assert!(is_aqw_avatar_asset_movie_url(
+            "https://game.aq.com/game/gamefiles/hair/Spiky.swf"
+        ));
+        // Order of the two segments is not significant.
+        assert!(is_aqw_avatar_asset_movie_url("https://a/items/gamefiles/x.swf"));
+
+        // The root movie is under gamefiles but is not avatar art.
+        assert!(!is_aqw_avatar_asset_movie_url(
+            "https://game.aq.com/game/gamefiles/Loader3.swf"
+        ));
+        // An avatar folder outside gamefiles is some other game.
+        assert!(!is_aqw_avatar_asset_movie_url("https://other.com/game/items/Sword.swf"));
+    }
+
+    #[test]
+    fn matches_whole_segments_ignoring_case_and_query() {
+        assert!(is_aqw_avatar_asset_movie_url(
+            "https://game.aq.com/GAMEFILES/Items/Sword.swf?v=2"
+        ));
+        // Partial names are not segments.
+        assert!(!is_aqw_avatar_asset_movie_url("https://a/gamefiles2/items/x.swf"));
+        assert!(!is_aqw_avatar_asset_movie_url("https://a/gamefiles/items2/x.swf"));
+        // Query values are not path segments.
+        assert!(!is_aqw_avatar_asset_movie_url("https://a/gamefiles/x.swf?dir=items"));
     }
 }

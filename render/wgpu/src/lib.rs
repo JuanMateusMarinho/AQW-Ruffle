@@ -40,6 +40,7 @@ pub mod backend;
 mod blend;
 mod buffer_builder;
 mod buffer_pool;
+mod content_bounds;
 #[cfg(feature = "clap")]
 pub mod clap;
 pub mod descriptors;

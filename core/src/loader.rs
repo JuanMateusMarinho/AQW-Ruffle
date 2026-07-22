@@ -79,7 +79,7 @@ fn is_aqw_empty_asset_url(url: &str) -> bool {
     let path_matches = parsed.path().contains("/game/gamefiles/")
         && parsed
             .path_segments()
-            .and_then(|segments| segments.filter(|segment| !segment.is_empty()).last())
+            .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
             .is_some_and(|segment| segment.eq_ignore_ascii_case("none"));
 
     host_matches && path_matches

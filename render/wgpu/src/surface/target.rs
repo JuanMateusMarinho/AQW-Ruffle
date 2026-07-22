@@ -1,12 +1,13 @@
 use crate::Transforms;
 use crate::backend::RenderTargetMode;
 use crate::buffer_pool::{AlwaysCompatible, PoolEntry, TexturePool, quantize_pool_dimension};
+use crate::content_bounds::ContentBounds;
 use crate::descriptors::Descriptors;
 use crate::filters::FilterSource;
 use crate::globals::Globals;
 use crate::utils::create_buffer_with_data;
 use crate::utils::run_copy_pipeline;
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::sync::{Arc, OnceLock};
 
 /// Kill-switch: `RUFFLE_AQW_NO_FILTER_PAD` restores exact-size filter render
@@ -216,6 +217,11 @@ pub struct CommandTarget {
     whole_frame_bind_group: OnceCell<(wgpu::Buffer, wgpu::BindGroup)>,
     color_needs_clear: OnceCell<bool>,
     render_target_mode: RenderTargetMode,
+    /// Extent of the commands drawn into this target, in its pixel space.
+    ///
+    /// Filled in by `Surface::draw_commands` once the command list has been
+    /// chunked. Stays empty for targets nothing was drawn into.
+    content_bounds: Cell<ContentBounds>,
 }
 
 impl CommandTarget {
@@ -351,7 +357,26 @@ impl CommandTarget {
             whole_frame_bind_group,
             color_needs_clear: OnceCell::new(),
             render_target_mode,
+            content_bounds: Cell::new(ContentBounds::EMPTY),
         }
+    }
+
+    pub fn content_bounds(&self) -> ContentBounds {
+        self.content_bounds.get()
+    }
+
+    pub fn set_content_bounds(&self, bounds: ContentBounds) {
+        // Only a target cleared to a flat colour holds nothing but what was
+        // just drawn into it. `FreshWithTexture` starts as a copy of an earlier
+        // texture, so its real content is whatever that held -- the commands
+        // alone do not bound it.
+        self.content_bounds.set(
+            if matches!(self.render_target_mode, RenderTargetMode::FreshWithColor(_)) {
+                bounds
+            } else {
+                ContentBounds::UNBOUNDED
+            },
+        );
     }
 
     pub fn width(&self) -> u32 {
@@ -478,11 +503,19 @@ impl CommandTarget {
         })
     }
 
+    /// Snapshots this target's colour into a buffer the blend shaders can read
+    /// as `dst`, since a pass cannot sample the attachment it writes.
+    ///
+    /// `region` limits the copy to `(x, y, width, height)`; the caller must
+    /// then read back only within that rect, because the rest of the buffer
+    /// keeps whatever a previous blend on this target left there. Passing
+    /// `None` copies the whole surface.
     pub fn update_blend_buffer(
         &self,
         descriptors: &Descriptors,
         pool: &mut TexturePool,
         encoder: &mut wgpu::CommandEncoder,
+        region: Option<(u32, u32, u32, u32)>,
     ) -> &BlendBuffer {
         let blend_buffer = self.blend_buffer.get_or_init(|| {
             BlendBuffer::new(
@@ -496,6 +529,27 @@ impl CommandTarget {
             )
         });
         self.ensure_cleared(encoder);
+
+        let full = self.frame_buffer.size();
+        let (origin, extent) = match region {
+            Some((x, y, width, height)) => {
+                let x = x.min(full.width);
+                let y = y.min(full.height);
+                (
+                    wgpu::Origin3d { x, y, z: 0 },
+                    wgpu::Extent3d {
+                        width: width.min(full.width - x),
+                        height: height.min(full.height - y),
+                        depth_or_array_layers: full.depth_or_array_layers,
+                    },
+                )
+            }
+            None => (Default::default(), full),
+        };
+        if extent.width == 0 || extent.height == 0 {
+            return blend_buffer;
+        }
+
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: self
@@ -504,16 +558,16 @@ impl CommandTarget {
                     .map(|b| b.texture())
                     .unwrap_or_else(|| self.frame_buffer.texture()),
                 mip_level: 0,
-                origin: Default::default(),
+                origin,
                 aspect: Default::default(),
             },
             wgpu::TexelCopyTextureInfo {
                 texture: blend_buffer.texture(),
                 mip_level: 0,
-                origin: Default::default(),
+                origin,
                 aspect: Default::default(),
             },
-            self.frame_buffer.size(),
+            extent,
         );
         blend_buffer
     }

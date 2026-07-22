@@ -94,6 +94,70 @@ pub trait RenderBackend: Any {
         None
     }
 
+    /// The same triple for the pool backing the *main surface* — the scene
+    /// draw and the blend/mask/filter targets nested inside it.
+    ///
+    /// Reported separately because the two pools are managed differently, and
+    /// a backend may reclaim one while letting the other accumulate; a caller
+    /// watching only `offscreen_pool_stats` would see none of that.
+    fn surface_pool_stats(&self) -> Option<(u64, u64, u64)> {
+        None
+    }
+
+    /// The main-surface pool's biggest buckets as `(width, height, count,
+    /// bytes)`, largest first — what shape the retention above actually has.
+    fn surface_pool_largest(&self, _limit: usize) -> Vec<(u32, u32, usize, u64)> {
+        Vec::new()
+    }
+
+    /// Blend modes that needed a render pass of their own since the last call,
+    /// as `(mode, count)` busiest-first, and cleared by reading.
+    ///
+    /// A backend that composites these into full-surface passes pays per pass
+    /// regardless of how small the blended object is, so this says where that
+    /// cost is concentrated.
+    fn take_complex_blend_counts(&mut self) -> Vec<(&'static str, u64)> {
+        Vec::new()
+    }
+
+    /// How much of the surface those blend passes actually covered since the
+    /// last call, as `(percent, [<=1%, <=5%, <=25%, >25%] layer counts)`.
+    ///
+    /// The count above says how many passes ran; this says how much of each one
+    /// was live. A backend that bounds its blend passes to the blended object
+    /// reports the same count at a fraction of the fill.
+    fn take_blend_coverage(&mut self) -> (u64, [u64; 4]) {
+        (0, [0; 4])
+    }
+
+    /// Pixels allocated for blend render targets since the last call, as a
+    /// percentage of what full-surface targets would have cost.
+    ///
+    /// Hundreds of these are alive at once in a busy scene, so their size is a
+    /// memory question, not just a fill one.
+    fn take_blend_alloc(&mut self) -> u64 {
+        100
+    }
+
+    /// Frame-building cost since the last call, as
+    /// `(encode_ms, submit_ms, frames, process_commit_mb)`.
+    ///
+    /// Encode is CPU spent recording commands; submit is what handing them over
+    /// costs, which is where a GPU that cannot keep up shows up. Process commit
+    /// is system memory, which runs out independently of VRAM.
+    fn take_render_timings(&mut self) -> (u64, u64, u64, u64) {
+        (0, 0, 0, 0)
+    }
+
+    /// How well complex blend passes could be merged, as
+    /// `(passes, groups, biggest_group)`.
+    ///
+    /// Overlapping blends must stay sequential, so `passes / groups` is the
+    /// most that merging them could ever save.
+    fn take_blend_grouping(&mut self) -> (u64, u64, u64) {
+        (0, 0, 0)
+    }
+
     fn submit_frame(
         &mut self,
         clear: swf::Color,
