@@ -146,6 +146,13 @@ impl Shaders {
                             .map(|n| n.clamp(0.0, 4.0))
                             .unwrap_or(0.7)
                     ),
+                )
+                .replace(
+                    "const ASPECT_43: u32 = 1u;",
+                    &format!(
+                        "const ASPECT_43: u32 = {}u;",
+                        u32::from(ruffle_render::backend::aqw_crt_aspect_43_enabled())
+                    ),
                 );
             make_shader(device, "copy_crt.wgsl", &source)
         };

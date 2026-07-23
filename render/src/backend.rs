@@ -765,3 +765,28 @@ pub fn aqw_crt_warp_strength() -> f32 {
             .unwrap_or(if is_df { 0.04 } else { 0.025 })
     })
 }
+
+/// Whether the CRT present filter squeezes its (16:9) content into a centred
+/// 4:3 region — the look of a widescreen signal on an old 4:3 tube, dark
+/// surround on the sides. Shared for the same reason as the warp above: the
+/// wgpu backend bakes it into the present shader while the desktop host must
+/// apply the SAME horizontal squeeze to mouse coordinates, or clicks land off
+/// the squeezed picture. Only meaningful while the CRT filter is on.
+///
+/// `RUFFLE_AQW_CRT_ASPECT_43` overrides (`0`/`false`/`off` = disable). Default
+/// is on for AQW — the game whose 16:9 art this is for — and off for
+/// DragonFable.
+pub fn aqw_crt_aspect_43_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if let Some(v) = std::env::var_os("RUFFLE_AQW_CRT_ASPECT_43") {
+            let v = v.to_string_lossy();
+            let v = v.trim();
+            return !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"));
+        }
+        let is_df = std::env::var("ARTIX_RUFFLE_GAME").is_ok_and(|v| v == "df")
+            || std::env::var("ARTIX_RUFFLE_GAME_ICON").is_ok_and(|v| v == "dragonfable");
+        !is_df
+    })
+}

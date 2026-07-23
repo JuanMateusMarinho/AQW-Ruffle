@@ -365,6 +365,47 @@ impl GuiController {
         (((cx * f) + 1.0) * 0.5 * w, ((cy * f) + 1.0) * 0.5 * h)
     }
 
+    /// Fraction of the movie-area width the 4:3 tube occupies, or `None` when
+    /// the squeeze is off or the window is already 4:3-or-narrower (nothing to
+    /// squeeze). Mirrors the shader's `content_frac`.
+    fn crt_aspect_43_content_frac(&self) -> Option<f64> {
+        if !ruffle_render::backend::aqw_crt_aspect_43_enabled()
+            || !ruffle_render::backend::aqw_crt_filter_enabled()
+        {
+            return None;
+        }
+        let w = f64::from(self.size.width);
+        let h = f64::from(self.size.height) - self.height_offset();
+        if w <= 0.0 || h <= 0.0 {
+            return None;
+        }
+        let frac = (4.0 / 3.0) / (w / h);
+        (frac < 1.0).then_some(frac)
+    }
+
+    /// Forward 4:3 squeeze in movie-area window coordinates: the present shows
+    /// the content of the centred 4:3 region at screen `x`, so a click at `x`
+    /// is aiming at the squeezed coordinate. The SAME map the shader applies
+    /// to `uv.x`. Runs before the warp, matching the shader's order.
+    fn crt_squeeze_window_position(&self, x: f64, y: f64) -> (f64, f64) {
+        let Some(frac) = self.crt_aspect_43_content_frac() else {
+            return (x, y);
+        };
+        let w = f64::from(self.size.width);
+        let margin = (1.0 - frac) * 0.5;
+        (((x / w - margin) / frac) * w, y)
+    }
+
+    /// Inverse of [`Self::crt_squeeze_window_position`].
+    fn crt_unsqueeze_window_position(&self, x: f64, y: f64) -> (f64, f64) {
+        let Some(frac) = self.crt_aspect_43_content_frac() else {
+            return (x, y);
+        };
+        let w = f64::from(self.size.width);
+        let margin = (1.0 - frac) * 0.5;
+        ((x / w * frac + margin) * w, y)
+    }
+
     /// Inverse of [`Self::crt_warp_window_position`] (fixed-point
     /// iteration; the warp is gentle so two rounds converge well below a
     /// pixel).
@@ -397,14 +438,19 @@ impl GuiController {
         // Reads the factor currently in effect — the renderer may gate SSAA off
         // for large windows — so clicks track whatever is actually rendering.
         let ss = f64::from(aqw_current_supersample());
-        let (wx, wy) = self.crt_warp_window_position(position.x, position.y - self.height_offset());
+        // Present order is squeeze -> warp, so window -> movie applies the same:
+        // squeeze first, then warp.
+        let (sx, sy) = self.crt_squeeze_window_position(position.x, position.y - self.height_offset());
+        let (wx, wy) = self.crt_warp_window_position(sx, sy);
         (wx * ss, wy * ss)
     }
 
     pub fn movie_to_window_position(&self, x: f64, y: f64) -> PhysicalPosition<f64> {
         let ss = f64::from(aqw_current_supersample());
+        // Inverse of window -> movie: undo the warp, then the squeeze.
         let (ux, uy) = self.crt_unwarp_window_position(x / ss, y / ss);
-        PhysicalPosition::new(ux, uy + self.height_offset())
+        let (sx, sy) = self.crt_unsqueeze_window_position(ux, uy);
+        PhysicalPosition::new(sx, sy + self.height_offset())
     }
 
     pub fn render(&mut self, mut player: Option<MutexGuard<Player>>) {

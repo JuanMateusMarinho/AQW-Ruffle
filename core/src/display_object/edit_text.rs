@@ -44,11 +44,16 @@ use ruffle_render::transform::Transform;
 use ruffle_wstr::WStrToUtf8;
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use swf::ColorTransform;
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::interactive::Avm2MousePick;
+
+fn char_limit_hint_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_CHAR_LIMIT_HINT").is_some())
+}
 
 /// The kind of autosizing behavior an `EditText` should have, if any
 #[derive(Copy, Clone, Collect, Debug, PartialEq, Eq)]
@@ -1275,6 +1280,7 @@ impl<'gc> EditText<'gc> {
         if let Some((text, _tf, font, params, color)) =
             lbox.as_renderable_text(self.0.text_spans.borrow().displayed_text())
         {
+            let color = self.char_limit_hint_color().unwrap_or(color);
             let metrics = font.metrics();
             let ascent = metrics.ascent(params.height());
             let descent = metrics.descent(params.height());
@@ -1635,6 +1641,44 @@ impl<'gc> EditText<'gc> {
 
     pub fn set_max_chars(self, value: i32) {
         self.0.max_chars.set(value);
+    }
+
+    /// Colour to draw an input field with once it is running out of room,
+    /// or `None` while there is still plenty left.
+    ///
+    /// A field with `maxChars` set just stops accepting keystrokes when it
+    /// fills up, with nothing on screen to explain why. AQW's chat entry is
+    /// capped at 150 characters and it's easy to type past that mid-sentence,
+    /// so the text warms to amber as the room runs out and goes red once the
+    /// field refuses further input. Tinting the text (and with it the caret
+    /// and underline, which are drawn in the same colour) costs no space in a
+    /// layout the content owns. `RUFFLE_AQW_NO_CHAR_LIMIT_HINT` disables it.
+    fn char_limit_hint_color(self) -> Option<Color> {
+        /// Bright enough to read against the dark chat backdrop.
+        const WARNING_COLOR: Color = Color::from_rgb(0xffc400, 255);
+        const LIMIT_COLOR: Color = Color::from_rgb(0xff3b30, 255);
+        /// Short caps (spin-box digits, initials) are always near their limit,
+        /// so a hint there would be permanent decoration rather than a warning.
+        const MIN_LIMIT: i32 = 20;
+        /// Upper bound on how early the warning starts, in characters left.
+        const MAX_WARNING_MARGIN: i32 = 20;
+
+        if !self.is_editable() || char_limit_hint_disabled() {
+            return None;
+        }
+        let max_chars = self.max_chars();
+        if max_chars < MIN_LIMIT || !super::is_aqw_movie_url(self.movie().url()) {
+            return None;
+        }
+
+        let remaining = max_chars - self.text_length() as i32;
+        if remaining <= 0 {
+            Some(LIMIT_COLOR)
+        } else if remaining <= (max_chars / 8).min(MAX_WARNING_MARGIN) {
+            Some(WARNING_COLOR)
+        } else {
+            None
+        }
     }
 
     /// Map the position on the screen to caret index.

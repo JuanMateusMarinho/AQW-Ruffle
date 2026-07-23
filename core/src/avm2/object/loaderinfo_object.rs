@@ -348,16 +348,24 @@ impl<'gc> LoaderInfoObject<'gc> {
             .display_object();
         let mut loader = loader_display_object.as_container().unwrap();
 
-        // Remove only the content tracked by LoaderInfo. User code can add
-        // auxiliary children to Loader, and Flash does not purge those here.
-        if let Some(content) = previous_content
-            && content
+        // A load that is still in flight has to be cancelled here too, and it
+        // has no parent yet: its content is only inserted into the Loader once
+        // it completes. Calling `load` again while one is in progress aborts
+        // the first, so only the second may deliver `init`/`complete`; letting
+        // the first survive means whichever response arrives first wins the
+        // shared LoaderInfo, and the handler runs against the wrong movie.
+        if let Some(content) = previous_content {
+            context.load_manager.cancel_load_for_target(content);
+
+            // Remove only the content tracked by LoaderInfo. User code can add
+            // auxiliary children to Loader, and Flash does not purge those here.
+            if content
                 .parent()
                 .is_some_and(|parent| DisplayObject::ptr_eq(parent, loader_display_object))
-        {
-            context.load_manager.cancel_load_for_target(content);
-            loader.remove_child(context, content);
-            cleanup_unloaded_display_object_tree(context, content);
+            {
+                loader.remove_child(context, content);
+                cleanup_unloaded_display_object_tree(context, content);
+            }
         }
     }
 }

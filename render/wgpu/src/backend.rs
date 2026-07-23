@@ -199,17 +199,25 @@ pub fn aqw_supersample_factor() -> f32 {
 /// Cap on the *supersampled* pixel area (`width × height × N²`) above which
 /// SSAA drops back to 1× for that window size, re-evaluated on every resize.
 /// Crispness is worth N²× fill/texture bytes at the default ~960×580 window,
-/// but at fullscreen 1080p the same N²× was measured blowing an 8 GB card
-/// past its VRAM budget in about a minute (WDDM paging, ~1 fps) — every
-/// offscreen cache/filter/blend target scales with the render surface.
-/// `RUFFLE_AQW_SUPERSAMPLE_PIXEL_CAP` overrides (in pixels; `0` = uncapped).
+/// but at fullscreen 1080p the same N²× *used to* blow an 8 GB card past its
+/// VRAM budget in about a minute (WDDM paging, ~1 fps) — every offscreen
+/// cache/filter/blend target scales with the render surface.
+///
+/// The V2.0 VRAM work (content-sized blend targets, avatar caching, surface-
+/// pool trimming) cut that peak hard: measured 2026-07-23 in castleparty/
+/// Yulgar/Battleon at true fullscreen 1080p×1.25 (2400×1350 = 3.24M px), VRAM
+/// peaked at 3.76 GB of a 7.24 GB grant with pool pressure at 0 — no paging,
+/// ~21 ms/frame. So the cap now sits just above 1080p×1.25 (3.3M): full
+/// crispness at 1080p, still falling back beyond it (e.g. 1440p×1.25 = 5.76M)
+/// where the wall is real again. `RUFFLE_AQW_SUPERSAMPLE_PIXEL_CAP` overrides
+/// (in pixels; `0` = uncapped).
 fn aqw_supersample_pixel_cap() -> u64 {
     static CAP: OnceLock<u64> = OnceLock::new();
     *CAP.get_or_init(|| {
         std::env::var("RUFFLE_AQW_SUPERSAMPLE_PIXEL_CAP")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(2_200_000)
+            .unwrap_or(3_300_000)
     })
 }
 

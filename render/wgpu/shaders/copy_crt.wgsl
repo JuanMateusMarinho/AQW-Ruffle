@@ -62,6 +62,12 @@ const BRIGHT: f32 = 1.0;
 // warp (see header).
 const WARP: f32 = 0.04;
 
+// 4:3 aspect (1u = on): squeeze the 16:9 content into a centred region whose
+// displayed aspect is 4:3, dark tube surround on the sides. Rewritten at
+// startup from `aqw_crt_aspect_43_enabled`; the host mirrors the same squeeze
+// in `window_to_movie_position`, so keep the two in lockstep.
+const ASPECT_43: u32 = 1u;
+
 // Virtual line count cap: AQW's native stage is 960x540, so simulate (at
 // most) a 540-line tube stretched over the output. Below 1080 output lines
 // the count adapts so a scanline always spans >= 2 output pixels - visible
@@ -81,11 +87,31 @@ fn main_vertex(in: common__VertexInput) -> VertexOutput {
 
 @fragment
 fn main_fragment(in: VertexOutput) -> @location(0) vec4<f32> {
+    // --- 4:3 squeeze (CRT-only) ---
+    // Map the output position into "tube space": for ASPECT_43 the tube is a
+    // centred region whose displayed aspect is 4:3, and everything below
+    // (warp, resample, scanlines, mask, vignette) then operates within it, so
+    // the phosphor raster stays aligned to the squeezed content and the
+    // vignette hugs the tube's corners. Outside the region is the dark
+    // surround. content_frac = (4/3) / window_aspect: 0.75 on a 16:9 window,
+    // 1.0 (no squeeze) once the window is 4:3 or narrower. The host mirrors
+    // this in `window_to_movie_position` so clicks track the squeezed picture.
+    var ruv = in.uv;
+    if (ASPECT_43 == 1u) {
+        let td = vec2<f32>(textureDimensions(texture));
+        let content_frac = clamp((4.0 / 3.0) / (td.x / td.y), 0.0, 1.0);
+        let margin = (1.0 - content_frac) * 0.5;
+        ruv.x = (in.uv.x - margin) / content_frac;
+        if (ruv.x < 0.0 || ruv.x > 1.0) {
+            return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        }
+    }
+
     // --- Barrel warp ---
-    // The screen position `in.uv` shows the content at warp(uv); outside
+    // The screen position `ruv` shows the content at warp(ruv); outside
     // the warped image the tube face is dark. The host applies this same
     // function to mouse coordinates, keeping clicks aligned.
-    var uv = in.uv;
+    var uv = ruv;
     if (WARP > 0.0) {
         var cc = uv * 2.0 - vec2<f32>(1.0, 1.0);
         cc = cc * (1.0 + WARP * dot(cc, cc));
@@ -131,7 +157,7 @@ fn main_fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // subtle color fringing of a tube's imperfect convergence.
     var col = result.rgb;
     if (ABERRATION > 0.0) {
-        let ca = ABERRATION * fwidth(in.uv.x);
+        let ca = ABERRATION * fwidth(ruv.x);
         col.r = textureSampleLevel(texture, texture_sampler, uv + vec2<f32>(ca, 0.0), 0.0).r;
         col.b = textureSampleLevel(texture, texture_sampler, uv - vec2<f32>(ca, 0.0), 0.0).b;
     }
@@ -139,8 +165,8 @@ fn main_fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // --- Tube softness + phosphor glow (before the scanlines, so the
     // dark rows cut through the halo and stay crisp; glow over the lines
     // erased them, field-observed) ---
-    let gx = 1.6 * fwidth(in.uv.x);
-    let gy = 1.6 * fwidth(in.uv.y);
+    let gx = 1.6 * fwidth(ruv.x);
+    let gy = 1.6 * fwidth(ruv.y);
     let halo = (textureSampleLevel(texture, texture_sampler, uv + vec2<f32>(gx, 0.0), 0.0).rgb
         + textureSampleLevel(texture, texture_sampler, uv - vec2<f32>(gx, 0.0), 0.0).rgb
         + textureSampleLevel(texture, texture_sampler, uv + vec2<f32>(0.0, gy), 0.0).rgb
@@ -155,8 +181,8 @@ fn main_fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // areas around bright content. Linear so blacks actually receive it
     // (the squared glow above vanishes in the dark).
     if (HALATION > 0.0) {
-        let hx = 4.0 * fwidth(in.uv.x);
-        let hy = 4.0 * fwidth(in.uv.y);
+        let hx = 4.0 * fwidth(ruv.x);
+        let hy = 4.0 * fwidth(ruv.y);
         let spill = (textureSampleLevel(texture, texture_sampler, uv + vec2<f32>(hx, hy), 0.0).rgb
             + textureSampleLevel(texture, texture_sampler, uv + vec2<f32>(-hx, hy), 0.0).rgb
             + textureSampleLevel(texture, texture_sampler, uv + vec2<f32>(hx, -hy), 0.0).rgb
@@ -178,7 +204,7 @@ fn main_fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // (shallower dark row); in dark areas the gap stays deep.
     // Row index from the WARPED coordinate so the lines curve with the
     // image, like they do on the glass of a real tube.
-    let out_lines = 1.0 / max(fwidth(in.uv.y), 1e-6);
+    let out_lines = 1.0 / max(fwidth(ruv.y), 1e-6);
     let lines = min(LINES, out_lines * 0.3333);
     let span_px = max(3u, u32(round(out_lines / lines)));
     if (u32(uv.y * out_lines) % span_px == span_px - 1u) {
@@ -199,7 +225,7 @@ fn main_fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // scanline pitch so the triads stay chunky at any output size.
     let span = out_lines / lines;
     let subw = max(1u, u32(round(span * 0.75)));
-    let out_cols = 1.0 / max(fwidth(in.uv.x), 1e-6);
+    let out_cols = 1.0 / max(fwidth(ruv.x), 1e-6);
     let px = u32(uv.x * out_cols);
     let stripe = (px / subw) % 3u;
     var grille = vec3<f32>(1.0 - MASK);
