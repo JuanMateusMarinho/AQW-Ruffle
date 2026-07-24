@@ -1649,10 +1649,12 @@ impl<'gc> EditText<'gc> {
     /// A field with `maxChars` set just stops accepting keystrokes when it
     /// fills up, with nothing on screen to explain why. AQW's chat entry is
     /// capped at 150 characters and it's easy to type past that mid-sentence,
-    /// so the text warms to amber as the room runs out and goes red once the
-    /// field refuses further input. Tinting the text (and with it the caret
-    /// and underline, which are drawn in the same colour) costs no space in a
-    /// layout the content owns. `RUFFLE_AQW_NO_CHAR_LIMIT_HINT` disables it.
+    /// so the text warms to amber with about a sentence of room left and turns
+    /// red for the last few characters, while there is still time to shorten
+    /// the message rather than only once the field refuses further input.
+    /// Tinting the text (and with it the caret and underline, which are drawn
+    /// in the same colour) costs no space in a layout the content owns.
+    /// `RUFFLE_AQW_NO_CHAR_LIMIT_HINT` disables it.
     fn char_limit_hint_color(self) -> Option<Color> {
         /// Bright enough to read against the dark chat backdrop.
         const WARNING_COLOR: Color = Color::from_rgb(0xffc400, 255);
@@ -1660,8 +1662,11 @@ impl<'gc> EditText<'gc> {
         /// Short caps (spin-box digits, initials) are always near their limit,
         /// so a hint there would be permanent decoration rather than a warning.
         const MIN_LIMIT: i32 = 20;
-        /// Upper bound on how early the warning starts, in characters left.
-        const MAX_WARNING_MARGIN: i32 = 20;
+        /// Upper bounds on how early each stage starts, in characters left.
+        /// The fractions below scale with smaller caps and clamp to these on
+        /// AQW's 150-character chat: amber for the last 45, red for the last 10.
+        const MAX_WARNING_MARGIN: i32 = 45;
+        const MAX_LIMIT_MARGIN: i32 = 10;
 
         if !self.is_editable() || char_limit_hint_disabled() {
             return None;
@@ -1672,9 +1677,9 @@ impl<'gc> EditText<'gc> {
         }
 
         let remaining = max_chars - self.text_length() as i32;
-        if remaining <= 0 {
+        if remaining <= (max_chars / 8).min(MAX_LIMIT_MARGIN) {
             Some(LIMIT_COLOR)
-        } else if remaining <= (max_chars / 8).min(MAX_WARNING_MARGIN) {
+        } else if remaining <= (max_chars / 3).min(MAX_WARNING_MARGIN) {
             Some(WARNING_COLOR)
         } else {
             None
