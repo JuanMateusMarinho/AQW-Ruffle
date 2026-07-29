@@ -316,6 +316,7 @@ app.artixRuffleGames = {
 		title: 'Artix Entertainment - Dragon Fable',
 		swfURL: 'https://play.dragonfable.com/game/dfloader.swf',
 		baseURL: 'https://play.dragonfable.com/game/',
+		quality: 'high',
 		width: '1016',
 		height: '700',
 		graphics: 'vulkan'
@@ -326,6 +327,7 @@ app.artixRuffleGames = {
 		title: 'Artix Entertainment - AdventureQuest',
 		swfURL: 'https://aq.battleon.com/game/flash/Lore4652.swf',
 		baseURL: 'https://aq.battleon.com/game/flash/',
+		quality: 'high',
 		width: '800',
 		height: '600',
 		graphics: 'vulkan'
@@ -336,6 +338,7 @@ app.artixRuffleGames = {
 		title: 'Artix Entertainment - MechQuest',
 		swfURL: 'https://play.mechquest.com/game/gamefiles/MQLoader4.swf?isWeb=true',
 		baseURL: 'https://play.mechquest.com/game/gamefiles/',
+		quality: 'high',
 		width: '1016',
 		height: '700',
 		graphics: 'vulkan'
@@ -346,6 +349,7 @@ app.artixRuffleGames = {
 		title: 'Artix Entertainment - OverSoul',
 		swfURL: 'https://oversoul.artix.com/game/OSWrapper0_5_00.swf',
 		baseURL: 'https://oversoul.artix.com/game/',
+		quality: 'high',
 		width: '960',
 		height: '580',
 		graphics: 'vulkan'
@@ -379,7 +383,7 @@ app.launchArtixRuffleGame = (gameName) => {
 		'--spoof-url', gameInfo.swfURL,
 		'--base', gameInfo.baseURL,
 		'--graphics', gameInfo.graphics || 'vulkan',
-		'--quality', 'low',
+		'--quality', gameInfo.quality || 'low',
 		'--power', 'high',
 		'--frame-rate', '24',
 		'--width', gameInfo.width,
@@ -404,8 +408,8 @@ app.launchArtixRuffleGame = (gameName) => {
 			ARTIX_RUFFLE_GAME: gameName,
 			ARTIX_RUFFLE_GAME_ICON: gameInfo.icon,
 			RUST_LOG: 'warn',
-			// SSAA 1.25x for AQW only (sharpens its fine vector lineart); '1' = off.
-			RUFFLE_AQW_SUPERSAMPLE: gameName === 'aqw' ? '1.25' : '1'
+			// SSAA 1.25x for AQW and DragonFable (sharpens their vector lineart); '1' = off.
+			RUFFLE_AQW_SUPERSAMPLE: (gameName === 'aqw' || gameName === 'df') ? '1.25' : '1'
 		});
 
 		const ruffleProcess = spawn(resolvedExe.exePath, args, {

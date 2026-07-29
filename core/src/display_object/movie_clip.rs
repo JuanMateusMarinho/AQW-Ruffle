@@ -549,6 +549,9 @@ fn aqw_crt_df_tick(context: &mut UpdateContext<'_>) {
         return;
     };
     aqw_crt_note_panel_found();
+    if aqw_diagnostics_enabled() {
+        aqw_crt_df_dump_layout(panel);
+    }
     let on = ruffle_render::backend::aqw_crt_filter_enabled();
 
     if let Some(check) = panel.child_by_name(WStr::from_units(b"aqwCrtCheck"), false) {
@@ -565,27 +568,36 @@ fn aqw_crt_df_tick(context: &mut UpdateContext<'_>) {
         return;
     }
 
-    let (Some(chk_ui), Some(chk_fps), Some(chk_weather)) = (
+    let (Some(chk_last), Some(chk_fps), Some(chk_weather)) = (
         panel.child_by_name(WStr::from_units(b"chkUIToggle"), false),
         panel.child_by_name(WStr::from_units(b"chkFPS"), false),
         panel.child_by_name(WStr::from_units(b"chkWeather"), false),
     ) else {
         return;
     };
-    let checkbox_id = chk_ui.id();
+    // chkUIToggle is the last authored GRAPHICS checkbox ("Seasonal Borders"
+    // in the live build, confirmed by the AQW_CRT_DF dump); chkWeather/chkFPS
+    // give the checkbox symbol and the authored row pitch. Walking the column
+    // by symbol id is NOT reliable: the GRAPHICS and SOUND checkboxes share
+    // this symbol with the left options page too, and there is a wide gap down
+    // to SOUND - so the fixed instance name is the stable anchor, and the gate
+    // diagnostics flag it if a game update ever renames it.
+    let checkbox_id = chk_last.id();
     if checkbox_id == 0 {
         return;
     }
-    let ui_matrix = chk_ui.base().matrix();
+    let ui_matrix = chk_last.base().matrix();
     let pitch = chk_fps.base().matrix().ty.get() - chk_weather.base().matrix().ty.get();
     if pitch <= 0 {
         return;
     }
     let row_x = ui_matrix.tx.get();
-    // DF starts the SOUND heading before another full graphics-row pitch
-    // fits. Keep a compact gap here so the injected checkbox clears both the
-    // Seasonal Borders row above and the SOUND heading below.
-    let row_y = ui_matrix.ty.get() + pitch * 4 / 5;
+    // One full row-pitch below the last graphics checkbox: the next slot in
+    // the GRAPHICS grid, full-size and grouped with the other graphics
+    // options. The DF GRAPHICS->SOUND gap is only about a pitch and the big
+    // SOUND heading fills part of it, so the row sits a touch over the heading
+    // - accepted on purpose, chosen over shrinking or relocating the row.
+    let row_y = ui_matrix.ty.get() + pitch;
 
     let Some(label_id) = aqw_crt_df_label_id(context, panel) else {
         return;
@@ -637,6 +649,55 @@ fn aqw_crt_df_tick(context: &mut UpdateContext<'_>) {
         edit.set_text(WStr::from_units(b"CRT Filter"), context);
     }
     aqw_crt_note_row_injected();
+}
+
+/// One-shot recursive dump of the DF options panel (name / id / tx / ty in
+/// panel-space twips, plus scale and any EditText content) so the injected row
+/// can be re-tuned against real geometry after a game update reshuffles the
+/// GRAPHICS column. Gated by the caller on diagnostics; fires once per process.
+fn aqw_crt_df_dump_layout(panel: MovieClip<'_>) {
+    static DUMPED: AtomicBool = AtomicBool::new(false);
+    if DUMPED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // Recursive so nested labels/headings show up (the SOUND heading is not a
+    // direct child); positions accumulate through parent matrices into panel
+    // space, and the scale (sx/sy) exposes size mismatches like the injected
+    // label rendering at the wrong scale.
+    fn walk<'gc>(obj: DisplayObject<'gc>, parent: Matrix, depth: u32, budget: &mut u32) {
+        if *budget == 0 || depth > 4 {
+            return;
+        }
+        *budget -= 1;
+        let m = parent * obj.base().matrix();
+        let name = obj.name().map(|s| s.to_string()).unwrap_or_default();
+        let text = obj
+            .as_edit_text()
+            .map(|edit| edit.text().to_string())
+            .unwrap_or_default();
+        // Only rows carrying a name or visible text: enough to place SOUND and
+        // the labels without drowning the log in decorative shapes.
+        if !name.is_empty() || !text.is_empty() {
+            tracing::info!(
+                target: "aqw_diag",
+                "AQW_CRT_DF d={depth} name={name:?} id={} tx={} ty={} sx={:.3} sy={:.3} text={text:?}",
+                obj.id(),
+                m.tx.get(),
+                m.ty.get(),
+                m.a,
+                m.d,
+            );
+        }
+        if let Some(container) = obj.as_container() {
+            for child in container.iter_render_list() {
+                walk(child, m, depth + 1, budget);
+            }
+        }
+    }
+    let mut budget = 2000u32;
+    for child in panel.iter_render_list() {
+        walk(child, Matrix::IDENTITY, 0, &mut budget);
+    }
 }
 
 /// Library id of a Noto-Serif EditText to clone for the DF row label.
