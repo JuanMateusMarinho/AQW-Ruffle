@@ -75,11 +75,24 @@ fn aqw_diagnostics_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
 }
 
-/// Kill-switch for releasing a frozen avatar subtree's cache texture:
-/// `RUFFLE_AQW_NO_AVATAR_CACHE_RELEASE=1` keeps it allocated while hidden.
-fn aqw_avatar_cache_release_disabled() -> bool {
-    static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_AVATAR_CACHE_RELEASE").is_some())
+/// Releasing a frozen avatar subtree's cache texture, opt-in via
+/// `RUFFLE_AQW_AVATAR_CACHE_RELEASE=1`.
+///
+/// OFF by default after field testing. It cuts peak memory by about a quarter,
+/// but the saving is paid back every time a hidden avatar is shown again: the
+/// texture is reallocated and the whole subtree recomposed, which for a heavy
+/// item is over a hundred blended layers. AQW moves avatars in and out of its
+/// hidden parking area constantly, so in a long session — exactly the case the
+/// change was meant to help — that costs more than the memory it saves, in
+/// both frame time and stability.
+///
+/// The measurement behind it stands and the code is kept for that reason. What
+/// it needs before being turned back on is hysteresis: release only after a
+/// subtree has stayed hidden for a while, so the avatars that genuinely pile up
+/// are reclaimed while the ones cycling in and out keep their texture.
+fn aqw_avatar_cache_release_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_AVATAR_CACHE_RELEASE").is_some())
 }
 
 fn aqw_full_timeline_throttle_enabled() -> bool {
@@ -3516,7 +3529,7 @@ impl<'gc> MovieClip<'gc> {
             // bitmap textures in one session, in tight bands of the 32px cache
             // grid. Re-enabling is free: the preference stays set, so the next
             // render after it becomes visible regenerates the texture.
-            if !aqw_avatar_cache_release_disabled() {
+            if aqw_avatar_cache_release_enabled() {
                 let base = self.base();
                 if let Some(cache) = &mut *base.bitmap_cache_mut() {
                     cache.clear();

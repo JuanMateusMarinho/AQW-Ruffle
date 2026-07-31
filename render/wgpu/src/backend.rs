@@ -515,6 +515,21 @@ impl WgpuRenderBackend<crate::target::TextureTarget> {
 
 impl<T: RenderTarget> WgpuRenderBackend<T> {
     pub fn new(descriptors: Arc<Descriptors>, target: T) -> Result<Self, Error> {
+        // Which GPU actually got picked. `HighPerformance` is only a request:
+        // on a machine with both an integrated and a discrete adapter the OS
+        // has the final say, and rendering on the integrated one is slow in a
+        // way no setting inside the player explains. The answer was reachable
+        // only from a panic dump, so in the field it was a guess. Logged at
+        // warn so it survives the default filter -- it is one line per launch.
+        let info = descriptors.adapter.get_info();
+        tracing::warn!(
+            backend = ?info.backend,
+            name = %info.name,
+            device_type = ?info.device_type,
+            driver = %info.driver_info,
+            "Graphics adapter selected"
+        );
+
         if target.width() > descriptors.limits.max_texture_dimension_2d
             || target.height() > descriptors.limits.max_texture_dimension_2d
         {
