@@ -84,7 +84,7 @@ pub use crate::avm2::object::class_object::{ClassObject, ClassObjectWeak};
 pub use crate::avm2::object::context3d_object::{Context3DObject, Context3DObjectWeak};
 pub use crate::avm2::object::date_object::{DateObject, DateObjectWeak, date_allocator};
 pub use crate::avm2::object::dictionary_object::{
-    DictionaryObject, DictionaryObjectWeak, dictionary_allocator,
+    DictionaryObject, DictionaryObjectWeak, dictionary_allocator, dictionary_stats,
 };
 pub use crate::avm2::object::dispatch_object::{DispatchObject, DispatchObjectWeak};
 pub use crate::avm2::object::domain_object::{

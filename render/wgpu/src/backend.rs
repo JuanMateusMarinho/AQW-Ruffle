@@ -32,7 +32,6 @@ use ruffle_render::shape_utils::DistilledShape;
 use ruffle_render::tessellator::ShapeTessellator;
 use std::any::Any;
 use std::borrow::Cow;
-use std::cell::Cell;
 use std::num::NonZeroU32;
 use std::sync::{Arc, OnceLock};
 use swf::Color;
@@ -1190,12 +1189,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             extent,
         );
 
-        let handle = BitmapHandle(Arc::new(Texture {
-            texture,
-            bind_linear: Default::default(),
-            bind_nearest: Default::default(),
-            copy_count: Cell::new(0),
-        }));
+        let handle = BitmapHandle(Arc::new(Texture::new(texture)));
 
         Ok(handle)
     }
@@ -1345,6 +1339,18 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
 
     fn surface_pool_largest(&self, limit: usize) -> Vec<(u32, u32, usize, u64)> {
         self.texture_pool.largest_buckets(limit)
+    }
+
+    fn bitmap_texture_stats(&self) -> Option<(i64, i64)> {
+        Some(crate::bitmap_texture_stats())
+    }
+
+    fn bitmap_texture_largest(&self, limit: usize) -> Vec<(u32, u32, usize, u64)> {
+        crate::bitmap_texture_largest(limit)
+    }
+
+    fn bitmap_texture_buckets(&self) -> (usize, u64) {
+        crate::bitmap_texture_buckets()
     }
 
     fn take_complex_blend_counts(&mut self) -> Vec<(&'static str, u64)> {
@@ -1516,12 +1522,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                             | wgpu::TextureUsages::RENDER_ATTACHMENT
                             | wgpu::TextureUsages::COPY_SRC,
                     });
-                BitmapHandle(Arc::new(Texture {
-                    texture,
-                    bind_linear: Default::default(),
-                    bind_nearest: Default::default(),
-                    copy_count: Cell::new(0),
-                }))
+                BitmapHandle(Arc::new(Texture::new(texture)))
             }
         };
 
@@ -1673,12 +1674,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     | wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::COPY_SRC,
             });
-        Ok(BitmapHandle(Arc::new(Texture {
-            texture,
-            bind_linear: Default::default(),
-            bind_nearest: Default::default(),
-            copy_count: Cell::new(0),
-        })))
+        Ok(BitmapHandle(Arc::new(Texture::new(texture))))
     }
 
     fn resolve_sync_handle(

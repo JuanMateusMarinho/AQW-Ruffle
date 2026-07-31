@@ -75,6 +75,13 @@ fn aqw_diagnostics_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
 }
 
+/// Kill-switch for releasing a frozen avatar subtree's cache texture:
+/// `RUFFLE_AQW_NO_AVATAR_CACHE_RELEASE=1` keeps it allocated while hidden.
+fn aqw_avatar_cache_release_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_AVATAR_CACHE_RELEASE").is_some())
+}
+
 fn aqw_full_timeline_throttle_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_TIMELINE_THROTTLE").is_some())
@@ -2142,6 +2149,40 @@ impl<'gc> MovieClip<'gc> {
         }
     }
 
+    /// Record cutscene frame transitions that are not consecutive.
+    ///
+    /// A per-throw log only fires on frames that fail, so it cannot show a
+    /// frame that never ran at all -- and a frame script configures children
+    /// its own frame places, so a frame passed over leaves the next one
+    /// reaching for something that was never created. Only the gaps are
+    /// logged: `+2` is a frame silently missed, while a large jump is the
+    /// content's own `gotoAndPlay` and expected.
+    fn note_cutscene_frame_gap(self) {
+        if !aqw_diagnostics_enabled() || !self.movie().url().contains("Cutscene") {
+            return;
+        }
+        thread_local! {
+            static LAST_FRAME: std::cell::RefCell<std::collections::HashMap<usize, FrameNumber>> =
+                std::cell::RefCell::new(std::collections::HashMap::new());
+        }
+        let frame = self.current_frame();
+        let key = Gc::as_ptr(self.0) as usize;
+        let previous = LAST_FRAME.with(|map| map.borrow_mut().insert(key, frame));
+        if let Some(previous) = previous
+            && frame != previous
+            && frame != previous.saturating_add(1)
+        {
+            tracing::warn!(
+                target: "aqw_diag",
+                from = previous,
+                to = frame,
+                gap = i64::from(frame) - i64::from(previous),
+                name = self.name().map(|n| n.to_string()).unwrap_or_default(),
+                "AQW cutscene frame gap"
+            );
+        }
+    }
+
     fn run_frame_internal(
         self,
         context: &mut UpdateContext<'gc>,
@@ -2149,6 +2190,7 @@ impl<'gc> MovieClip<'gc> {
         run_sounds: bool,
         is_action_script_3: bool,
     ) {
+        self.note_cutscene_frame_gap();
         let shared = Gc::as_ref(self.0.shared.get());
 
         let next_frame = self.determine_next_frame();
@@ -3277,6 +3319,73 @@ impl<'gc> MovieClip<'gc> {
                         avm2_object.into(),
                         Avm2FunctionArgs::empty(),
                     ) {
+                        // A throwing frame script abandons everything after the
+                        // throw, and authored frames overwhelmingly end with
+                        // `stop()`. The clip is then left running by an error
+                        // whose message says nothing about that -- a cutscene
+                        // advancing on its own, with no input, looks exactly
+                        // like this. `playing` is the field that matters: still
+                        // true means the stop never happened.
+                        if aqw_diagnostics_enabled() {
+                            // Is an ancestor mid-`Sprite.constructChildren`?
+                            // That is the claim under test: the script runs
+                            // inside construction, so the siblings it is
+                            // written to configure may not be placed yet, and
+                            // the first one it touches is null. `children` is
+                            // the corroborating count -- a frame script that
+                            // configures components on a clip reporting very
+                            // few children is looking at an unfinished list.
+                            let mut constructing_ancestor = false;
+                            let mut node: Option<DisplayObject<'gc>> = Some(self.into());
+                            while let Some(current) = node {
+                                if let Some(clip) = current.as_movie_clip()
+                                    && clip.constructing_frame()
+                                {
+                                    constructing_ancestor = true;
+                                    break;
+                                }
+                                node = current.parent();
+                            }
+                            // Name and class of every child present at the
+                            // moment of the throw. The script died reaching a
+                            // null child while the clip already had dozens, so
+                            // the two readings left are distinguishable here:
+                            // a component child present in this list means the
+                            // instance exists and only the slot the script
+                            // reads it through is empty; no such child means it
+                            // was never instantiated at all. Those want
+                            // opposite fixes.
+                            let children_list = self
+                                .iter_render_list()
+                                .take(24)
+                                .map(|child| {
+                                    let name = child
+                                        .name()
+                                        .map(|n| n.to_string())
+                                        .unwrap_or_else(|| "<unnamed>".to_string());
+                                    let class = child
+                                        .object2()
+                                        .map(|o| {
+                                            use crate::avm2::object::TObject;
+                                            o.instance_class().name().local_name().to_string()
+                                        })
+                                        .unwrap_or_else(|| "<no-obj>".to_string());
+                                    format!("{name}={class}")
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            tracing::warn!(
+                                target: "aqw_diag",
+                                name = self.name().map(|n| n.to_string()).unwrap_or_default(),
+                                frame = self.current_frame(),
+                                playing = self.playing(),
+                                constructing = constructing_ancestor,
+                                children = self.num_children(),
+                                child_list = children_list.as_str(),
+                                movie = self.movie().url(),
+                                "AQW frame script threw; clip left in this state"
+                            );
+                        }
                         Avm2::uncaught_error(
                             &mut activation,
                             Some(self.into()),
@@ -3400,6 +3509,19 @@ impl<'gc> MovieClip<'gc> {
             && self.current_frame() != 0
             && self.is_in_aqw_hidden_subtree()
         {
+            // Drop the cache texture along with the timeline. Freezing already
+            // says this art cannot be seen; holding a texture for it buys
+            // nothing, and AQW never releases avatars mid-session, so every one
+            // that ever walked past keeps its own. Measured at ~1.5GB of live
+            // bitmap textures in one session, in tight bands of the 32px cache
+            // grid. Re-enabling is free: the preference stays set, so the next
+            // render after it becomes visible regenerates the texture.
+            if !aqw_avatar_cache_release_disabled() {
+                let base = self.base();
+                if let Some(cache) = &mut *base.bitmap_cache_mut() {
+                    cache.clear();
+                }
+            }
             self.0.aqw_timeline_counter.set(0);
             self.0.aqw_timeline_divisor.set(0);
             return true;
@@ -5632,6 +5754,10 @@ impl<'gc, 'a> MovieClip<'gc> {
     pub fn set_constructing_frame(self, val: bool) {
         self.0
             .set_flag(MovieClipFlags::RUNNING_CONSTRUCT_FRAME, val);
+    }
+
+    pub fn constructing_frame(self) -> bool {
+        self.0.contains_flag(MovieClipFlags::RUNNING_CONSTRUCT_FRAME)
     }
 }
 

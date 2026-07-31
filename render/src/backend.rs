@@ -110,6 +110,30 @@ pub trait RenderBackend: Any {
         Vec::new()
     }
 
+    /// `(live textures, bytes)` owned by `BitmapHandle`s — bitmap caches,
+    /// `BitmapData` surfaces, decoded SWF bitmaps.
+    ///
+    /// Deliberately outside both pool reports: these are freed when the last
+    /// handle drops rather than by pool maintenance, so they are invisible to
+    /// a caller adding up the pools, and they are the remainder when pool
+    /// totals stay flat while process memory climbs.
+    fn bitmap_texture_stats(&self) -> Option<(i64, i64)> {
+        None
+    }
+
+    /// Those textures' biggest buckets as `(width, height, count, bytes)`.
+    /// The totals say how much is held; only the shape says by what.
+    fn bitmap_texture_largest(&self, _limit: usize) -> Vec<(u32, u32, usize, u64)> {
+        Vec::new()
+    }
+
+    /// `(distinct sizes, bytes across all of them)` for those textures. How
+    /// spread out the sizes are, plus a total that doubles as a check on the
+    /// breakdown above being complete.
+    fn bitmap_texture_buckets(&self) -> (usize, u64) {
+        (0, 0)
+    }
+
     /// Blend modes that needed a render pass of their own since the last call,
     /// as `(mode, count)` busiest-first, and cleared by reading.
     ///

@@ -10,6 +10,36 @@ use crate::string::AvmString;
 use core::fmt;
 use gc_arena::{Collect, Gc, GcWeak, Mutation};
 use ruffle_common::utils::HasPrefixField;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+
+fn aqw_diagnostics_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
+}
+
+/// How many `Dictionary` instances have been allocated, and how many entries
+/// currently live in their *object* space.
+///
+/// The constructor's `weakKeys` argument is accepted and discarded (see
+/// `Dictionary.as`), so every one of these entries pins its key for the
+/// lifetime of the dictionary — where the player would have collected the
+/// ones whose key became unreachable. Only object keys can be weak; string
+/// and numeric keys are ordinary dynamic properties and unaffected. That is
+/// what makes the second number the deciding one: if a content that asks for
+/// weak keys keeps almost nothing in object space, implementing them cannot
+/// reclaim anything, however many dictionaries exist.
+static DICTIONARY_INSTANCES: AtomicU64 = AtomicU64::new(0);
+static DICTIONARY_OBJECT_KEYS: AtomicI64 = AtomicI64::new(0);
+
+/// `(instances allocated, live object-space entries)`. Both are only tracked
+/// under `RUFFLE_AQW_DIAGNOSTICS`, so they read zero otherwise.
+pub fn dictionary_stats() -> (u64, i64) {
+    (
+        DICTIONARY_INSTANCES.load(Ordering::Relaxed),
+        DICTIONARY_OBJECT_KEYS.load(Ordering::Relaxed),
+    )
+}
 
 /// A class instance allocator that allocates Dictionary objects.
 pub fn dictionary_allocator<'gc>(
@@ -17,6 +47,10 @@ pub fn dictionary_allocator<'gc>(
     activation: &mut Activation<'_, 'gc>,
 ) -> Result<Object<'gc>, Error<'gc>> {
     let base = ScriptObjectData::new(class);
+
+    if aqw_diagnostics_enabled() {
+        DICTIONARY_INSTANCES.fetch_add(1, Ordering::Relaxed);
+    }
 
     Ok(DictionaryObject(Gc::new(activation.gc(), DictionaryObjectData { base })).into())
 }
@@ -62,6 +96,11 @@ impl<'gc> DictionaryObject<'gc> {
 
     /// Set a value in the dictionary's object space.
     pub fn set_property_by_object(self, name: Object<'gc>, value: Value<'gc>, mc: &Mutation<'gc>) {
+        // Overwriting an existing key is not a new entry, so the probe has to
+        // ask first -- `insert` reports nothing back.
+        if aqw_diagnostics_enabled() && !self.has_property_by_object(name) {
+            DICTIONARY_OBJECT_KEYS.fetch_add(1, Ordering::Relaxed);
+        }
         self.base()
             .values_mut(mc)
             .insert(DynamicKey::Object(name), value);
@@ -69,7 +108,10 @@ impl<'gc> DictionaryObject<'gc> {
 
     /// Delete a value from the dictionary's object space.
     pub fn delete_property_by_object(self, name: Object<'gc>, mc: &Mutation<'gc>) {
-        self.base().values_mut(mc).remove(&DynamicKey::Object(name));
+        let removed = self.base().values_mut(mc).remove(&DynamicKey::Object(name));
+        if aqw_diagnostics_enabled() && removed.is_some() {
+            DICTIONARY_OBJECT_KEYS.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     pub fn has_property_by_object(self, name: Object<'gc>) -> bool {

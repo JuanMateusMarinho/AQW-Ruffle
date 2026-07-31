@@ -129,7 +129,19 @@ pub struct BitmapCache {
     /// keeps losing the budget race (admission is in render order) still
     /// refreshes within about a second instead of staying stale forever.
     deferred_frames: u32,
+
+    /// Consecutive redraws where the object's transform was unchanged but the
+    /// computed cache geometry was not. See `note_static_churn`.
+    static_churn: u32,
+
+    /// Whether that churn has been reported, so it is said once per cache.
+    churn_reported: bool,
 }
+
+/// How long geometry has to keep moving under a static transform before it is
+/// reported. An object that resizes once trips this for a frame or two; only
+/// a genuine oscillation survives two seconds of it.
+const STATIC_CHURN_REPORT_FRAMES: u32 = 48;
 
 const MAX_CACHE_BITMAP_DIMENSION: u32 = 4096;
 const MAX_CACHE_BITMAP_PIXELS: u32 = 2_500_000;
@@ -144,6 +156,13 @@ const CACHE_DEGENERATE_SCALE: f32 = MAX_CACHE_BITMAP_DIMENSION as f32;
 fn aqw_diagnostics_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
+}
+
+/// The per-object flicker probes, which are too expensive to leave on the
+/// general diagnostics flag. `RUFFLE_AQW_FLICKER_PROBE=1`.
+fn aqw_flicker_probe_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_FLICKER_PROBE").is_some())
 }
 
 /// True when `url` has `segment` as a whole path segment, ignoring case, the
@@ -297,6 +316,45 @@ impl BitmapCache {
         // Setting the old transform to something invalid is a cheap way of making it invalid,
         // without reserving an extra field for.
         self.matrix_a = f32::NAN;
+    }
+
+    /// Detect a cache that rebuilds every frame while its object stands still.
+    ///
+    /// `is_dirty` keys off bounds run through `ceil()`, and the draw offset
+    /// comes from a filter rect run through `floor()`. An edge that lands on a
+    /// pixel boundary can therefore flip between two values indefinitely: the
+    /// cache is regenerated each frame, and because the offset is added to the
+    /// object's translation at draw time, a flip there paints the art a pixel
+    /// away from where it was. Held art that vibrates in place is this.
+    ///
+    /// Returns the streak length once it is long enough to rule out an object
+    /// that merely resized, and only once per cache.
+    fn note_static_churn(
+        &mut self,
+        matrix: &Matrix,
+        source_width: u32,
+        source_height: u32,
+        draw_offset: Point<i32>,
+    ) -> Option<u32> {
+        let matrix_static = self.matrix_a == matrix.a
+            && self.matrix_b == matrix.b
+            && self.matrix_c == matrix.c
+            && self.matrix_d == matrix.d;
+        let moved = self.source_width != source_width
+            || self.source_height != source_height
+            || self.draw_offset != draw_offset;
+
+        if !matrix_static || !moved {
+            self.static_churn = 0;
+            return None;
+        }
+
+        self.static_churn = self.static_churn.saturating_add(1);
+        if self.static_churn < STATIC_CHURN_REPORT_FRAMES || self.churn_reported {
+            return None;
+        }
+        self.churn_reported = true;
+        Some(self.static_churn)
     }
 
     fn is_dirty(&self, other: &Matrix, source_width: u32, source_height: u32) -> bool {
@@ -1965,6 +2023,45 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
             .map(|(name, count)| format!("{name}:{count}"))
             .collect::<Vec<_>>()
             .join(",");
+        // `Dictionary` retention. The class takes a `weakKeys` flag and drops
+        // it, so object-space entries are pinned for the dictionary's whole
+        // life; content that expects the player to drop unreachable keys gets
+        // a leak instead. `dict_okeys` is the size of that exposure -- string
+        // and numeric keys are plain dynamic properties, so they cannot be
+        // weak and are deliberately not counted here.
+        let (dicts, dict_okeys) = crate::avm2::object::dictionary_stats();
+        // The third texture bucket, and the only one nothing else reports:
+        // everything held by a `BitmapHandle`. `cache_mb` above walks the
+        // stage, so a cache on a detached subtree -- an orphaned avatar, a
+        // clip parked in AQW's TRASH -- stops being counted while its texture
+        // stays alive. `bmp_mb` counts it regardless of where the owner sits.
+        // The last unmeasured share. With this, `commit_mb` is fully
+        // attributed: heap + bitmap textures + the two pools + whatever the
+        // driver holds. The driver's share is what is left, and it is the one
+        // no change in this codebase can reach.
+        let heap_mb = crate::heap_stats::heap_bytes() / (1024 * 1024);
+        let (bmp_tex, bmp_mb) = context
+            .renderer
+            .bitmap_texture_stats()
+            .map(|(count, bytes)| (count, bytes / (1024 * 1024)))
+            .unwrap_or((0, 0));
+        // Same breakdown `tex_top` gives the surface pool. A room-sized bucket
+        // repeated hundreds of times says the map raster; thousands of small
+        // ones say avatar art. The totals cannot tell those apart.
+        let bmp_top = context
+            .renderer
+            .bitmap_texture_largest(15)
+            .iter()
+            .map(|(w, h, count, bytes)| format!("{w}x{h}x{count}={}MB", bytes / (1024 * 1024)))
+            .collect::<Vec<_>>()
+            .join(",");
+        // How many distinct sizes those textures come in, and the total across
+        // all of them. `bmp_sizes` separates "a few allocations repeated" from
+        // "the same content re-rasterized at dimensions that keep shifting",
+        // and `bmp_tracked_mb` is the control: it has to land near `bmp_mb`,
+        // or the breakdown above is describing only a fraction of the problem.
+        let (bmp_sizes, bmp_tracked) = context.renderer.bitmap_texture_buckets();
+        let bmp_tracked_mb = bmp_tracked / (1024 * 1024);
         let (blend_cover, blend_cover_buckets) = context.renderer.take_blend_coverage();
         let blend_cover_hist = blend_cover_buckets
             .iter()
@@ -2016,6 +2113,14 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
             blend_group_max,
             blend_swfs = blend_swfs.as_str(),
             avatar_caches,
+            dicts,
+            dict_okeys,
+            bmp_tex,
+            bmp_mb,
+            bmp_top = bmp_top.as_str(),
+            bmp_sizes,
+            bmp_tracked_mb,
+            heap_mb,
             "AQW memory sweep"
         );
 
@@ -2029,7 +2134,7 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         {
             let _ = writeln!(
                 file,
-                "AQW sweep: orphans={orphans} loaders={loaders} cached_objects={cached_objects} cache_mb={cache_mb} evicted_mb={evicted_mb} over_budget={over_budget} movie_libs_total={movie_libs_total} movie_libs_aqw={movie_libs_aqw} avatar_roots={avatar_roots} redraw_large={redraw_large} redraw_small={redraw_small} redraw_aged={redraw_aged} redraw_deferred={redraw_deferred} stale_fallback={stale_fallback} blend_layers={blend_layers} tick_orphan_ms={tick_orphan_ms} tick_stage_ms={tick_stage_ms} tick_bcast_ms={tick_bcast_ms} orphans_frozen={orphans_frozen} vram_mb={vram_mb} vram_budget_mb={vram_budget_mb} vram_pressure={vram_pressure} pool_allocs={pool_allocs} pool_free={pool_free} pool_mb={pool_mb} tex_allocs={tex_allocs} tex_free={tex_free} tex_mb={tex_mb} tex_top={tex_top} blend_modes={blend_modes} blend_cover={blend_cover}% blend_cover_hist={blend_cover_hist} blend_alloc={blend_alloc}% render_encode_ms={render_encode_ms} render_submit_ms={render_submit_ms} render_frames={render_frames} commit_mb={commit_mb} blend_passes={blend_passes} blend_groups={blend_groups} blend_group_max={blend_group_max} blend_swfs={blend_swfs} avatar_caches={avatar_caches}"
+                "AQW sweep: orphans={orphans} loaders={loaders} cached_objects={cached_objects} cache_mb={cache_mb} evicted_mb={evicted_mb} over_budget={over_budget} movie_libs_total={movie_libs_total} movie_libs_aqw={movie_libs_aqw} avatar_roots={avatar_roots} redraw_large={redraw_large} redraw_small={redraw_small} redraw_aged={redraw_aged} redraw_deferred={redraw_deferred} stale_fallback={stale_fallback} blend_layers={blend_layers} tick_orphan_ms={tick_orphan_ms} tick_stage_ms={tick_stage_ms} tick_bcast_ms={tick_bcast_ms} orphans_frozen={orphans_frozen} vram_mb={vram_mb} vram_budget_mb={vram_budget_mb} vram_pressure={vram_pressure} pool_allocs={pool_allocs} pool_free={pool_free} pool_mb={pool_mb} tex_allocs={tex_allocs} tex_free={tex_free} tex_mb={tex_mb} tex_top={tex_top} blend_modes={blend_modes} blend_cover={blend_cover}% blend_cover_hist={blend_cover_hist} blend_alloc={blend_alloc}% render_encode_ms={render_encode_ms} render_submit_ms={render_submit_ms} render_frames={render_frames} commit_mb={commit_mb} blend_passes={blend_passes} blend_groups={blend_groups} blend_group_max={blend_group_max} blend_swfs={blend_swfs} avatar_caches={avatar_caches} dicts={dicts} dict_okeys={dict_okeys} bmp_tex={bmp_tex} bmp_mb={bmp_mb} bmp_top={bmp_top} bmp_sizes={bmp_sizes} bmp_tracked_mb={bmp_tracked_mb} heap_mb={heap_mb}"
             );
         }
     }
@@ -2080,6 +2185,173 @@ fn aqw_sweep_node<'gc>(
     }
 }
 
+/// Ping-pong state for one display object, keyed by pointer in
+/// `note_position_oscillation`.
+#[derive(Default)]
+struct OscillationState {
+    prev1: f64,
+    prev2: f64,
+    flips: u32,
+    reported: bool,
+}
+
+thread_local! {
+    static OSCILLATION_PROBE:
+        std::cell::RefCell<std::collections::HashMap<usize, OscillationState>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Report art that vibrates in place, whatever kind of object it is.
+///
+/// Earlier probes watched one mechanism each — cache geometry, then bitmap
+/// pixel snapping — and a vector `Graphic` would have tripped neither. This
+/// watches the only thing all of them share: the world position the object is
+/// actually drawn at.
+///
+/// The signature is a strict A-B-A ping-pong of small amplitude, sustained.
+/// Real animation walks through many positions; alternating between exactly
+/// two, a fraction of a pixel apart, for dozens of frames is an artifact. What
+/// it cannot say on its own is *whose* artifact — but the amplitude does: an
+/// exact 1.0 means something is rounding, anything else means the transform
+/// itself is being driven that way.
+fn note_position_oscillation<'gc>(this: DisplayObject<'gc>, context: &RenderContext<'_, 'gc>) {
+    const REPORT_FLIPS: u32 = 30;
+    const MAX_TRACKED: usize = 4096;
+
+    let y = context.transform_stack.transform().matrix.ty.to_pixels();
+    let key = this.as_ptr() as usize;
+
+    let report = OSCILLATION_PROBE.with(|probe| {
+        let mut probe = probe.borrow_mut();
+        if !probe.contains_key(&key) && probe.len() >= MAX_TRACKED {
+            return None;
+        }
+        let state = probe.entry(key).or_default();
+        if state.reported {
+            return None;
+        }
+
+        let amplitude = (y - state.prev1).abs();
+        let returned = (y - state.prev2).abs() < 0.01;
+        if returned && (0.2..4.0).contains(&amplitude) {
+            state.flips += 1;
+        }
+        state.prev2 = state.prev1;
+        state.prev1 = y;
+
+        if state.flips < REPORT_FLIPS {
+            return None;
+        }
+        state.reported = true;
+        Some(amplitude)
+    });
+
+    let Some(amplitude) = report else { return };
+
+    let kind = match this {
+        DisplayObject::MovieClip(_) => "MovieClip",
+        DisplayObject::Bitmap(_) => "Bitmap",
+        DisplayObject::Graphic(_) => "Graphic",
+        DisplayObject::EditText(_) => "EditText",
+        DisplayObject::LoaderDisplay(_) => "Loader",
+        _ => "other",
+    };
+    let class = this
+        .object2()
+        .map(|o| {
+            use crate::avm2::object::TObject;
+            o.instance_class().name().local_name().to_string()
+        })
+        .unwrap_or_else(|| "<no avm2 object>".to_string());
+    tracing::warn!(
+        target: "aqw_diag",
+        kind,
+        class = class.as_str(),
+        name = this.name().map(|n| n.to_string()).unwrap_or_default(),
+        movie = this.movie().url(),
+        amplitude = format!("{amplitude:.4}"),
+        between = format!("{:.4} / {:.4}", this.base().transform(true).matrix.ty.to_pixels(), y),
+        depth = this.depth(),
+        "AQW oscillation: drawn position alternating between two values"
+    );
+}
+
+thread_local! {
+    static ANIMATING_CLIPS: std::cell::RefCell<std::collections::HashMap<usize, (u16, u32, bool)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// List map-art clips whose timeline keeps running.
+///
+/// With the position probe silent, art that still appears to move has to be
+/// changing what it *draws* rather than where: a clip advancing between frames
+/// whose contents sit at different heights looks exactly like the object
+/// bobbing. The interesting case is a clip that is stopped in the player and
+/// running here, which no rendering fix would ever reach.
+///
+/// Reports name, class and frame count, because those are what identify a
+/// piece of scenery — every probe so far could see that *something* was wrong
+/// without being able to say which object it was.
+fn note_map_clip_animation<'gc>(this: DisplayObject<'gc>) {
+    const REPORT_CHANGES: u32 = 30;
+    const MAX_REPORTS: usize = 25;
+
+    let Some(clip) = this.as_movie_clip() else {
+        return;
+    };
+    if !url_path_has_segment(&clip.movie().url(), "maps") {
+        return;
+    }
+
+    let frame = clip.current_frame();
+    let key = this.as_ptr() as usize;
+    let report = ANIMATING_CLIPS.with(|clips| {
+        let mut clips = clips.borrow_mut();
+        if clips.len() >= 512 && !clips.contains_key(&key) {
+            return false;
+        }
+        let entry = clips.entry(key).or_insert((frame, 0, false));
+        if entry.2 {
+            return false;
+        }
+        if entry.0 != frame {
+            entry.0 = frame;
+            entry.1 += 1;
+        }
+        if entry.1 < REPORT_CHANGES {
+            return false;
+        }
+        entry.2 = true;
+        true
+    });
+    if !report {
+        return;
+    }
+
+    static REPORTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if REPORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= MAX_REPORTS {
+        return;
+    }
+
+    tracing::warn!(
+        target: "aqw_diag",
+        name = this.name().map(|n| n.to_string()).unwrap_or_default(),
+        class = this
+            .object2()
+            .map(|o| {
+                use crate::avm2::object::TObject;
+                o.instance_class().name().local_name().to_string()
+            })
+            .unwrap_or_else(|| "<none>".to_string()),
+        frame,
+        frames_loaded = clip.frames_loaded(),
+        playing = clip.playing(),
+        depth = this.depth(),
+        movie = clip.movie().url(),
+        "AQW map clip animating: timeline still advancing"
+    );
+}
+
 pub fn render_base<'gc>(
     this: DisplayObject<'gc>,
     context: &mut RenderContext<'_, 'gc>,
@@ -2103,6 +2375,14 @@ pub fn render_base<'gc>(
     if options.apply_transform {
         let transform = this.base().transform(options.apply_matrix);
         context.transform_stack.push(&transform);
+        // Behind its own switch, not the general diagnostics one: these two
+        // run a map lookup per display object per frame, which is affordable
+        // for a targeted hunt but would tax — and so distort — the memory
+        // sweep that shares that flag.
+        if aqw_flicker_probe_enabled() {
+            note_position_oscillation(this, context);
+            note_map_clip_animation(this);
+        }
     }
 
     let blend_mode = this.blend_mode();
@@ -2252,6 +2532,38 @@ pub fn render_base<'gc>(
                         }
 
                         if can_redraw_cache {
+                            if aqw_diagnostics_enabled()
+                                && let Some(streak) = cache.note_static_churn(
+                                    &base_transform.matrix,
+                                    width,
+                                    height,
+                                    draw_offset,
+                                )
+                            {
+                                // Read before `update` overwrites them, so the
+                                // log shows both ends of the ping-pong.
+                                let was = (cache.source_width, cache.source_height);
+                                let was_offset = cache.draw_offset;
+                                let class = this
+                                    .object2()
+                                    .map(|o| {
+                                        use crate::avm2::object::TObject;
+                                        o.instance_class().name().local_name().to_string()
+                                    })
+                                    .unwrap_or_else(|| "<no avm2 object>".to_string());
+                                tracing::warn!(
+                                    target: "aqw_diag",
+                                    streak,
+                                    class = class.as_str(),
+                                    movie = this.movie().url(),
+                                    was_size = format!("{}x{}", was.0, was.1),
+                                    now_size = format!("{width}x{height}"),
+                                    was_offset = format!("{},{}", was_offset.x, was_offset.y),
+                                    now_offset = format!("{},{}", draw_offset.x, draw_offset.y),
+                                    filters = filters.len(),
+                                    "AQW cache churn: geometry moving under a static transform"
+                                );
+                            }
                             cache.update(
                                 context.renderer,
                                 base_transform.matrix,

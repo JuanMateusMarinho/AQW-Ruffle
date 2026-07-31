@@ -33,6 +33,7 @@ pub mod events;
 pub mod focus_tracker;
 pub mod font;
 mod frame_lifecycle;
+pub mod heap_stats;
 mod html;
 mod input;
 mod library;

@@ -21,6 +21,8 @@ use ruffle_render::tessellator::{Gradient as TessGradient, Vertex as TessVertex}
 use std::any::Any;
 use std::cell::{Cell, OnceCell};
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI64, Ordering};
 use swf::GradientSpread;
 pub use wgpu;
 
@@ -245,6 +247,96 @@ impl QueueSyncHandle {
     }
 }
 
+/// Live GPU memory behind `BitmapHandle`s: bitmap caches, the `BitmapData`
+/// surfaces content draws into, and decoded SWF bitmaps.
+///
+/// Neither texture pool can see any of it. These textures belong to the
+/// handle and are freed only when its last clone drops, so a diagnostic that
+/// adds up the two pools can report a healthy total while this grows without
+/// bound — which is exactly the shape of the unaccounted commit growth.
+static BITMAP_TEXTURE_BYTES: AtomicI64 = AtomicI64::new(0);
+static BITMAP_TEXTURE_COUNT: AtomicI64 = AtomicI64::new(0);
+
+/// `(live textures, bytes)` currently held by `BitmapHandle`s.
+pub fn bitmap_texture_stats() -> (i64, i64) {
+    (
+        BITMAP_TEXTURE_COUNT.load(Ordering::Relaxed),
+        BITMAP_TEXTURE_BYTES.load(Ordering::Relaxed),
+    )
+}
+
+/// Live bitmap textures grouped by dimensions, tracked only under the AQW
+/// diagnostics flag because it costs a lock on every texture birth and death.
+///
+/// The totals alone cannot say what is accumulating: a gigabyte is thousands
+/// of avatar-sized caches or a few hundred room-sized bitmaps, and those have
+/// nothing to do with each other. The shape names the source.
+fn bitmap_texture_sizes()
+-> &'static std::sync::Mutex<std::collections::HashMap<(u32, u32), (usize, u64)>> {
+    static SIZES: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(u32, u32), (usize, u64)>>,
+    > = OnceLock::new();
+    SIZES.get_or_init(Default::default)
+}
+
+fn track_bitmap_texture(texture: &wgpu::Texture, bytes: i64, born: bool) {
+    if !crate::backend::aqw_diagnostics_enabled() {
+        return;
+    }
+    let key = (texture.width(), texture.height());
+    let Ok(mut sizes) = bitmap_texture_sizes().lock() else {
+        return;
+    };
+    let entry = sizes.entry(key).or_insert((0, 0));
+    if born {
+        entry.0 += 1;
+        entry.1 += bytes.max(0) as u64;
+    } else {
+        entry.0 = entry.0.saturating_sub(1);
+        entry.1 = entry.1.saturating_sub(bytes.max(0) as u64);
+        if entry.0 == 0 {
+            sizes.remove(&key);
+        }
+    }
+}
+
+/// `(distinct sizes, bytes across all of them)`.
+///
+/// The pair the largest-buckets list cannot provide: a handful of sizes means
+/// a few repeated allocations, hundreds means the same content re-rasterized
+/// at dimensions that keep shifting. The byte total is also the control — if
+/// it does not come close to the reported live total, the tracking is wrong
+/// and the shape below it means nothing.
+pub fn bitmap_texture_buckets() -> (usize, u64) {
+    let Ok(sizes) = bitmap_texture_sizes().lock() else {
+        return (0, 0);
+    };
+    (sizes.len(), sizes.values().map(|(_, bytes)| bytes).sum())
+}
+
+/// The biggest live bitmap-texture buckets as `(width, height, count, bytes)`.
+pub fn bitmap_texture_largest(limit: usize) -> Vec<(u32, u32, usize, u64)> {
+    let Ok(sizes) = bitmap_texture_sizes().lock() else {
+        return Vec::new();
+    };
+    let mut buckets: Vec<_> = sizes
+        .iter()
+        .map(|((w, h), (count, bytes))| (*w, *h, *count, *bytes))
+        .collect();
+    buckets.sort_by(|a, b| b.3.cmp(&a.3));
+    buckets.truncate(limit);
+    buckets
+}
+
+fn texture_bytes(texture: &wgpu::Texture) -> i64 {
+    let size = texture.size();
+    let block = texture.format().block_copy_size(None).unwrap_or(4);
+    i64::from(size.width)
+        * i64::from(size.height)
+        * i64::from(size.depth_or_array_layers)
+        * i64::from(block)
+}
+
 #[derive(Debug)]
 pub struct Texture {
     pub(crate) texture: wgpu::Texture,
@@ -253,7 +345,31 @@ pub struct Texture {
     copy_count: Cell<u8>,
 }
 
+impl Drop for Texture {
+    fn drop(&mut self) {
+        let bytes = texture_bytes(&self.texture);
+        BITMAP_TEXTURE_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+        BITMAP_TEXTURE_COUNT.fetch_sub(1, Ordering::Relaxed);
+        track_bitmap_texture(&self.texture, bytes, false);
+    }
+}
+
 impl Texture {
+    /// The only way to build one, so the accounting above cannot be bypassed
+    /// by a new call site.
+    pub(crate) fn new(texture: wgpu::Texture) -> Self {
+        let bytes = texture_bytes(&texture);
+        BITMAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        BITMAP_TEXTURE_COUNT.fetch_add(1, Ordering::Relaxed);
+        track_bitmap_texture(&texture, bytes, true);
+        Self {
+            texture,
+            bind_linear: Default::default(),
+            bind_nearest: Default::default(),
+            copy_count: Cell::new(0),
+        }
+    }
+
     pub fn bind_group(
         &self,
         smoothed: bool,

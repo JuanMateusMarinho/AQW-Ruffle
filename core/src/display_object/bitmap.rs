@@ -128,7 +128,25 @@ pub struct BitmapGraphicData<'gc> {
 
     /// How to snap this bitmap to the pixel grid
     pixel_snapping: Cell<PixelSnapping>,
+
+    /// Flicker probe: last drawn (post-snapping) and pre-snapping vertical
+    /// positions, and how often the first jumped while the second held still.
+    /// See `render_self`.
+    probe_last_drawn_y: Cell<f64>,
+    probe_last_raw_y: Cell<f64>,
+    probe_jumps: Cell<u32>,
+    probe_reported: Cell<bool>,
 }
+
+fn aqw_diagnostics_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
+}
+
+/// How many jumps to see before reporting. High enough that a bitmap which
+/// legitimately moves a pixel now and then never trips it; an oscillation
+/// reaches it in a second.
+const SNAP_JUMP_REPORT_COUNT: u32 = 20;
 
 impl<'gc> Bitmap<'gc> {
     /// Create a `Bitmap` with dynamic bitmap data.
@@ -161,6 +179,10 @@ impl<'gc> Bitmap<'gc> {
                 height: Cell::new(height),
                 smoothing: Cell::new(smoothing),
                 pixel_snapping: Cell::new(PixelSnapping::Auto),
+                probe_last_drawn_y: Cell::new(f64::NAN),
+                probe_last_raw_y: Cell::new(f64::NAN),
+                probe_jumps: Cell::new(0),
+                probe_reported: Cell::new(false),
                 avm2_object: Lock::new(None),
                 avm2_bitmap_class: Lock::new(BitmapClass::NoSubclass),
                 movie: movie.clone(),
@@ -215,6 +237,71 @@ impl<'gc> Bitmap<'gc> {
 
     pub fn set_pixel_snapping(self, value: PixelSnapping) {
         self.0.pixel_snapping.set(value);
+    }
+
+    /// Watch for a bitmap that visibly jumps while standing still.
+    ///
+    /// `PixelSnapping::Auto` rounds the translation to whole pixels, but only
+    /// inside a hard scale window (0.999..=1.001) with no hysteresis, and the
+    /// rounding itself has an edge at .5. Either boundary can be straddled: a
+    /// scale drifting across the window turns snapping on and off, and a
+    /// position sitting on a half-pixel flips which pixel it rounds to. Both
+    /// paint the art a pixel from where it was on the previous frame, every
+    /// frame, while the object itself is still — which is what held art
+    /// vibrating in place looks like. Flash's rule differs, so content that
+    /// is steady there can vibrate here.
+    ///
+    /// The signature is a *drawn* position that moves while the pre-snapping
+    /// one does not; genuine movement moves both.
+    fn note_snap_jump(self, context: &mut RenderContext<'_, 'gc>, snapping: PixelSnapping) {
+        if self.0.probe_reported.get() {
+            return;
+        }
+
+        let raw = context.transform_stack.transform().matrix;
+        let mut snapped = raw;
+        snapping.apply(&mut snapped);
+
+        let drawn_y = snapped.ty.to_pixels();
+        let raw_y = raw.ty.to_pixels();
+        let last_drawn = self.0.probe_last_drawn_y.get();
+        let last_raw = self.0.probe_last_raw_y.get();
+        self.0.probe_last_drawn_y.set(drawn_y);
+        self.0.probe_last_raw_y.set(raw_y);
+
+        if last_drawn.is_nan()
+            || (drawn_y - last_drawn).abs() < 0.5
+            || (raw_y - last_raw).abs() > 0.25
+        {
+            return;
+        }
+
+        let jumps = self.0.probe_jumps.get() + 1;
+        self.0.probe_jumps.set(jumps);
+        if jumps < SNAP_JUMP_REPORT_COUNT {
+            return;
+        }
+        self.0.probe_reported.set(true);
+
+        let class = self
+            .object2()
+            .map(|o| {
+                use crate::avm2::object::TObject;
+                o.instance_class().name().local_name().to_string()
+            })
+            .unwrap_or_else(|| "<no avm2 object>".to_string());
+        tracing::warn!(
+            target: "aqw_diag",
+            jumps,
+            class = class.as_str(),
+            movie = self.movie().url(),
+            snapping = format!("{snapping:?}"),
+            scale = format!("a={:.6} d={:.6}", raw.a, raw.d),
+            raw_y = format!("{last_raw:.4} -> {raw_y:.4}"),
+            drawn_y = format!("{last_drawn:.4} -> {drawn_y:.4}"),
+            size = format!("{}x{}", self.0.width.get(), self.0.height.get()),
+            "AQW snap jump: drawn position moving while the object holds still"
+        );
     }
 
     pub fn bitmap_data(self) -> BitmapData<'gc> {
@@ -399,11 +486,15 @@ impl<'gc> TDisplayObject<'gc> for Bitmap<'gc> {
             return;
         }
 
-        self.0.bitmap_data.get().render(
-            self.0.smoothing.get(),
-            context,
-            self.0.pixel_snapping.get(),
-        );
+        let snapping = self.0.pixel_snapping.get();
+        if aqw_diagnostics_enabled() {
+            self.note_snap_jump(context, snapping);
+        }
+
+        self.0
+            .bitmap_data
+            .get()
+            .render(self.0.smoothing.get(), context, snapping);
     }
 
     fn object1(self) -> Option<crate::avm1::Object<'gc>> {
