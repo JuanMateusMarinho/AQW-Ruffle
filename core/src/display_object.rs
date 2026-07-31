@@ -318,6 +318,7 @@ impl BitmapCache {
         self.matrix_a = f32::NAN;
     }
 
+
     /// Detect a cache that rebuilds every frame while its object stands still.
     ///
     /// `is_dirty` keys off bounds run through `ceil()`, and the draw offset
@@ -746,8 +747,12 @@ impl<'gc> DisplayObjectBase<'gc> {
         self.color_transform.get()
     }
 
-    pub fn set_color_transform(&self, color_transform: ColorTransform) {
-        self.color_transform.set(color_transform);
+    /// Returns whether the value actually changed, so callers can skip work
+    /// that only matters on a real change. Content re-applies the same tint
+    /// every frame often enough that treating every write as a change is not
+    /// affordable.
+    pub fn set_color_transform(&self, color_transform: ColorTransform) -> bool {
+        self.color_transform.replace(color_transform) != color_transform
     }
 
     pub fn perspective_projection(&self) -> Option<PerspectiveProjection> {
@@ -2352,6 +2357,71 @@ fn note_map_clip_animation<'gc>(this: DisplayObject<'gc>) {
     );
 }
 
+thread_local! {
+    static TINT_REPORTED: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Report how a tinted object is actually tinted.
+///
+/// Two instances of one asset drawing in different colours in the same frame
+/// narrows to three mechanisms, and they are not distinguishable by looking at
+/// the screen: a colour transform that one instance did not receive, a filter
+/// that did not apply, or a blend resolving against different content. Each
+/// wants a different fix, and three guesses have already been spent here. This
+/// says which one is in play by printing what each instance actually carries.
+fn note_tint_mechanism<'gc>(this: DisplayObject<'gc>, context: &RenderContext<'_, 'gc>) {
+    // Each object reports once, so the cap only exists to bound a pathological
+    // scene. The first version set it at 40 and the whole budget was spent on
+    // startup objects before the skill under investigation was ever cast --
+    // a cap low enough to be reached is a cap that decides what you see.
+    const MAX_REPORTS: usize = 400;
+
+    let blend = this.blend_mode();
+    let filters = this.filters();
+    let color = context.transform_stack.transform().color_transform;
+    let tinted = color != Default::default();
+    // Only objects that carry one of the three mechanisms are interesting.
+    if blend == ExtendedBlendMode::Normal && filters.is_empty() && !tinted {
+        return;
+    }
+
+    let key = this.as_ptr() as usize;
+    let fresh = TINT_REPORTED.with(|seen| {
+        let mut seen = seen.borrow_mut();
+        seen.len() < MAX_REPORTS && seen.insert(key)
+    });
+    if !fresh {
+        return;
+    }
+
+    let filter_names = filters
+        .iter()
+        .map(|f| format!("{f:?}").split('(').next().unwrap_or("?").to_string())
+        .collect::<Vec<_>>()
+        .join("+");
+    tracing::warn!(
+        target: "aqw_diag",
+        name = this.name().map(|n| n.to_string()).unwrap_or_default(),
+        depth = this.depth(),
+        blend = ?blend,
+        filters = filter_names.as_str(),
+        mult = format!(
+            "{:.3},{:.3},{:.3},{:.3}",
+            color.r_multiply.to_f32(),
+            color.g_multiply.to_f32(),
+            color.b_multiply.to_f32(),
+            color.a_multiply.to_f32()
+        ),
+        add = format!(
+            "{},{},{},{}",
+            color.r_add, color.g_add, color.b_add, color.a_add
+        ),
+        movie = this.movie().url(),
+        "AQW tint: how this object is coloured"
+    );
+}
+
 pub fn render_base<'gc>(
     this: DisplayObject<'gc>,
     context: &mut RenderContext<'_, 'gc>,
@@ -2382,6 +2452,7 @@ pub fn render_base<'gc>(
         if aqw_flicker_probe_enabled() {
             note_position_oscillation(this, context);
             note_map_clip_animation(this);
+            note_tint_mechanism(this, context);
         }
     }
 
@@ -2631,7 +2702,7 @@ pub fn render_base<'gc>(
                             // pixels, like the large/small thresholds above,
                             // but the offsets it is compared against are in
                             // view-scaled surface pixels — scale it by the
-                            // view too, or fullscreen trips the guard on the
+                            // view too, or fullscreen trips the drift guard on the
                             // ambient motion that windowed absorbs and blinks
                             // the object's filters off for a frame.
                             let max_drift_twips = if aqw_drift_norm_disabled() {
@@ -3178,8 +3249,29 @@ pub trait TDisplayObject<'gc>:
     /// This does NOT invalidate the cache, as it's often used with other operations.
     /// It is the callers responsibility to do so.
     #[no_dynamic]
+    /// Sets the color transform of this object.
+    /// This invalidates any ancestor's cacheAsBitmap automatically.
     fn set_color_transform(self, color_transform: ColorTransform) {
-        self.base().set_color_transform(color_transform)
+        // Every other visual property does this -- x, y, rotation, scale and
+        // perspective all tell ancestors to regenerate. Colour did not, and a
+        // cache bakes its descendants' colour into the texture: the object's
+        // own transform is re-applied when the cache is drawn, but a child's
+        // is not. Content that tints named child parts after a cached ancestor
+        // exists therefore keeps the untinted texture, and whether the tint
+        // survives comes down to which happened first. That reads as the same
+        // asset drawing in different colours from one instance to the next.
+        if self.base().set_color_transform(color_transform)
+            && let Some(parent) = self.parent()
+        {
+            // Self-transform changes are handled when the cache is drawn, so
+            // only ancestors need telling -- matching the sibling setters.
+            //
+            // Exempting these from the redraw budget was tried and reverted:
+            // content animates colour (fades) every frame, so "the colour
+            // changed" is true almost always, and the exemption removed the
+            // budget rather than making an exception to it.
+            parent.invalidate_cached_bitmap();
+        }
     }
 
     /// Sets the perspective projection of this object.

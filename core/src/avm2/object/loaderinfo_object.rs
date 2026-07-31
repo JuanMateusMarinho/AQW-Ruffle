@@ -142,7 +142,7 @@ pub struct LoaderInfoObjectData<'gc> {
 
     errored: Cell<bool>,
 
-    /// True enquanto um SWF está sendo carregado. Impede loads simultâneos.
+    /// True while a SWF is loading. Prevents concurrent loads.
     is_loading: Cell<bool>,
 }
 
@@ -277,7 +277,7 @@ impl<'gc> LoaderInfoObject<'gc> {
                 }
 
                 self.0.complete_event_fired.set(true);
-                // Load concluído — libera para novos loads
+                // Load finished -- accept new ones again
                 self.0.is_loading.set(false);
                 let complete_evt = EventObject::bare_default_event(context, "complete");
                 Avm2::dispatch_event(context, complete_evt, self.into());
@@ -304,7 +304,7 @@ impl<'gc> LoaderInfoObject<'gc> {
         self.0.expose_content.set(true);
     }
 
-    /// Retorna true se um SWF está sendo carregado atualmente.
+    /// Whether a SWF is currently loading.
     pub fn is_loading(self) -> bool {
         self.0.is_loading.get()
     }
@@ -338,7 +338,7 @@ impl<'gc> LoaderInfoObject<'gc> {
         self.set_loader_stream(loader_stream, context.gc());
         self.set_errored(false);
         self.reset_init_and_complete_events();
-        // Reseta flag de loading ao fazer unload
+        // Unloading ends any load in progress
         self.0.is_loading.set(false);
 
         let loader_display_object = self
@@ -377,15 +377,15 @@ impl<'gc> TObject<'gc> for LoaderInfoObject<'gc> {
 }
 
 impl<'gc> LoaderInfoObject<'gc> {
-    /// Reseta o LoaderInfo para estado "não carregado" e dispara o evento "unload".
-    /// Chamado por Loader._unload() após remover o conteúdo da display list.
+    /// Reset this LoaderInfo to its "not loaded" state and fire "unload".
+    /// Called by `Loader._unload()` after the content leaves the display list.
     pub fn reset_and_dispatch_unload(
         self,
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<(), Error<'gc>> {
         let context = &mut activation.context;
 
-        // Reseta stream para "não carregado"
+        // Put the stream back to "not loaded"
         let movie = &context.root_swf;
         let empty_swf = Arc::new(crate::tag_utils::SwfMovie::empty(
             movie.version(),
@@ -396,7 +396,7 @@ impl<'gc> LoaderInfoObject<'gc> {
         self.set_errored(false);
         self.reset_init_and_complete_events();
 
-        // Dispara evento "unload" no LoaderInfo (Adobe spec §4.8.3)
+        // Fire "unload" on the LoaderInfo (Adobe spec 4.8.3)
         let unload_event = EventObject::bare_default_event(context, "unload");
         Avm2::dispatch_event(context, unload_event, self.into());
 

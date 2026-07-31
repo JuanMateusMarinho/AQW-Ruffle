@@ -1791,7 +1791,7 @@ async fn request_device(
 /// Set once the device has reported an out-of-memory error. Subsequent errors
 /// are almost always cascades from the failed allocation (e.g. `create_view` on
 /// a texture that never got memory), so we downgrade them to logs instead of
-/// crashing — the whole point of the guard is to survive the OOM episode.
+/// crashing — the whole point of the OOM guard is to survive the episode.
 static WGPU_OOM_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Uncaptured-error handler installed on every device: logs out-of-memory (and
