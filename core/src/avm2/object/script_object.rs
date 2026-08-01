@@ -332,6 +332,10 @@ impl<'gc> ScriptObjectWrapper<'gc> {
             DynamicKey::String(name) => Value::String(*name),
             DynamicKey::Object(obj) => Value::Object(*obj),
             DynamicKey::Uint(val) => Value::Number(*val as f64),
+            // Only a weak `Dictionary` produces these, and it overrides both
+            // enumerant accessors precisely because resolving one needs the
+            // mutation context that this path does not have.
+            DynamicKey::WeakObject(_) => Value::Undefined,
         })
     }
 

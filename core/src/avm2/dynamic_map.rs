@@ -1,4 +1,4 @@
-use crate::avm2::object::Object;
+use crate::avm2::object::{Object, WeakObject};
 use crate::string::AvmString;
 use fnv::FnvBuildHasher;
 use gc_arena::Collect;
@@ -24,6 +24,11 @@ pub enum DynamicKey<'gc> {
     // can be `number`
     Uint(u32),
     Object(Object<'gc>),
+    // A `Dictionary` built with `new Dictionary(true)` holds its object keys
+    // weakly, so an entry stops keeping its own key alive. Only `Dictionary`
+    // ever produces either object variant, and a given dictionary uses one or
+    // the other for its whole life, so the two never mix within one map.
+    WeakObject(WeakObject<'gc>),
 }
 
 /// A HashMap designed for dynamic properties on an object.
@@ -135,6 +140,19 @@ impl<K: Eq + Hash, V> DynamicMap<K, V> {
                 ));
             }
         }
+    }
+
+    /// Drop every entry whose key `keep` rejects, and report how many went.
+    ///
+    /// Resets the enumeration cursor: unlike `remove`, this can move entries
+    /// between buckets, so a public index captured before the call no longer
+    /// refers to the same entry.
+    pub fn retain(&mut self, mut keep: impl FnMut(&K) -> bool) -> usize {
+        let before = self.table.len();
+        self.table.retain(|(k, _)| keep(k));
+        self.public_index.set(0);
+        self.real_index.set(0);
+        before - self.table.len()
     }
 
     pub fn remove(&mut self, key: &K) -> Option<DynamicProperty<V>> {

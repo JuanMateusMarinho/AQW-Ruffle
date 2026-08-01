@@ -1,2 +1,7 @@
+# Weak keys themselves work: with a completed collection cycle this test
+# produces Flash's exact output, dropping precisely the three entries the SWF
+# nulls. What it still fails on is pacing -- the test forces collection by
+# allocating 6000 small objects, which is not enough debt for `collect_debt`
+# to finish a cycle over an arena the size of a loaded player.
 num_frames = 25
 known_failure = true

@@ -9,6 +9,7 @@ use crate::avm2::value::Value;
 use crate::string::AvmString;
 use core::fmt;
 use gc_arena::{Collect, Gc, GcWeak, Mutation};
+use std::cell::Cell;
 use ruffle_common::utils::HasPrefixField;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -21,16 +22,20 @@ fn aqw_diagnostics_enabled() -> bool {
 /// How many `Dictionary` instances have been allocated, and how many entries
 /// currently live in their *object* space.
 ///
-/// The constructor's `weakKeys` argument is accepted and discarded (see
-/// `Dictionary.as`), so every one of these entries pins its key for the
-/// lifetime of the dictionary — where the player would have collected the
-/// ones whose key became unreachable. Only object keys can be weak; string
-/// and numeric keys are ordinary dynamic properties and unaffected. That is
-/// what makes the second number the deciding one: if a content that asks for
-/// weak keys keeps almost nothing in object space, implementing them cannot
-/// reclaim anything, however many dictionaries exist.
+/// Only object keys can be weak; string and numeric keys are ordinary dynamic
+/// properties and unaffected. That makes the second number the one to watch:
+/// it is the population that `weakKeys` governs, so it is both the measure of
+/// how much a weak dictionary is holding and the signal that pruning is
+/// reclaiming it.
 static DICTIONARY_INSTANCES: AtomicU64 = AtomicU64::new(0);
 static DICTIONARY_OBJECT_KEYS: AtomicI64 = AtomicI64::new(0);
+
+/// Insertions into a weak dictionary between sweeps for dead keys.
+///
+/// A weak dictionary that stays a constant size while its keys die would never
+/// trip a growth-based trigger, so the schedule counts writes rather than
+/// length. One sweep per this many insertions keeps it amortized.
+const PRUNE_INTERVAL: usize = 64;
 
 /// `(instances allocated, live object-space entries)`. Both are only tracked
 /// under `RUFFLE_AQW_DIAGNOSTICS`, so they read zero otherwise.
@@ -52,7 +57,15 @@ pub fn dictionary_allocator<'gc>(
         DICTIONARY_INSTANCES.fetch_add(1, Ordering::Relaxed);
     }
 
-    Ok(DictionaryObject(Gc::new(activation.gc(), DictionaryObjectData { base })).into())
+    Ok(DictionaryObject(Gc::new(
+        activation.gc(),
+        DictionaryObjectData {
+            base,
+            weak_keys: Cell::new(false),
+            inserts_since_prune: Cell::new(0),
+        },
+    ))
+    .into())
 }
 
 /// An object that allows associations between objects and values.
@@ -82,14 +95,66 @@ impl fmt::Debug for DictionaryObject<'_> {
 pub struct DictionaryObjectData<'gc> {
     /// Base script object
     base: ScriptObjectData<'gc>,
+
+    /// Whether `new Dictionary(true)` asked for weak keys, in which case the
+    /// object space is keyed by `DynamicKey::WeakObject` and an entry no
+    /// longer keeps its own key alive.
+    #[collect(require_static)]
+    weak_keys: Cell<bool>,
+
+    /// Insertions since the last sweep for collected keys (weak only).
+    #[collect(require_static)]
+    inserts_since_prune: Cell<usize>,
 }
 
 impl<'gc> DictionaryObject<'gc> {
+    /// Hold object keys weakly from here on (`new Dictionary(true)`).
+    ///
+    /// Called from the constructor, before any entry can exist, so there is
+    /// never a mix of strong and weak keys in one dictionary.
+    pub fn set_weak_keys(self) {
+        self.0.weak_keys.set(true);
+    }
+
+    /// The key this dictionary files `name` under.
+    ///
+    /// A live `Object` and its `WeakObject` hash identically (both by box
+    /// address), so a lookup built this way finds the entry either way.
+    fn object_key(self, name: Object<'gc>) -> DynamicKey<'gc> {
+        if self.0.weak_keys.get() {
+            DynamicKey::WeakObject(name.downgrade())
+        } else {
+            DynamicKey::Object(name)
+        }
+    }
+
+    /// Drop entries whose key has been collected.
+    ///
+    /// Only enumeration and `length` can observe them -- a lookup always comes
+    /// from a live `Object`, whose entry is by definition still live -- so this
+    /// is about not letting dead entries accumulate, and about reporting the
+    /// object-key population honestly.
+    fn prune_dead_keys(self, mc: &Mutation<'gc>) {
+        self.0.inserts_since_prune.set(0);
+
+        let pruned = self.base().values_mut(mc).retain(|key| match key {
+            // `upgrade` returns `None` both for an already-dropped pointer and
+            // for one the in-progress sweep has already condemned. Either way
+            // the entry is dead and safe to drop.
+            DynamicKey::WeakObject(weak) => weak.upgrade(mc).is_some(),
+            _ => true,
+        });
+
+        if aqw_diagnostics_enabled() && pruned > 0 {
+            DICTIONARY_OBJECT_KEYS.fetch_sub(pruned as i64, Ordering::Relaxed);
+        }
+    }
+
     /// Retrieve a value in the dictionary's object space.
     pub fn get_property_by_object(self, name: Object<'gc>) -> Value<'gc> {
         self.base()
             .values()
-            .get(&DynamicKey::Object(name))
+            .get(&self.object_key(name))
             .map(|v| v.value)
             .unwrap_or(Value::Undefined)
     }
@@ -103,19 +168,35 @@ impl<'gc> DictionaryObject<'gc> {
         }
         self.base()
             .values_mut(mc)
-            .insert(DynamicKey::Object(name), value);
+            .insert(self.object_key(name), value);
+
+        if self.0.weak_keys.get() {
+            let writes = self.0.inserts_since_prune.get() + 1;
+            self.0.inserts_since_prune.set(writes);
+            if writes >= PRUNE_INTERVAL {
+                self.prune_dead_keys(mc);
+            }
+        }
     }
 
     /// Delete a value from the dictionary's object space.
     pub fn delete_property_by_object(self, name: Object<'gc>, mc: &Mutation<'gc>) {
-        let removed = self.base().values_mut(mc).remove(&DynamicKey::Object(name));
+        let removed = self.base().values_mut(mc).remove(&self.object_key(name));
         if aqw_diagnostics_enabled() && removed.is_some() {
             DICTIONARY_OBJECT_KEYS.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
     pub fn has_property_by_object(self, name: Object<'gc>) -> bool {
-        self.base().values().contains_key(&DynamicKey::Object(name))
+        self.base().values().contains_key(&self.object_key(name))
+    }
+
+    /// Whether the entry at `index` is a weak key that has been collected.
+    fn enumerant_is_dead(self, index: u32, mc: &Mutation<'gc>) -> bool {
+        match self.base().values().key_at(index as usize) {
+            Some(DynamicKey::WeakObject(weak)) => weak.upgrade(mc).is_none(),
+            _ => false,
+        }
     }
 }
 
@@ -132,6 +213,36 @@ impl<'gc> TObject<'gc> for DictionaryObject<'gc> {
         _name: AvmString<'gc>,
         _is_enumerable: bool,
     ) {
+    }
+
+    // A collected weak key stays in the table until the next prune. Content
+    // must never be handed one, so enumeration steps over them.
+    fn get_next_enumerant(
+        self,
+        last_index: u32,
+        activation: &mut Activation<'_, 'gc>,
+    ) -> Result<u32, Error<'gc>> {
+        let mut index = last_index;
+        loop {
+            index = self.base().get_next_enumerant(index);
+            if index == 0 || !self.enumerant_is_dead(index, activation.gc()) {
+                return Ok(index);
+            }
+        }
+    }
+
+    fn get_enumerant_name(
+        self,
+        index: u32,
+        activation: &mut Activation<'_, 'gc>,
+    ) -> Result<Value<'gc>, Error<'gc>> {
+        if let Some(DynamicKey::WeakObject(weak)) = self.base().values().key_at(index as usize) {
+            return Ok(weak
+                .upgrade(activation.gc())
+                .map_or(Value::Undefined, Value::Object));
+        }
+
+        Ok(self.base().get_enumerant_name(index).unwrap_or(Value::Null))
     }
 
     fn get_enumerant_value(
