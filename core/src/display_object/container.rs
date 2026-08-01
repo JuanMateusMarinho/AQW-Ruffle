@@ -1228,6 +1228,15 @@ impl<'gc> ChildContainer<'gc> {
 
     fn render_list_mut(&mut self) -> &mut Vec<DisplayObject<'gc>> {
         *self.render_list_index.get_mut() = None;
+        // A live `RenderIter` (one per level of an in-flight `enter_frame`
+        // walk) makes the next line clone the whole list rather than mutate
+        // in place. Count that before it happens.
+        if super::aqw_diagnostics_enabled() && Rc::strong_count(&self.render_list) > 1 {
+            use std::sync::atomic::Ordering;
+            super::AQW_RENDERLIST_COPIES.fetch_add(1, Ordering::Relaxed);
+            super::AQW_RENDERLIST_COPIED
+                .fetch_add(self.render_list.len() as u64, Ordering::Relaxed);
+        }
         Rc::make_mut(&mut self.render_list)
     }
 }

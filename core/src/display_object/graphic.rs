@@ -203,6 +203,10 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
         }
     }
 
+    fn needs_frame_construction(self) -> bool {
+        self.movie().is_action_script_3() && self.object2().is_none()
+    }
+
     fn construct_frame(self, context: &mut UpdateContext<'gc>) {
         if self.movie().is_action_script_3() && self.object2().is_none() {
             let class_object = self

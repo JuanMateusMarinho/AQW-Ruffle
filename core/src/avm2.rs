@@ -444,6 +444,25 @@ impl<'gc> Avm2<'gc> {
     ///
     /// Attempts to register the same listener for the same event will also do
     /// nothing.
+    /// `(live listeners, suspended listeners, largest bucket, its event name)`.
+    ///
+    /// `broadcast_frame_entered` dispatches to the whole `enterFrame` bucket
+    /// every frame, and that call sits inside the stage's `enter_frame` -- so
+    /// its cost has been landing in `stage_enter_ms` and reading as tree-walk
+    /// time, even though it walks listeners rather than display objects.
+    pub fn broadcast_stats(&self) -> (usize, usize, usize, String) {
+        let live = self.broadcast_list.values().map(Vec::len).sum();
+        let suspended = self.broadcast_list_suspended.values().map(Vec::len).sum();
+        let (mut max, mut name) = (0, String::new());
+        for (event, bucket) in &self.broadcast_list {
+            if bucket.len() > max {
+                max = bucket.len();
+                name = event.to_string();
+            }
+        }
+        (live, suspended, max, name)
+    }
+
     pub fn remove_object_from_broadcast_list(
         &mut self,
         object_ptr: *const crate::avm2::object::ObjectPtr,
@@ -652,9 +671,38 @@ impl<'gc> Avm2<'gc> {
                             display_object.is_in_currently_detached_aqw_avatar_loader()
                         });
                 if !suspended {
-                    let mut activation = Activation::from_nothing(context);
+                    // Attribute the handler's cost to its class. Measured
+                    // 2026-08-01: ~23 `enterFrame` listeners account for 96%
+                    // of the stage phase, so the expensive ones are few and
+                    // naming them is the whole question.
+                    let probe = crate::display_object::aqw_diagnostics_enabled()
+                        .then(std::time::Instant::now);
 
+                    // Profile only what the handler itself runs. Opening the
+                    // window around the whole frame would bury the handler in
+                    // the rest of the tick, which is the mistake the listener
+                    // timer above already had to correct for.
+                    let profiling = crate::display_object::aqw_avm2_profile_enabled();
+                    if profiling {
+                        crate::display_object::aqw_avm2_profile_push_window();
+                    }
+
+                    let mut activation = Activation::from_nothing(context);
                     events::broadcast_event(&mut activation, object, event);
+
+                    if profiling {
+                        crate::display_object::aqw_avm2_profile_pop_window();
+                    }
+
+                    if let Some(started) = probe {
+                        // Record every call, not just slow ones. A 100us floor
+                        // made a build whose handlers were merely cheap look
+                        // like a build that barely called them, which is a
+                        // different diagnosis entirely.
+                        let elapsed = started.elapsed().as_nanos() as u64;
+                        let name = object.instance_class().name().local_name().to_string();
+                        crate::display_object::aqw_note_listener_cost(name, elapsed);
+                    }
                 }
             }
         }

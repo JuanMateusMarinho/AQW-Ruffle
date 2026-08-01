@@ -86,7 +86,8 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
     // decision is made once per tick in the Enter pass; the later passes use
     // the read-only check so all phases of one tick agree.
     use crate::display_object::{
-        AQW_ORPHANS_FROZEN, AQW_TICK_BCAST_NS, AQW_TICK_ORPHAN_NS, AQW_TICK_STAGE_NS,
+        AQW_ORPHANS_FROZEN, AQW_STAGE_CTOR_NS, AQW_STAGE_ENTER_NS, AQW_STAGE_SCRIPT_NS,
+        AQW_TICK_BCAST_NS, AQW_TICK_ORPHAN_NS, AQW_TICK_STAGE_NS,
     };
     use std::sync::atomic::Ordering;
     let mut orphan_ns = 0u64;
@@ -107,7 +108,9 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
     orphan_ns += started.elapsed().as_nanos() as u64;
     let started = Instant::now();
     stage.enter_frame(context);
-    stage_ns += started.elapsed().as_nanos() as u64;
+    let phase_ns = started.elapsed().as_nanos() as u64;
+    AQW_STAGE_ENTER_NS.fetch_add(phase_ns, Ordering::Relaxed);
+    stage_ns += phase_ns;
 
     *context.frame_phase = FramePhase::Construct;
     let started = Instant::now();
@@ -123,7 +126,9 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
     orphan_ns += started.elapsed().as_nanos() as u64;
     let started = Instant::now();
     stage.construct_frame(context);
-    stage_ns += started.elapsed().as_nanos() as u64;
+    let phase_ns = started.elapsed().as_nanos() as u64;
+    AQW_STAGE_CTOR_NS.fetch_add(phase_ns, Ordering::Relaxed);
+    stage_ns += phase_ns;
     let started = Instant::now();
     broadcast_frame_constructed(context);
     bcast_ns += started.elapsed().as_nanos() as u64;
@@ -143,7 +148,9 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
     let started = Instant::now();
     stage.run_frame_scripts(context);
     run_frame_script_cleanup(context);
-    stage_ns += started.elapsed().as_nanos() as u64;
+    let phase_ns = started.elapsed().as_nanos() as u64;
+    AQW_STAGE_SCRIPT_NS.fetch_add(phase_ns, Ordering::Relaxed);
+    stage_ns += phase_ns;
 
     *context.frame_phase = FramePhase::Exit;
     let started = Instant::now();
@@ -174,6 +181,11 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
 
 thread_local! {
     static GOTO_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+
+    /// The `ORPHAN_DIRTY_EPOCH` a nested goto last ran its orphan loops for.
+    /// While it matches, nothing has marked an orphan since, so the loops would
+    /// walk the whole list to find nothing.
+    static ORPHAN_EPOCH_DONE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Like `run_all_phases_avm2`, but specialized for the "nested frame" triggered
@@ -228,32 +240,101 @@ fn run_inner_goto_frame_impl<'gc>(
 
     // Note - we do *not* call `enter_frame` or dispatch an `enterFrame` event
 
+    // Step timers for the nested frame. See AQW_INNER_* -- the subtree skip only
+    // covers the two stage walks, so this says what the rest costs.
+    let probe = crate::display_object::aqw_diagnostics_enabled();
+    let mark = || probe.then(Instant::now);
+    let bill = |started: Option<Instant>, counter: &std::sync::atomic::AtomicU64| {
+        if let Some(started) = started {
+            counter.fetch_add(
+                started.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    };
+    if probe {
+        crate::display_object::AQW_INNER_FRAMES
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Both orphan loops are gated on the same epoch: they are the pair that
+    // reads the orphan list, and running one without the other would settle
+    // marks the other still needs.
+    let orphan_epoch =
+        crate::orphan_manager::ORPHAN_DIRTY_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+    let orphans_dirty = ORPHAN_EPOCH_DONE.with(|done| done.get() != orphan_epoch);
+    if probe && orphans_dirty {
+        crate::display_object::AQW_GATE_OPEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     *context.frame_phase = FramePhase::Construct;
-    OrphanManager::each_orphan_obj(context, |orphan, context| {
-        orphan.construct_frame(context);
-    });
+    let started = mark();
+    if orphans_dirty {
+        OrphanManager::each_orphan_obj(context, |orphan, context| {
+            if probe {
+                use std::sync::atomic::Ordering::Relaxed;
+                crate::display_object::AQW_INNER_ORPHAN_VISITS.fetch_add(1, Relaxed);
+                if !orphan.can_skip_frame_pass(context) {
+                    crate::display_object::AQW_INNER_ORPHAN_WORK.fetch_add(1, Relaxed);
+                }
+            }
+            orphan.construct_frame(context);
+        });
+    }
+    bill(started, &crate::display_object::AQW_INNER_ORPHAN_NS);
+
+    let started = mark();
     stage.construct_frame(context);
+    bill(started, &crate::display_object::AQW_INNER_STAGE_NS);
+
+    let started = mark();
     broadcast_frame_constructed(context);
+    bill(started, &crate::display_object::AQW_INNER_BCAST_NS);
 
     *context.frame_phase = FramePhase::FrameScripts;
+    let started = mark();
     stage.run_frame_scripts(context);
-    OrphanManager::each_orphan_obj(context, |orphan, context| {
-        orphan.run_frame_scripts(context);
-    });
+    bill(started, &crate::display_object::AQW_INNER_STAGE_NS);
 
+    let started = mark();
+    if orphans_dirty {
+        OrphanManager::each_orphan_obj(context, |orphan, context| {
+            if probe {
+                use std::sync::atomic::Ordering::Relaxed;
+                crate::display_object::AQW_INNER_ORPHAN_VISITS.fetch_add(1, Relaxed);
+                if !orphan.can_skip_frame_pass(context) {
+                    crate::display_object::AQW_INNER_ORPHAN_WORK.fetch_add(1, Relaxed);
+                }
+            }
+            orphan.run_frame_scripts(context);
+        });
+
+        // Record the epoch read *before* the loops, not the current one. The
+        // loops run frame scripts, which can mark orphans again; recording the
+        // value from after would swallow exactly those marks.
+        ORPHAN_EPOCH_DONE.with(|done| done.set(orphan_epoch));
+    }
+
+    // Not gated: these are named explicitly by the goto that removed them, and
+    // are not reached by walking the orphan list.
     for child in removed_frame_scripts {
         child.run_frame_scripts(context);
     }
+    bill(started, &crate::display_object::AQW_INNER_ORPHAN_NS);
 
     *context.frame_phase = FramePhase::Exit;
+    let started = mark();
     broadcast_frame_exited(context);
+    bill(started, &crate::display_object::AQW_INNER_BCAST_NS);
 
     // We cannot easily remove dead `GcWeak` instances from the orphan list
     // inside `each_orphan_movie`, since the callback may modify the orphan list.
     // Instead, we do one cleanup at the end of the frame.
     // This performs special handling of clips which became orphaned as
     // a result of a RemoveObject tag - see `cleanup_dead_orphans` for details.
+    let started = mark();
     context.orphan_manager.cleanup_dead_orphans(context.gc());
+    bill(started, &crate::display_object::AQW_INNER_CLEANUP_NS);
 
     *context.aqw_nested_goto = old_aqw_nested_goto;
     *context.frame_phase = old_phase;
@@ -261,9 +342,22 @@ fn run_inner_goto_frame_impl<'gc>(
 
 /// Broadcast a `enterFrame` event to all `DisplayObject`s.
 pub fn broadcast_frame_entered<'gc>(context: &mut UpdateContext<'gc>) {
+    // Timed apart from the stage walk it is nested inside: this dispatches to
+    // every `enterFrame` listener, which is where AQW runs its combat and FX
+    // logic, and it is not proportional to the display tree at all.
+    let started = crate::display_object::aqw_diagnostics_enabled()
+        .then(std::time::Instant::now);
+
     let enter_frame_evt = EventObject::bare_default_event(context, "enterFrame");
     let dobject_constr = context.avm2.classes().display_object;
     Avm2::broadcast_event(context, enter_frame_evt, dobject_constr);
+
+    if let Some(started) = started {
+        crate::display_object::AQW_BCAST_ENTER_NS.fetch_add(
+            started.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
 }
 
 /// Broadcast a `frameConstructed` event to all `DisplayObject`s.

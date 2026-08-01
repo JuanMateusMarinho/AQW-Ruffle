@@ -127,24 +127,44 @@ fn labels_for_scene<'gc>(
         start: scene_start,
         length: scene_length,
     } = scene;
-    let frame_label_class = activation.context.avm2.classes().framelabel;
+    // Rebuilt only when this clip has not already built this scene's labels.
+    // The `FrameLabel` instances are shared between reads; the `Array` wrapping
+    // them is not, so a caller that mutates the returned array still gets a
+    // fresh one. `FrameLabel` is `final` and exposes only getters, so sharing an
+    // instance is unobservable except by comparing identity across two reads.
+    let labels = match mc.cached_scene_labels(*scene_start, *scene_length) {
+        Some(labels) => labels,
+        None => {
+            let frame_label_class = activation.context.avm2.classes().framelabel;
+            let labels = mc
+                .labels_in_range(*scene_start, scene_start + scene_length)
+                .into_iter()
+                .map(|(name, frame)| {
+                    let name: Value<'gc> = AvmString::new(activation.gc(), name).into();
+                    let local_frame = frame - scene_start + 1;
+                    let args = [name, local_frame.into()];
 
-    let frame_labels = mc
-        .labels_in_range(*scene_start, scene_start + scene_length)
-        .into_iter()
-        .map(|(name, frame)| {
-            let name: Value<'gc> = AvmString::new(activation.gc(), name).into();
-            let local_frame = frame - scene_start + 1;
-            let args = [name, local_frame.into()];
+                    frame_label_class.construct(activation, &args)
+                })
+                .collect::<Result<Vec<Value<'gc>>, Error<'gc>>>()?;
 
-            frame_label_class.construct(activation, &args)
-        })
-        .collect::<Result<ArrayStorage<'gc>, Error<'gc>>>()?;
+            mc.set_cached_scene_labels(
+                activation.gc(),
+                *scene_start,
+                *scene_length,
+                labels.clone(),
+            );
+            labels
+        }
+    };
 
     Ok((
         scene_name.to_string(),
         *scene_length,
-        ArrayObject::from_storage(activation.context, frame_labels),
+        ArrayObject::from_storage(
+            activation.context,
+            labels.into_iter().collect::<ArrayStorage<'gc>>(),
+        ),
     ))
 }
 

@@ -214,6 +214,15 @@ pub fn exec<'gc>(
         return Ok(Value::Undefined);
     }
 
+    // Bill this call's exclusive time to the method, for `RUFFLE_AQW_AVM2_PROFILE`.
+    // A guard rather than a call at the tail because the argument-count and
+    // verification paths below return early, and an unpopped frame would
+    // misattribute every enclosing call.
+    let _profile = Avm2ProfileGuard {
+        started: crate::display_object::aqw_avm2_profile_enter(),
+        method,
+    };
+
     let ret = match method.method_kind() {
         MethodKind::Native { native_method, .. } => {
             let caller_domain = activation.caller_domain();
@@ -314,6 +323,25 @@ impl fmt::Debug for BoundMethod<'_> {
             .field("scope", &self.scope)
             .field("receiver", &self.bound_receiver)
             .finish()
+    }
+}
+
+/// Pops the profile frame opened for one `exec`, on every exit path.
+struct Avm2ProfileGuard<'gc> {
+    started: Option<std::time::Instant>,
+    method: Method<'gc>,
+}
+
+impl Drop for Avm2ProfileGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(started) = self.started {
+            let method = self.method;
+            crate::display_object::aqw_avm2_profile_exit(started, method.as_ptr(), || {
+                let mut name = WString::new();
+                display_function(&mut name, method);
+                name.to_utf8_lossy().into_owned()
+            });
+        }
     }
 }
 

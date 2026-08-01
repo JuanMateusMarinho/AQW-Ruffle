@@ -153,9 +153,16 @@ const MAX_AQW_CACHE_BITMAP_PIXELS: u32 = 8_000_000;
 /// traversal and to guard against NaN/inf matrices.
 const CACHE_DEGENERATE_SCALE: f32 = MAX_CACHE_BITMAP_DIMENSION as f32;
 
-fn aqw_diagnostics_enabled() -> bool {
+pub(crate) fn aqw_diagnostics_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
+}
+
+/// Kill switch for skipping clean subtrees inside a nested goto frame.
+/// `RUFFLE_AQW_NO_FRAME_SKIP=1` restores the unconditional full-stage walk.
+pub(crate) fn frame_skip_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_FRAME_SKIP").is_some())
 }
 
 /// The per-object flicker probes, which are too expensive to leave on the
@@ -681,7 +688,11 @@ impl Default for DisplayObjectBase<'_> {
             sound_transform: Default::default(),
             blend_mode: Default::default(),
             opaque_background: Default::default(),
-            flags: Cell::new(DisplayObjectFlags::VISIBLE),
+            // A brand new object always has frame work pending: it has no AVM2
+            // object yet, so `construct_frame` has to reach it.
+            flags: Cell::new(
+                DisplayObjectFlags::VISIBLE | DisplayObjectFlags::SUBTREE_NEEDS_FRAME,
+            ),
             scroll_rect: Cell::new(None),
             next_scroll_rect: Default::default(),
             scaling_grid: Default::default(),
@@ -703,7 +714,8 @@ impl<'gc> DisplayObjectBase<'gc> {
     /// Reset all properties that would be adjusted by a movie load.
     fn reset_for_movie_load(&self) {
         let flags_to_keep = self.flags.get() & DisplayObjectFlags::LOCK_ROOT;
-        self.flags.set(flags_to_keep | DisplayObjectFlags::VISIBLE);
+        self.flags
+            .set(flags_to_keep | DisplayObjectFlags::VISIBLE | DisplayObjectFlags::SUBTREE_NEEDS_FRAME);
     }
 
     fn depth(&self) -> Depth {
@@ -1010,6 +1022,14 @@ impl<'gc> DisplayObjectBase<'gc> {
 
     pub fn set_skip_next_enter_frame(&self, skip: bool) {
         self.set_flag(DisplayObjectFlags::SKIP_NEXT_ENTER_FRAME, skip);
+    }
+
+    pub fn subtree_needs_frame(&self) -> bool {
+        self.contains_flag(DisplayObjectFlags::SUBTREE_NEEDS_FRAME)
+    }
+
+    pub fn set_subtree_needs_frame(&self, value: bool) {
+        self.set_flag(DisplayObjectFlags::SUBTREE_NEEDS_FRAME, value);
     }
 
     fn set_avm1_removed(&self, value: bool) {
@@ -1568,6 +1588,478 @@ pub(crate) static AQW_TICK_BCAST_NS: std::sync::atomic::AtomicU64 =
 pub(crate) static AQW_ORPHANS_FROZEN: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// `tick_stage_ms` split by phase.
+///
+/// The three stage passes cost very different things -- advancing timelines,
+/// constructing newly placed objects, and running the content's own frame
+/// scripts -- and summing them hides which one grew. Measured 2026-08-01: the
+/// total is 42-58ms/frame on the updated game while the fork's own per-clip
+/// hook accounts for ~1.2ms of it, so the answer is in here.
+/// AS3 clips whose timeline actually advanced in `enter_frame`, against
+/// `aqw_clips` (every clip walked).
+///
+/// Measured 2026-08-01: `stage_enter_ms` is 98% of the stage tick, and two
+/// windows with the same clip count differed 21x in cost -- so the driver is
+/// how many clips are *playing*, not how many exist. A frame script that
+/// throws abandons everything after it, including the `stop()` that authored
+/// timelines almost always end on (see the note on Error #1009), which would
+/// leave clips advancing forever. This ratio is what tells those apart.
+pub(crate) static AQW_CLIPS_ADVANCED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Nanoseconds inside `run_frame_internal`, the timeline-advance half of
+/// `enter_frame`. `stage_enter_ms` minus this is the cost of the tree walk
+/// itself -- the recursion, and the queued-tag work every AS3 clip does
+/// whether or not it is playing.
+///
+/// Needed because neither clip count nor playing count predicts the cost:
+/// measured 2026-08-01, one window walked 9277 clips with 596 advancing for
+/// 124ms, another walked 8079 with 71 advancing for 2253ms.
+pub(crate) static AQW_RUNFRAME_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Render-list deep copies forced by `Rc::make_mut`, and elements copied.
+///
+/// `enter_frame` keeps a `RenderIter` alive at every level while it recurses,
+/// and each one holds a strong `Rc` to that container's render list. Any child
+/// added or removed while the walk is in flight therefore clones the whole
+/// list instead of mutating it in place -- by design, so iteration stays valid
+/// (see the comment on `ChildContainer::render_list`), but the cost lands on
+/// exactly the workload that churns children fastest.
+///
+/// Measured 2026-08-01: walking a constant ~8800 clips cost 0.12us/clip at
+/// rest and 11.19us/clip during skill spam, with timeline advance flat at
+/// ~2ms. These two counters are what tie that 100x to the copies.
+/// The queued-tag half of `enter_frame`, which `runframe_ms` does not cover:
+/// draining the pending `PlaceObject` queue (`unqueue_ms`) and executing those
+/// tags (`place_ms`, `places` = tags run).
+///
+/// This is the last unmeasured block in the phase. Everything else has been
+/// ruled out by measurement: timeline advance is ~5ms, render-list copies run
+/// 3-15 per frame at one element each, and the fork's own hook is 2%.
+/// Self-time attribution for `enter_frame`, keyed by the clip's source SWF.
+///
+/// Four hypotheses have now been refuted by measurement -- stuck-playing
+/// clips, render-list copy-on-write, timeline advance, and queued-tag work --
+/// and the sub-blocks that *are* timed sum to ~90ms of a 3800ms phase. Walking
+/// more clips is demonstrably cheaper (18824 clips for 188ms against 6991 for
+/// 3891ms), so the cost is concentrated in specific clips rather than spread
+/// over the tree. This attributes each clip's own time, excluding its
+/// children, so the expensive ones name themselves.
+static AQW_SELF_TIME: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, String)>>> =
+    std::sync::Mutex::new(None);
+
+thread_local! {
+    /// Inclusive time the clip currently being timed has spent in children.
+    static ENTER_CHILD_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) struct EnterFrameProbe {
+    start: std::time::Instant,
+    parent_child_ns: u64,
+}
+
+pub(crate) fn enter_probe_begin() -> Option<EnterFrameProbe> {
+    aqw_diagnostics_enabled().then(|| EnterFrameProbe {
+        start: std::time::Instant::now(),
+        parent_child_ns: ENTER_CHILD_NS.with(|c| c.replace(0)),
+    })
+}
+
+pub(crate) fn enter_probe_end(probe: Option<EnterFrameProbe>, movie: &std::sync::Arc<SwfMovie>) {
+    let Some(probe) = probe else { return };
+    let inclusive = probe.start.elapsed().as_nanos() as u64;
+    // Hand the parent its own accumulator back, plus what this subtree cost.
+    let children = ENTER_CHILD_NS.with(|c| c.replace(probe.parent_child_ns + inclusive));
+    let exclusive = inclusive.saturating_sub(children);
+
+    if let Ok(mut guard) = AQW_SELF_TIME.lock() {
+        let map = guard.get_or_insert_with(Default::default);
+        map.entry(std::sync::Arc::as_ptr(movie) as usize)
+            .or_insert_with(|| (0, short_swf_name(movie.url())))
+            .0 += exclusive;
+    }
+}
+
+/// `.../classes/M/LegionRevenantr2.swf` -> `LegionRevenantr2.swf`
+fn short_swf_name(url: &str) -> String {
+    url.split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .rsplit('/')
+        .next()
+        .unwrap_or(url)
+        .to_string()
+}
+
+/// Top `n` SWFs by self-time since the last call, as `name=ms` pairs.
+fn aqw_self_time_top(n: usize) -> String {
+    let Ok(mut guard) = AQW_SELF_TIME.lock() else {
+        return String::new();
+    };
+    let Some(map) = guard.as_mut() else {
+        return String::new();
+    };
+    let mut rows: Vec<_> = map
+        .values()
+        .filter(|(ns, _)| *ns > 1_000_000)
+        .map(|(ns, name)| (*ns / 1_000_000, name.clone()))
+        .collect();
+    map.clear();
+    rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    rows.truncate(n);
+    rows.iter()
+        .map(|(ms, name)| format!("{name}={ms}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Time in `broadcast_frame_entered`. Nested inside the stage's `enter_frame`,
+/// so `stage_enter_ms` has been reporting it as walk cost all along.
+pub(crate) static AQW_BCAST_ENTER_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `run_goto` cost, calls, and frames stepped through.
+///
+/// AQW's aura cooldown handler (`playerAuras.countDownAct`) drives a 90-frame
+/// mask with `gotoAndStop` on four segments per aura per frame, and a backward
+/// goto restarts at frame 1 and replays forward. Whether that is what makes
+/// each handler call cost ~5.4ms, or whether the cost is elsewhere in the
+/// handler, is the difference between fixing timeline seeking and fixing
+/// something else -- so it gets measured rather than assumed.
+pub(crate) static AQW_GOTO_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `run_goto` split into its three phases, plus placement tags parsed.
+///
+/// A goto costs ~1.4ms while stepping 12-17 frames -- about 100us per frame,
+/// far more than reading a handful of tags should take. The phases have very
+/// different fixes: scanning is tag parsing (a `PlaceObject3` parse allocates
+/// for filters and name), removal walks the render list, and applying
+/// instantiates or updates children. Measure before rewriting any of them.
+pub(crate) static AQW_GOTO_SCAN_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_GOTO_REMOVE_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_GOTO_APPLY_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_GOTO_TAGS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The apply phase split again: placing children (`run_goto_command` over the
+/// merged commands) against `run_inner_goto_frame`, the recursive frame an
+/// explicit goto runs afterwards.
+///
+/// Apply is 98% of a goto -- scanning tags is 1.7% -- so this is the cut that
+/// says whether the cost is placing objects or re-running a whole frame.
+/// Gotos that skipped the recursive frame because they changed nothing that
+/// needs one.
+pub(crate) static AQW_GOTO_FAST: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Opt-in, and off by default because it is **not** semantically correct.
+///
+/// Skipping the recursive frame breaks 10 timeline tests
+/// (`movieclip_gotoandstop_queueing`, `movieclip_displayevents_*`,
+/// `swf_10_queued_goto_scripts_construct`, ...): the frame is a *global*
+/// operation -- it broadcasts `frameConstructed`/`exitFrame`, runs other
+/// clips' frame scripts, and drains queued tags -- so "this clip changed
+/// nothing structural" is not a sound reason to skip it.
+///
+/// Kept behind `RUFFLE_AQW_GOTO_FASTPATH=1` only to measure the ceiling: it
+/// takes an aura goto from 6600us to roughly what SWF 9 content pays. The
+/// real fix is to make the recursive frame cheap rather than to skip it.
+pub(crate) fn aqw_goto_fastpath_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_GOTO_FASTPATH").is_some())
+}
+
+pub(crate) static AQW_GOTO_PLACE_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_GOTO_INNER_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_GOTO_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_GOTO_REWINDS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_GOTO_FRAMES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Broadcast-handler time by listener class, for calls over 0.1ms.
+static AQW_LISTENER_COST: std::sync::Mutex<Option<std::collections::HashMap<String, (u64, u64)>>> =
+    std::sync::Mutex::new(None);
+
+/// Record one handler call. `(calls, nanoseconds)` per class.
+pub(crate) fn aqw_note_listener_cost(class: String, ns: u64) {
+    if let Ok(mut guard) = AQW_LISTENER_COST.lock() {
+        let entry = guard
+            .get_or_insert_with(Default::default)
+            .entry(class)
+            .or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 += ns;
+    }
+}
+
+/// Top `n` listener classes since the last call, as `Class=ms/calls`.
+fn aqw_listener_cost_top(n: usize) -> String {
+    let Ok(mut guard) = AQW_LISTENER_COST.lock() else {
+        return String::new();
+    };
+    let Some(map) = guard.as_mut() else {
+        return String::new();
+    };
+    // Microseconds, so a handler that is cheap per call but runs constantly is
+    // still visible instead of rounding to zero.
+    let mut rows: Vec<_> = map
+        .iter()
+        .map(|(class, (calls, ns))| (ns / 1_000, *calls, class.clone()))
+        .collect();
+    map.clear();
+    rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    rows.truncate(n);
+    rows.iter()
+        .map(|(us, calls, class)| format!("{class}={us}us/{calls}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Exclusive ("self") time per AVM2 method called inside a broadcast handler.
+///
+/// Measured 2026-08-01: with the goto fast path on, `run_goto` is only 9.6% of
+/// an aura handler call, and the three runs without it agree that the goto is
+/// almost exactly half. So half the cost is somewhere the `swf_version` gate on
+/// the recursive goto frame does not explain, and the remaining version gates
+/// in the tree are all on paths an `enterFrame` listener never takes. Guessing
+/// has already cost nine dead hypotheses; record which method spends the time.
+///
+/// Self time rather than inclusive, so a parent doesn't hide behind its
+/// children: if the handler's own bytecode is the cost, `countDownAct` itself
+/// tops the table, and if a builtin is, the builtin does.
+///
+/// Off unless `RUFFLE_AQW_AVM2_PROFILE=1`. This times every single `exec` and
+/// keeps a map keyed by method identity -- far too expensive to sit on the
+/// general diagnostics flag, same reasoning as the flicker probes.
+pub(crate) fn aqw_avm2_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_AVM2_PROFILE").is_some())
+}
+
+#[derive(Default)]
+struct Avm2Profile {
+    /// Open windows, not a flag. Broadcasts nest: an explicit goto inside a
+    /// handler runs a recursive frame that broadcasts `frameConstructed` and
+    /// `exitFrame` through this same path, so a bool let the inner broadcast
+    /// close the window mid-`gotoAndStop` and every enclosing sample was
+    /// dropped. That is why the first run profiled 390ms of a 4300ms phase and
+    /// `gotoAndStop` -- 1500ms of it by `goto_ms` -- did not appear at all.
+    depth: u32,
+    /// Inclusive time of the calls each open frame has made, so a method can
+    /// subtract its children and report exclusive time. One entry per open
+    /// `exec`.
+    child_ns: Vec<u64>,
+    /// Method identity -> (display name, calls, exclusive ns). The name is
+    /// built once, when the method is first seen.
+    entries: std::collections::HashMap<usize, (String, u64, u64)>,
+}
+
+thread_local! {
+    static AVM2_PROFILE: RefCell<Avm2Profile> = RefCell::new(Avm2Profile::default());
+}
+
+/// Ops executed while a profile window was open. Separates "this build runs far
+/// more bytecode" from "it runs the same bytecode but something native inside
+/// got slow", which need different fixes.
+pub(crate) static AQW_AVM2_OPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Mirrors `Avm2Profile::active` as a plain atomic. The op dispatch loop is the
+/// hottest loop in the VM and cannot afford a thread-local borrow per op.
+pub(crate) static AQW_AVM2_PROFILE_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Open the accumulation window, or nest one level deeper into it.
+pub(crate) fn aqw_avm2_profile_push_window() {
+    let opened = AVM2_PROFILE.with(|cell| {
+        let Ok(mut profile) = cell.try_borrow_mut() else {
+            return false;
+        };
+        profile.depth += 1;
+        profile.depth == 1
+    });
+    if opened {
+        AQW_AVM2_PROFILE_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Leave one level. The outermost exit also drops any frames still open, which
+/// can only happen if a call unwound past the window.
+pub(crate) fn aqw_avm2_profile_pop_window() {
+    let closed = AVM2_PROFILE.with(|cell| {
+        let Ok(mut profile) = cell.try_borrow_mut() else {
+            return false;
+        };
+        profile.depth = profile.depth.saturating_sub(1);
+        if profile.depth == 0 {
+            profile.child_ns.clear();
+            return true;
+        }
+        false
+    });
+    if closed {
+        AQW_AVM2_PROFILE_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Push a frame. `None` means the window is closed and the caller should not
+/// record an exit.
+pub(crate) fn aqw_avm2_profile_enter() -> Option<std::time::Instant> {
+    // `exec` runs constantly, so the disabled path must cost one relaxed load
+    // and nothing else -- not a thread-local access.
+    if !AQW_AVM2_PROFILE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    AVM2_PROFILE.with(|cell| {
+        let mut profile = cell.try_borrow_mut().ok()?;
+        if profile.depth == 0 {
+            return None;
+        }
+        profile.child_ns.push(0);
+        Some(std::time::Instant::now())
+    })
+}
+
+/// Pop a frame and bill its exclusive time. `name` is only called the first
+/// time a method is seen, because building it formats the class and method.
+pub(crate) fn aqw_avm2_profile_exit(
+    started: std::time::Instant,
+    key: usize,
+    name: impl FnOnce() -> String,
+) {
+    let elapsed = started.elapsed().as_nanos() as u64;
+    AVM2_PROFILE.with(|cell| {
+        let Ok(mut profile) = cell.try_borrow_mut() else {
+            return;
+        };
+        if profile.depth == 0 {
+            return;
+        }
+        let children = profile.child_ns.pop().unwrap_or(0);
+        // This call is a child of whatever is still open above it.
+        if let Some(parent) = profile.child_ns.last_mut() {
+            *parent += elapsed;
+        }
+        let entry = profile.entries.entry(key).or_insert_with(|| (name(), 0, 0));
+        entry.1 += 1;
+        entry.2 += elapsed.saturating_sub(children);
+    });
+}
+
+/// Top `n` methods by exclusive time since the last call, as `Name=us/calls`.
+fn aqw_avm2_profile_top(n: usize) -> String {
+    AVM2_PROFILE.with(|cell| {
+        let Ok(mut profile) = cell.try_borrow_mut() else {
+            return String::new();
+        };
+        let mut rows: Vec<_> = profile
+            .entries
+            .values()
+            .map(|(name, calls, ns)| (ns / 1_000, *calls, name.clone()))
+            .collect();
+        profile.entries.clear();
+        rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        rows.truncate(n);
+        rows.iter()
+            .map(|(us, calls, name)| format!("{name}={us}us/{calls}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    })
+}
+
+/// `run_inner_goto_frame_impl` split into its steps.
+///
+/// The subtree skip took `gotoAndStop` from ~1590us to ~500us per call, but it
+/// only covers the two stage walks. The nested frame also iterates every orphan
+/// twice and runs `cleanup_dead_orphans`, none of which the skip touches, and at
+/// ~2000 nested frames per window against 99-1755 orphans that is a plausible
+/// remainder. Measure which step it actually is before changing any of them.
+pub(crate) static AQW_INNER_ORPHAN_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_INNER_STAGE_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_INNER_BCAST_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_INNER_CLEANUP_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_INNER_FRAMES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The orphan loops are 70-77% of the nested frame, but the cost barely moves
+/// between 85 and 2943 orphans, so it is not obviously proportional to the list.
+/// These separate the two candidates: `VISITS` counts every orphan the loops
+/// hand to the callback, `WORK` counts the ones that were actually dirty. If
+/// visits dominate, the fix is to stop iterating; if work does, the fix is to
+/// stop those orphans from staying dirty.
+/// Why the orphan gate reopens. It engages while the orphan list is small but
+/// stops working once the list balloons (measured: 1490 of 1514 nested frames
+/// found it open at 1719 orphans), so something bumps the epoch on nearly every
+/// goto. The two candidates need opposite fixes: `ORPHAN_ADDS` means gotos are
+/// orphaning children, `MARK_BUMPS` means marks are terminating outside the
+/// stage tree.
+pub(crate) static AQW_GATE_OPEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_ORPHAN_ADDS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_MARK_BUMPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) static AQW_INNER_ORPHAN_VISITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_INNER_ORPHAN_WORK: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) static AQW_UNQUEUE_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_PLACE_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_PLACE_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) static AQW_RENDERLIST_COPIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_RENDERLIST_COPIED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) static AQW_STAGE_ENTER_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_STAGE_CTOR_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_STAGE_SCRIPT_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Clips the per-clip AQW timeline hook ran on, and nanoseconds it spent, per
+/// sweep window.
+///
+/// `enter_frame` calls that hook on every `MovieClip` in the tree, so its cost
+/// scales with the size of the display list rather than with anything AQW-
+/// specific. The counters separate it from the rest of the stage phases, which
+/// `tick_stage_ms` lumps together with the game's own frame scripts -- without
+/// them there is no way to tell a hook that got expensive from content that
+/// got heavier.
+pub(crate) static AQW_HOOK_CLIPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_HOOK_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Kill-switch for the per-clip AQW timeline hook, so its whole cost can be
+/// taken out in the field for an A/B without a rebuild. Turning it off also
+/// turns off the avatar cache and both freezes, so compare `tick_stage_ms`
+/// (CPU) rather than frame rate.
+pub(crate) fn aqw_throttle_hook_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_THROTTLE_HOOK").is_some())
+}
+
 fn scale_twips(value: Twips, scale: f32) -> Twips {
     Twips::new((value.get() as f32 * scale).round_ties_even() as i32)
 }
@@ -1934,6 +2426,50 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         let tick_stage_ms = AQW_TICK_STAGE_NS.swap(0, Ordering::Relaxed) / 1_000_000;
         let tick_bcast_ms = AQW_TICK_BCAST_NS.swap(0, Ordering::Relaxed) / 1_000_000;
         let orphans_frozen = AQW_ORPHANS_FROZEN.swap(0, Ordering::Relaxed);
+        // Read against `tick_stage_ms`: the share of the stage phases that is
+        // our per-clip hook rather than AQW's own scripts. `aqw_clips` is the
+        // display-list size it walks, which is what a content update moves.
+        let aqw_hook_ms = AQW_HOOK_NS.swap(0, Ordering::Relaxed) / 1_000_000;
+        let aqw_clips = AQW_HOOK_CLIPS.swap(0, Ordering::Relaxed);
+        // These three sum to `tick_stage_ms`.
+        let aqw_playing = AQW_CLIPS_ADVANCED.swap(0, Ordering::Relaxed);
+        let runframe_ms = AQW_RUNFRAME_NS.swap(0, Ordering::Relaxed) / 1_000_000;
+        let bcast_enter_ms = AQW_BCAST_ENTER_NS.swap(0, Ordering::Relaxed) / 1_000_000;
+        let (listeners, listeners_susp, bcast_max, bcast_max_event) =
+            context.avm2.broadcast_stats();
+        let goto_ms = AQW_GOTO_NS.swap(0, Ordering::Relaxed) / 1_000_000;
+        let goto_calls = AQW_GOTO_CALLS.swap(0, Ordering::Relaxed);
+        let goto_rewinds = AQW_GOTO_REWINDS.swap(0, Ordering::Relaxed);
+        let goto_frames = AQW_GOTO_FRAMES.swap(0, Ordering::Relaxed);
+        let goto_scan_ms = AQW_GOTO_SCAN_NS.swap(0, Ordering::Relaxed) / 1_000_000;
+        let goto_remove_ms = AQW_GOTO_REMOVE_NS.swap(0, Ordering::Relaxed) / 1_000_000;
+        let goto_apply_ms = AQW_GOTO_APPLY_NS.swap(0, Ordering::Relaxed) / 1_000_000;
+        let goto_tags = AQW_GOTO_TAGS.swap(0, Ordering::Relaxed);
+        let goto_fast = AQW_GOTO_FAST.swap(0, Ordering::Relaxed);
+        let goto_place_ms = AQW_GOTO_PLACE_NS.swap(0, Ordering::Relaxed) / 1_000_000;
+        let goto_inner_ms = AQW_GOTO_INNER_NS.swap(0, Ordering::Relaxed) / 1_000_000;
+        let bcast_top = aqw_listener_cost_top(6);
+        let avm2_prof = aqw_avm2_profile_top(10);
+        let avm2_ops = AQW_AVM2_OPS.swap(0, Ordering::Relaxed);
+        let inner_orphan_ms = AQW_INNER_ORPHAN_NS.swap(0, Ordering::Relaxed) / 1_000_000;
+        let inner_stage_ms = AQW_INNER_STAGE_NS.swap(0, Ordering::Relaxed) / 1_000_000;
+        let inner_bcast_ms = AQW_INNER_BCAST_NS.swap(0, Ordering::Relaxed) / 1_000_000;
+        let inner_cleanup_ms = AQW_INNER_CLEANUP_NS.swap(0, Ordering::Relaxed) / 1_000_000;
+        let inner_frames = AQW_INNER_FRAMES.swap(0, Ordering::Relaxed);
+        let inner_orphan_visits = AQW_INNER_ORPHAN_VISITS.swap(0, Ordering::Relaxed);
+        let inner_orphan_work = AQW_INNER_ORPHAN_WORK.swap(0, Ordering::Relaxed);
+        let gate_open = AQW_GATE_OPEN.swap(0, Ordering::Relaxed);
+        let orphan_adds = AQW_ORPHAN_ADDS.swap(0, Ordering::Relaxed);
+        let mark_bumps = AQW_MARK_BUMPS.swap(0, Ordering::Relaxed);
+        let enter_top = aqw_self_time_top(6);
+        let unqueue_ms = AQW_UNQUEUE_NS.swap(0, Ordering::Relaxed) / 1_000_000;
+        let place_ms = AQW_PLACE_NS.swap(0, Ordering::Relaxed) / 1_000_000;
+        let places = AQW_PLACE_COUNT.swap(0, Ordering::Relaxed);
+        let list_copies = AQW_RENDERLIST_COPIES.swap(0, Ordering::Relaxed);
+        let list_copied = AQW_RENDERLIST_COPIED.swap(0, Ordering::Relaxed);
+        let stage_enter_ms = AQW_STAGE_ENTER_NS.swap(0, Ordering::Relaxed) / 1_000_000;
+        let stage_ctor_ms = AQW_STAGE_CTOR_NS.swap(0, Ordering::Relaxed) / 1_000_000;
+        let stage_script_ms = AQW_STAGE_SCRIPT_NS.swap(0, Ordering::Relaxed) / 1_000_000;
         let vram_pressure = aqw_vram_pressure();
         // Offscreen texture-pool churn since the previous sweep (~48 frames):
         // `pool_allocs` = new GPU textures the pool had to create (misses),
@@ -2139,7 +2675,7 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         {
             let _ = writeln!(
                 file,
-                "AQW sweep: orphans={orphans} loaders={loaders} cached_objects={cached_objects} cache_mb={cache_mb} evicted_mb={evicted_mb} over_budget={over_budget} movie_libs_total={movie_libs_total} movie_libs_aqw={movie_libs_aqw} avatar_roots={avatar_roots} redraw_large={redraw_large} redraw_small={redraw_small} redraw_aged={redraw_aged} redraw_deferred={redraw_deferred} stale_fallback={stale_fallback} blend_layers={blend_layers} tick_orphan_ms={tick_orphan_ms} tick_stage_ms={tick_stage_ms} tick_bcast_ms={tick_bcast_ms} orphans_frozen={orphans_frozen} vram_mb={vram_mb} vram_budget_mb={vram_budget_mb} vram_pressure={vram_pressure} pool_allocs={pool_allocs} pool_free={pool_free} pool_mb={pool_mb} tex_allocs={tex_allocs} tex_free={tex_free} tex_mb={tex_mb} tex_top={tex_top} blend_modes={blend_modes} blend_cover={blend_cover}% blend_cover_hist={blend_cover_hist} blend_alloc={blend_alloc}% render_encode_ms={render_encode_ms} render_submit_ms={render_submit_ms} render_frames={render_frames} commit_mb={commit_mb} blend_passes={blend_passes} blend_groups={blend_groups} blend_group_max={blend_group_max} blend_swfs={blend_swfs} avatar_caches={avatar_caches} dicts={dicts} dict_okeys={dict_okeys} bmp_tex={bmp_tex} bmp_mb={bmp_mb} bmp_top={bmp_top} bmp_sizes={bmp_sizes} bmp_tracked_mb={bmp_tracked_mb} heap_mb={heap_mb}"
+                "AQW sweep: orphans={orphans} loaders={loaders} cached_objects={cached_objects} cache_mb={cache_mb} evicted_mb={evicted_mb} over_budget={over_budget} movie_libs_total={movie_libs_total} movie_libs_aqw={movie_libs_aqw} avatar_roots={avatar_roots} redraw_large={redraw_large} redraw_small={redraw_small} redraw_aged={redraw_aged} redraw_deferred={redraw_deferred} stale_fallback={stale_fallback} blend_layers={blend_layers} tick_orphan_ms={tick_orphan_ms} tick_stage_ms={tick_stage_ms} tick_bcast_ms={tick_bcast_ms} aqw_hook_ms={aqw_hook_ms} aqw_clips={aqw_clips} aqw_playing={aqw_playing} runframe_ms={runframe_ms} bcast_enter_ms={bcast_enter_ms} listeners={listeners} listeners_susp={listeners_susp} bcast_max={bcast_max}:{bcast_max_event} goto_ms={goto_ms} goto_calls={goto_calls} goto_rewinds={goto_rewinds} goto_frames={goto_frames} goto_scan_ms={goto_scan_ms} goto_remove_ms={goto_remove_ms} goto_apply_ms={goto_apply_ms} goto_place_ms={goto_place_ms} goto_inner_ms={goto_inner_ms} goto_fast={goto_fast} goto_tags={goto_tags} bcast_top={bcast_top} enter_top={enter_top} unqueue_ms={unqueue_ms} place_ms={place_ms} places={places} list_copies={list_copies} list_copied={list_copied} stage_enter_ms={stage_enter_ms} stage_ctor_ms={stage_ctor_ms} stage_script_ms={stage_script_ms} orphans_frozen={orphans_frozen} vram_mb={vram_mb} vram_budget_mb={vram_budget_mb} vram_pressure={vram_pressure} pool_allocs={pool_allocs} pool_free={pool_free} pool_mb={pool_mb} tex_allocs={tex_allocs} tex_free={tex_free} tex_mb={tex_mb} tex_top={tex_top} blend_modes={blend_modes} blend_cover={blend_cover}% blend_cover_hist={blend_cover_hist} blend_alloc={blend_alloc}% render_encode_ms={render_encode_ms} render_submit_ms={render_submit_ms} render_frames={render_frames} commit_mb={commit_mb} blend_passes={blend_passes} blend_groups={blend_groups} blend_group_max={blend_group_max} blend_swfs={blend_swfs} avatar_caches={avatar_caches} dicts={dicts} dict_okeys={dict_okeys} bmp_tex={bmp_tex} bmp_mb={bmp_mb} bmp_top={bmp_top} bmp_sizes={bmp_sizes} bmp_tracked_mb={bmp_tracked_mb} heap_mb={heap_mb} avm2_ops={avm2_ops} inner_frames={inner_frames} inner_orphan_ms={inner_orphan_ms} inner_stage_ms={inner_stage_ms} inner_bcast_ms={inner_bcast_ms} inner_cleanup_ms={inner_cleanup_ms} inner_orphan_visits={inner_orphan_visits} inner_orphan_work={inner_orphan_work} gate_open={gate_open} orphan_adds={orphan_adds} mark_bumps={mark_bumps} avm2_prof={avm2_prof}"
             );
         }
     }
@@ -3741,6 +4277,14 @@ pub trait TDisplayObject<'gc>:
         let parent_removed = had_parent && parent.is_none();
         let parent_added = !had_parent && parent.is_some();
 
+        // The new ancestor chain has never seen this object, and the old one
+        // just lost a child; both have frame work to find. Marking after the
+        // reparent walks the chain the object actually hangs from now.
+        self.mark_subtree_needs_frame();
+        if let Some(parent) = parent {
+            parent.mark_subtree_needs_frame();
+        }
+
         if parent_removed {
             if let Some(int) = self.as_interactive() {
                 int.drop_focus(context);
@@ -4180,6 +4724,110 @@ pub trait TDisplayObject<'gc>:
     ///    as properties on the class
     fn construct_frame(self, _context: &mut UpdateContext<'gc>) {}
 
+    /// Record that a frame pass has work to find here, and make sure it can be
+    /// reached: a nested goto skips clean subtrees, so an ancestor that still
+    /// looks clean would hide this object from the walk.
+    ///
+    /// Stops at the first ancestor already marked, which is what keeps this
+    /// cheap on the hot mutation paths -- in a settled tree the parent is
+    /// almost always marked already.
+    /// Whether a frame pass may skip this subtree entirely.
+    ///
+    /// Only inside a nested goto. The ordinary frame always walks everything,
+    /// so a mark this scheme fails to set costs one frame of latency there
+    /// rather than leaving an object unconstructed forever.
+    #[no_dynamic]
+    fn can_skip_frame_pass(self, context: &UpdateContext<'gc>) -> bool {
+        *context.aqw_nested_goto
+            && !self.base().subtree_needs_frame()
+            && !frame_skip_disabled()
+    }
+
+    /// Recompute this object's mark from its own pending work and its children's
+    /// marks, after a pass has walked it. Called by the frame-script pass, which
+    /// is the last one over the tree -- clearing in the construct pass would hide
+    /// the work from the pass that still has to run.
+    /// Whether `construct_frame` still has something to do for this object, so
+    /// that the subtree mark survives a pass that could not finish.
+    ///
+    /// Paired with `construct_frame`: the default is `false` because the default
+    /// `construct_frame` is a no-op, and a type that overrides one must override
+    /// the other. Answering `object2().is_none()` for everything is the trap --
+    /// types that never allocate an AVM2 object would pin the mark forever and
+    /// propagate it up, which measured out at ~60% of orphan visits.
+    fn needs_frame_construction(self) -> bool {
+        false
+    }
+
+    #[no_dynamic]
+    fn settle_subtree_needs_frame(self, children_need: bool) {
+        // Deliberately does *not* keep the mark alive for an object that still
+        // has no AVM2 side. That looks like the safe thing and is the opposite:
+        // several types never allocate an `object2` at all (an empty
+        // `construct_frame`, or any object in an AVM1 movie), so the mark would
+        // never clear and would propagate up through `children_need` forever.
+        // Measured 2026-08-01: it pinned ~60% of orphan visits permanently
+        // dirty, defeating the skip.
+        //
+        // Nothing is lost, because the skip only applies inside a nested goto
+        // and the ordinary frame always walks the whole tree -- an object that
+        // does need constructing gets constructed there, within one frame.
+        self.base()
+            .set_subtree_needs_frame(children_need || self.needs_frame_construction());
+    }
+
+    /// Mark this object's whole subtree, as well as the path to it.
+    ///
+    /// A goto re-runs the frame scripts of everything under the clip it acts
+    /// on, and those scripts are *discovered* by `construct_frame`
+    /// (`check_has_pending_script`) rather than being known in advance. Marking
+    /// only upwards would let the construct pass skip a descendant, so its
+    /// script would never be found and never run -- which is exactly what
+    /// `timeline/frame_script_cleanup_goto2` catches.
+    ///
+    /// Costs one walk of the gotoed clip's subtree, which the frame would have
+    /// walked anyway. The stage's other ~360k objects stay skippable.
+    #[no_dynamic]
+    fn mark_subtree_needs_frame_deep(self) {
+        self.mark_subtree_needs_frame();
+        if let Some(container) = self.as_container() {
+            for child in container.iter_render_list() {
+                child.mark_subtree_needs_frame_deep();
+            }
+        }
+    }
+
+    #[no_dynamic]
+    fn mark_subtree_needs_frame(self) {
+        // Always mark self first. A freshly created object is already marked
+        // while its brand new ancestors are not, so an early return on "self is
+        // marked" would leave the path to it clean and unreachable.
+        self.base().set_subtree_needs_frame(true);
+
+        let mut top: DisplayObject<'gc> = self.into();
+        let mut node = self.parent();
+        while let Some(current) = node {
+            top = current;
+            if current.base().subtree_needs_frame() {
+                // Already reachable, so whatever this walk would have told the
+                // orphan loops was told when that ancestor was marked.
+                return;
+            }
+            current.base().set_subtree_needs_frame(true);
+            node = current.parent();
+        }
+
+        // The walk ended at a parentless object. If that is not the stage, this
+        // subtree hangs off the orphan list, and a nested goto that would
+        // otherwise skip the orphan loops has to run them again.
+        if !matches!(top, DisplayObject::Stage(_)) {
+            if aqw_diagnostics_enabled() {
+                AQW_MARK_BUMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            crate::orphan_manager::bump_orphan_dirty_epoch();
+        }
+    }
+
     /// To be called when an AVM2 display object has finished being constructed.
     ///
     /// This function must be called once and ONLY once, after the object's
@@ -4274,6 +4922,10 @@ pub trait TDisplayObject<'gc>:
 
     /// Run any frame scripts (if they exist and this object needs to run them).
     fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
+        if self.can_skip_frame_pass(context) {
+            return;
+        }
+
         let Some(_frame_script_guard) = DisplayObjectRecursionGuard::enter(
             &FRAME_SCRIPT_RECURSION_DEPTH,
             "frame_scripts",
@@ -4282,11 +4934,17 @@ pub trait TDisplayObject<'gc>:
             return;
         };
 
+        let mut children_need = false;
         if let Some(container) = self.as_container() {
             for child in container.iter_render_list() {
+                if child.can_skip_frame_pass(context) {
+                    continue;
+                }
                 child.run_frame_scripts(context);
+                children_need |= child.base().subtree_needs_frame();
             }
         }
+        self.settle_subtree_needs_frame(children_need);
     }
 
     /// Called before the child is about to be rendered.
@@ -4886,6 +5544,22 @@ bitflags! {
         /// (they need to be instantiated "manually" by
         /// `Sprite.constructChildren`).
         const MANUAL_FRAME_CONSTRUCT  = 1 << 16;
+
+        /// Whether this object, or anything below it, may have work for
+        /// `construct_frame` or `run_frame_scripts` to find.
+        ///
+        /// An explicit AVM2 goto runs a whole recursive frame, which walks the
+        /// entire stage. Content that gotos in an `enterFrame` handler pays that
+        /// walk once per goto: measured 2026-08-01 in AQW at ~2270 nested frames
+        /// per 48 rendered ones over a tree of ~360k objects, which was 86-89%
+        /// of the frame. Almost none of that tree can have changed between two
+        /// gotos in the same frame, so a subtree that is known clean is skipped.
+        ///
+        /// Set on creation and by every mutation a frame pass reacts to;
+        /// recomputed bottom-up as the passes walk. Only *consulted* inside a
+        /// nested goto -- the ordinary frame still walks everything, so a missed
+        /// mark costs at most a frame of latency instead of breaking the object.
+        const SUBTREE_NEEDS_FRAME     = 1 << 17;
     }
 }
 

@@ -870,7 +870,13 @@ impl<'gc> TDisplayObject<'gc> for Stage<'gc> {
     }
 
     fn construct_frame(self, context: &mut UpdateContext<'gc>) {
+        if self.can_skip_frame_pass(context) {
+            return;
+        }
         for child in self.iter_render_list() {
+            if child.can_skip_frame_pass(context) {
+                continue;
+            }
             child.construct_frame(context);
         }
     }

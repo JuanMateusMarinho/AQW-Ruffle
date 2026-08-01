@@ -21,8 +21,31 @@ pub struct OrphanManager<'gc> {
     orphans: Rc<Vec<DisplayObjectWeak<'gc>>>,
 }
 
+/// Bumped whenever something in the orphan list might need a frame pass: a new
+/// orphan, or a mark whose walk ended at a parentless object (an orphan root --
+/// the stage is excluded, since a mark that reached the stage is about the
+/// on-stage tree).
+///
+/// A nested goto compares this against the value it last processed. If it has
+/// not moved, no orphan can have become dirty since, so both orphan loops are
+/// skipped whole. Measured 2026-08-01: with the subtree skip working, 95-99% of
+/// orphan visits in a nested frame found nothing to do -- 5.2M visits against
+/// 50k units of work in one window -- and the list only grows over a session
+/// (27 to 1764 orphans), so the waste grows with it.
+pub static ORPHAN_DIRTY_EPOCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+pub fn bump_orphan_dirty_epoch() {
+    ORPHAN_DIRTY_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 impl<'gc> OrphanManager<'gc> {
     fn orphans_mut(&mut self) -> &mut Vec<DisplayObjectWeak<'gc>> {
+        // Deliberately does *not* bump the epoch. `cleanup_dead_orphans` runs at
+        // the end of every nested goto frame and goes through here, so bumping
+        // on any mutation invalidated the epoch ~2000 times a window and the
+        // gate never engaged at all. Only *adding* an orphan can create work;
+        // removing one can only remove it. So the bump lives in `add_orphan_obj`.
         Rc::make_mut(&mut self.orphans)
     }
 
@@ -40,6 +63,13 @@ impl<'gc> OrphanManager<'gc> {
             .all(|d| !std::ptr::eq(d.as_ptr(), dobj.as_ptr()))
         {
             self.orphans_mut().push(dobj.downgrade());
+            // A list the nested goto has already cleared just gained an entry
+            // it has never looked at.
+            if crate::display_object::aqw_diagnostics_enabled() {
+                crate::display_object::AQW_ORPHAN_ADDS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            bump_orphan_dirty_epoch();
         }
     }
 

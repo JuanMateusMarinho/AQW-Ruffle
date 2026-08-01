@@ -443,6 +443,15 @@ impl<'gc> TDisplayObject<'gc> for Avm2Button<'gc> {
         }
     }
 
+    /// Conservative: a button constructs its *state* children, which are not on
+    /// the render list, so the subtree walk never sees them and cannot report
+    /// them through `children_need`. Skipping a button would leave the states of
+    /// the ones it is not currently showing unconstructed
+    /// (`avm2/button_nested_frame_simple`). Buttons are few; never skip one.
+    fn needs_frame_construction(self) -> bool {
+        self.movie().is_action_script_3()
+    }
+
     fn construct_frame(self, context: &mut UpdateContext<'gc>) {
         for state in self.all_state_children(false) {
             state.construct_frame(context);

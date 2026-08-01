@@ -439,6 +439,10 @@ impl<'gc> TDisplayObject<'gc> for Video<'gc> {
         self.seek(context, starting_seek);
     }
 
+    fn needs_frame_construction(self) -> bool {
+        self.movie().is_action_script_3() && self.object2().is_none()
+    }
+
     fn construct_frame(self, context: &mut UpdateContext<'gc>) {
         if self.movie().is_action_script_3() && self.object2().is_none() {
             let video_constr = context.avm2.classes().video;

@@ -144,6 +144,14 @@ impl PartialEq for Method<'_> {
     }
 }
 
+impl Method<'_> {
+    /// Stable identity, for keying a profile map without holding a GC pointer
+    /// or formatting a name on every call.
+    pub fn as_ptr(self) -> usize {
+        Gc::as_ptr(self.0) as usize
+    }
+}
+
 impl core::fmt::Debug for Method<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.debug_struct("Method")

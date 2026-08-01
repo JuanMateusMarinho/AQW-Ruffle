@@ -981,6 +981,21 @@ struct MovieClipDataMut<'gc> {
     container: ChildContainer<'gc>,
     frame_scripts: Vec<Option<Avm2Object<'gc>>>,
     avm1_text_field_bindings: Vec<Avm1TextFieldBinding<'gc>>,
+
+    /// Memoized `currentLabels`, as `(scene start, scene length, the labels)`.
+    ///
+    /// `currentLabels` rebuilds everything on every read: it clones and sorts
+    /// every label name, allocates an `AvmString` per label, and constructs a
+    /// `FrameLabel` per label -- which, since `FrameLabel extends
+    /// EventDispatcher`, runs two AS3 constructors each. Content that reads it
+    /// inside a loop pays all of that per iteration, and AQW does exactly that
+    /// (`currentLabels` in the loop condition and twice in the body). Measured
+    /// 2026-08-01: ~3900 reads per 48 frames at ~83us each, building ~370k
+    /// `FrameLabel` objects a second.
+    ///
+    /// Frame labels come from immutable tag data, so the only thing that can
+    /// invalidate this is landing in a different scene.
+    current_labels: Option<(FrameNumber, FrameNumber, Vec<Avm2Value<'gc>>)>,
 }
 
 impl<'gc> MovieClipData<'gc> {
@@ -992,6 +1007,7 @@ impl<'gc> MovieClipData<'gc> {
                 container: ChildContainer::new(&movie),
                 frame_scripts: Vec::new(),
                 avm1_text_field_bindings: Vec::new(),
+                current_labels: None,
             }),
             shared: Lock::new(Gc::new(mc, shared)),
             tag_stream_pos: Cell::new(0),
@@ -1582,8 +1598,49 @@ impl<'gc> MovieClip<'gc> {
         self.0.has_pending_script.get()
     }
 
+    /// Whether `run_local_frame_scripts` would actually run something: a script
+    /// is queued *and* it is not the one already run for this frame. The raw
+    /// `has_pending_script` stays true indefinitely once a scripted frame has
+    /// been played, so it is not usable as "there is work here".
+    /// The memoized `currentLabels` for this scene, if it is the one we built.
+    pub fn cached_scene_labels(
+        self,
+        scene_start: FrameNumber,
+        scene_length: FrameNumber,
+    ) -> Option<Vec<Avm2Value<'gc>>> {
+        let cell = self.0.cell.borrow();
+        match &cell.current_labels {
+            Some((start, length, labels))
+                if *start == scene_start && *length == scene_length =>
+            {
+                Some(labels.clone())
+            }
+            _ => None,
+        }
+    }
+
+    pub fn set_cached_scene_labels(
+        self,
+        mc: &Mutation<'gc>,
+        scene_start: FrameNumber,
+        scene_length: FrameNumber,
+        labels: Vec<Avm2Value<'gc>>,
+    ) {
+        let write = unlock!(Gc::write(mc, self.0), MovieClipData, cell);
+        write.borrow_mut().current_labels = Some((scene_start, scene_length, labels));
+    }
+
+    pub fn has_fresh_frame_script(self) -> bool {
+        self.has_pending_script()
+            && self.last_queued_script_frame() != Some(self.0.queued_script_frame.get())
+    }
+
     pub fn set_has_pending_script(self, value: bool) {
         self.0.has_pending_script.set(value);
+        if value {
+            // `run_frame_scripts` has something to do here now.
+            self.mark_subtree_needs_frame();
+        }
     }
 
     pub fn last_queued_script_frame(self) -> Option<FrameNumber> {
@@ -1745,6 +1802,10 @@ impl<'gc> MovieClip<'gc> {
                 }
                 return;
             }
+
+            // A no-op goto is still observable: it re-runs this subtree's frame
+            // scripts like a real one, so it has to be marked like one.
+            self.mark_subtree_needs_frame_deep();
 
             // Pretend we actually did a goto, but don't do anything.
             run_inner_goto_frame(context, &[], self);
@@ -1941,6 +2002,9 @@ impl<'gc> MovieClip<'gc> {
     /// This sets the current frame of this MovieClip to a given number.
     pub fn set_current_frame(self, current_frame: FrameNumber) {
         self.0.current_frame.set(current_frame);
+        // A different frame can mean different children and a different frame
+        // script, which is exactly what the frame passes look for.
+        self.mark_subtree_needs_frame();
     }
 
     /// The amount of frames loaded in this movieclip.
@@ -2205,6 +2269,11 @@ impl<'gc> MovieClip<'gc> {
     ) {
         self.note_cutscene_frame_gap();
         let shared = Gc::as_ref(self.0.shared.get());
+
+        // Advancing the timeline runs tags, which place and remove children and
+        // can queue a frame script. Mark before doing any of it, so the marking
+        // is not conditional on which branch below is taken.
+        self.mark_subtree_needs_frame();
 
         let next_frame = self.determine_next_frame();
         match next_frame {
@@ -2481,6 +2550,14 @@ impl<'gc> MovieClip<'gc> {
             self.assert_expected_tag_start();
         }
 
+        let goto_probe = crate::display_object::aqw_diagnostics_enabled()
+            .then(std::time::Instant::now);
+
+        // A goto rewrites this clip's children and frame, and re-runs the frame
+        // scripts below it. The recursive frame it runs afterwards has to be
+        // able to reach all of that.
+        self.mark_subtree_needs_frame_deep();
+
         let frame_before_rewind = self.current_frame();
         self.base().set_skip_next_enter_frame(false);
 
@@ -2515,6 +2592,18 @@ impl<'gc> MovieClip<'gc> {
             false
         };
 
+        if goto_probe.is_some() {
+            use std::sync::atomic::Ordering;
+            crate::display_object::AQW_GOTO_CALLS.fetch_add(1, Ordering::Relaxed);
+            if is_rewind {
+                crate::display_object::AQW_GOTO_REWINDS.fetch_add(1, Ordering::Relaxed);
+            }
+            // How many frames this seek has to step through, which is the cost
+            // a rewind pays that a forward seek does not.
+            crate::display_object::AQW_GOTO_FRAMES
+                .fetch_add(frame.saturating_sub(self.current_frame()) as u64, Ordering::Relaxed);
+        }
+
         let from_frame = self.current_frame();
 
         // Explicit gotos in the middle of an AS3 loop cancel the loop's queued
@@ -2539,6 +2628,7 @@ impl<'gc> MovieClip<'gc> {
 
         let mut removed_frame_scripts: Vec<DisplayObject<'gc>> = vec![];
 
+        let scan_started = goto_probe.map(|_| std::time::Instant::now());
         let mut reader = data.read_from(frame_pos);
         while self.current_frame() < clamped_frame && !reader.get_ref().is_empty() {
             self.0.increment_current_frame();
@@ -2590,8 +2680,16 @@ impl<'gc> MovieClip<'gc> {
                 tracing::error!("Error running abc/symbols in goto: {e:?}");
             }
         }
+        if let Some(started) = scan_started {
+            use std::sync::atomic::Ordering;
+            crate::display_object::AQW_GOTO_SCAN_NS
+                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            crate::display_object::AQW_GOTO_TAGS.fetch_add(index as u64, Ordering::Relaxed);
+        }
+
         let hit_target_frame = self.0.current_frame() == frame;
 
+        let remove_started = goto_probe.map(|_| std::time::Instant::now());
         if is_rewind {
             // Remove all display objects that were created after the
             // destination frame.
@@ -2619,6 +2717,10 @@ impl<'gc> MovieClip<'gc> {
                 }
             }
         }
+
+        // Whether this goto created or swapped a child. Purely updating an
+        // existing one's properties needs no construction pass.
+        let structural_change = std::cell::Cell::new(false);
 
         // Run the list of goto commands to actually create and update the display objects.
         let run_goto_command = |clip: MovieClip<'gc>,
@@ -2659,11 +2761,13 @@ impl<'gc> MovieClip<'gc> {
                     prev_child.apply_place_object(context, &params.place_object);
                 }
                 (PlaceObjectAction::Replace(id), Some(prev_child), _) => {
+                    structural_change.set(true);
                     prev_child.replace_with(context, id);
                     prev_child.apply_place_object(context, &params.place_object);
                     prev_child.set_place_frame(params.frame);
                 }
                 (PlaceObjectAction::Place(id) | PlaceObjectAction::Replace(id), _, _) => {
+                    structural_change.set(true);
                     if let Some(child) =
                         clip.instantiate_child(context, id, params.depth(), &params.place_object)
                     {
@@ -2679,6 +2783,14 @@ impl<'gc> MovieClip<'gc> {
                 }
             }
         };
+
+        if let Some(started) = remove_started {
+            crate::display_object::AQW_GOTO_REMOVE_NS.fetch_add(
+                started.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        let apply_started = goto_probe.map(|_| std::time::Instant::now());
 
         // We have to be sure that queued actions are generated in the same order
         // as if the playhead had reached this frame normally.
@@ -2721,7 +2833,40 @@ impl<'gc> MovieClip<'gc> {
             .filter(|params| params.frame >= frame)
             .for_each(|goto| run_goto_command(self, context, goto));
 
-        if !is_implicit {
+        if let Some(started) = apply_started {
+            crate::display_object::AQW_GOTO_PLACE_NS.fetch_add(
+                started.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+
+        // An explicit AVM2 goto runs a whole recursive frame: construct the
+        // entire stage, broadcast frameConstructed, run every frame script,
+        // broadcast exitFrame. Its cost therefore scales with the room, not
+        // with what the goto touched -- measured 2026-08-01 at 1128ms of a
+        // 1143ms goto, against 1ms to actually place the children.
+        //
+        // AQW's aura cooldown drives a mask with `gotoAndStop` four times per
+        // aura per frame, and each of those only nudges an existing shape's
+        // properties. There is nothing to construct and no script to run, so
+        // the recursive frame has no work to find; content compiled for SWF 9
+        // already skips it via the branch at the top of
+        // `run_inner_goto_frame_impl`, and the same goto costs 26us there
+        // against 6600us here. Skip it when the goto changed nothing that a
+        // construction pass could act on. `RUFFLE_AQW_NO_GOTO_FASTPATH`
+        // restores the unconditional call.
+        let needs_recursive_frame = !crate::display_object::aqw_goto_fastpath_enabled()
+            || structural_change.get()
+            || self.has_pending_script()
+            || !removed_frame_scripts.is_empty();
+
+        if !needs_recursive_frame && goto_probe.is_some() {
+            crate::display_object::AQW_GOTO_FAST
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        let inner_started = goto_probe.map(|_| std::time::Instant::now());
+        if !is_implicit && needs_recursive_frame {
             // On AVM2, all explicit gotos act the same way as a normal new frame,
             // save for the lack of an enterFrame event. Since this must happen
             // before AS3 continues execution, this is effectively a "recursive
@@ -2730,8 +2875,28 @@ impl<'gc> MovieClip<'gc> {
             // Our queued place tags will now run at this time, too.
             run_inner_goto_frame(context, &removed_frame_scripts, self);
         }
+        if let Some(started) = inner_started {
+            crate::display_object::AQW_GOTO_INNER_NS.fetch_add(
+                started.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
 
         self.assert_expected_tag_end(hit_target_frame);
+
+        if let Some(started) = apply_started {
+            crate::display_object::AQW_GOTO_APPLY_NS.fetch_add(
+                started.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+
+        if let Some(started) = goto_probe {
+            crate::display_object::AQW_GOTO_NS.fetch_add(
+                started.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
     }
 
     fn survives_rewind(
@@ -3475,7 +3640,34 @@ impl<'gc> MovieClip<'gc> {
         }
     }
 
+    /// Measurement wrapper around the per-clip hook below.
+    ///
+    /// `enter_frame` runs this on every clip in the tree, so it is the one
+    /// piece of the stage phases whose cost tracks display-list size rather
+    /// than the game's own scripts. `tick_stage_ms` cannot tell those apart;
+    /// `aqw_hook_ms`/`aqw_clips` can.
     fn update_aqw_timeline_throttle(
+        self,
+        context: &mut UpdateContext<'gc>,
+        can_throttle: bool,
+    ) -> bool {
+        if crate::display_object::aqw_throttle_hook_disabled() {
+            return false;
+        }
+        if !crate::display_object::aqw_diagnostics_enabled() {
+            return self.update_aqw_timeline_throttle_inner(context, can_throttle);
+        }
+
+        use std::sync::atomic::Ordering;
+        let started = std::time::Instant::now();
+        let result = self.update_aqw_timeline_throttle_inner(context, can_throttle);
+        crate::display_object::AQW_HOOK_NS
+            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        crate::display_object::AQW_HOOK_CLIPS.fetch_add(1, Ordering::Relaxed);
+        result
+    }
+
+    fn update_aqw_timeline_throttle_inner(
         self,
         context: &mut UpdateContext<'gc>,
         can_throttle: bool,
@@ -3680,9 +3872,13 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     }
 
     fn enter_frame(self, context: &mut UpdateContext<'gc>) {
+        // The probe needs one exit point to attribute self-time, so the body
+        // runs in a labeled block rather than returning early.
+        let probe = crate::display_object::enter_probe_begin();
+        'enter: {
         let skip_frame = self.base().should_skip_next_enter_frame();
         if self.update_aqw_timeline_throttle(context, !skip_frame) {
-            return;
+            break 'enter;
         }
 
         //Child removals from looping gotos appear to resolve in reverse order.
@@ -3705,21 +3901,40 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
 
         if skip_frame {
             self.base().set_skip_next_enter_frame(false);
-            return;
+            break 'enter;
         }
 
         if self.movie().is_action_script_3() {
             let is_playing = self.playing();
 
             if is_playing {
-                self.run_frame_internal(context, true, true, true);
+                if crate::display_object::aqw_diagnostics_enabled() {
+                    use std::sync::atomic::Ordering;
+                    crate::display_object::AQW_CLIPS_ADVANCED.fetch_add(1, Ordering::Relaxed);
+                    let started = std::time::Instant::now();
+                    self.run_frame_internal(context, true, true, true);
+                    crate::display_object::AQW_RUNFRAME_NS
+                        .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                } else {
+                    self.run_frame_internal(context, true, true, true);
+                }
             }
 
             // PlaceObject tags execute at this time.
             // Note that this is NOT when constructors run; that happens later
             // after tags have executed.
+            let diag = crate::display_object::aqw_diagnostics_enabled();
+            let place_started = diag.then(std::time::Instant::now);
             let data = self.0.shared.get().swf.clone();
             let place_actions = self.unqueue_filtered(|q| q.unqueue_add());
+            if let Some(started) = place_started {
+                use std::sync::atomic::Ordering;
+                crate::display_object::AQW_PLACE_COUNT
+                    .fetch_add(place_actions.len() as u64, Ordering::Relaxed);
+                crate::display_object::AQW_UNQUEUE_NS
+                    .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            let place_started = diag.then(std::time::Instant::now);
 
             for (_, tag) in place_actions {
                 let mut reader = data.read_from(tag.tag_start);
@@ -3732,11 +3947,28 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                     tracing::error!("Error running queued tag: {:?}, got {}", tag.tag_type, e);
                 }
             }
+
+            if let Some(started) = place_started {
+                crate::display_object::AQW_PLACE_NS.fetch_add(
+                    started.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
         }
+        }
+        crate::display_object::enter_probe_end(probe, &self.movie());
     }
 
     /// Construct objects placed on this frame.
+    fn needs_frame_construction(self) -> bool {
+        self.movie().is_action_script_3() && self.object2().is_none()
+    }
+
     fn construct_frame(self, context: &mut UpdateContext<'gc>) {
+        if self.can_skip_frame_pass(context) {
+            return;
+        }
+
         if !*context.aqw_nested_goto
             && self.is_aqw_avatar_asset_root()
             && self.0.aqw_skip_timeline_frame.get()
@@ -3808,6 +4040,10 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     }
 
     fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
+        if self.can_skip_frame_pass(context) {
+            return;
+        }
+
         if !*context.aqw_nested_goto
             && self.is_aqw_avatar_asset_root()
             && self.0.aqw_skip_timeline_frame.get()
@@ -3825,9 +4061,21 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
 
         self.run_local_frame_scripts(context);
 
+        let mut children_need = false;
         for child in self.iter_render_list() {
+            if child.can_skip_frame_pass(context) {
+                continue;
+            }
             child.run_frame_scripts(context);
+            children_need |= child.base().subtree_needs_frame();
         }
+        // A script that is still queued has to be reachable next pass -- but
+        // `has_pending_script` alone does not mean that. `run_local_frame_scripts`
+        // only clears it on a *fresh* frame, so a clip parked on a frame that
+        // has a script keeps it set forever, and using it raw pinned the mark on
+        // roughly half of all orphans permanently. Mirror the condition that
+        // actually runs a script instead.
+        self.settle_subtree_needs_frame(children_need || self.has_fresh_frame_script());
     }
 
     fn render_self(self, context: &mut RenderContext<'_, 'gc>) {
