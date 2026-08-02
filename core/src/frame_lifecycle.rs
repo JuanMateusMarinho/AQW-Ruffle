@@ -95,6 +95,11 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
     let mut bcast_ns = 0u64;
 
     *context.frame_phase = FramePhase::Enter;
+    // Every orphan is about to be visited three times over, so whatever was
+    // queued for a nested goto is about to be done anyway. Dropped *before* the
+    // loops, not after: they run frame scripts too, and a mark one of them makes
+    // still has to reach the nested gotos later in this same tick.
+    context.orphan_manager.clear_pending();
     let started = Instant::now();
     OrphanManager::each_orphan_obj(context, |orphan, context| {
         if let Some(clip) = orphan.as_movie_clip() {
@@ -181,11 +186,6 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
 
 thread_local! {
     static GOTO_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-
-    /// The `ORPHAN_DIRTY_EPOCH` a nested goto last ran its orphan loops for.
-    /// While it matches, nothing has marked an orphan since, so the loops would
-    /// walk the whole list to find nothing.
-    static ORPHAN_EPOCH_DONE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Like `run_all_phases_avm2`, but specialized for the "nested frame" triggered
@@ -257,29 +257,34 @@ fn run_inner_goto_frame_impl<'gc>(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    // Both orphan loops are gated on the same epoch: they are the pair that
-    // reads the orphan list, and running one without the other would settle
-    // marks the other still needs.
-    let orphan_epoch =
-        crate::orphan_manager::ORPHAN_DIRTY_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
-    let orphans_dirty = ORPHAN_EPOCH_DONE.with(|done| done.get() != orphan_epoch);
-    if probe && orphans_dirty {
+    // Both orphan loops walk the same batch: they are the pair that reads the
+    // orphan list, and running one without the other would settle marks the
+    // other still needs. Taking the batch once, up front, is also what lets a
+    // frame script run by these loops re-dirty an orphan -- that mark lands in
+    // the now-empty pending list and is honoured by the next nested frame.
+    let dirty_orphans = if crate::display_object::orphan_pending_disabled() {
+        context.orphan_manager.all_orphans(context.gc())
+    } else {
+        context.orphan_manager.take_pending(context.gc())
+    };
+    if probe && !dirty_orphans.is_empty() {
         crate::display_object::AQW_GATE_OPEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     *context.frame_phase = FramePhase::Construct;
     let started = mark();
-    if orphans_dirty {
-        OrphanManager::each_orphan_obj(context, |orphan, context| {
-            if probe {
-                use std::sync::atomic::Ordering::Relaxed;
-                crate::display_object::AQW_INNER_ORPHAN_VISITS.fetch_add(1, Relaxed);
-                if !orphan.can_skip_frame_pass(context) {
-                    crate::display_object::AQW_INNER_ORPHAN_WORK.fetch_add(1, Relaxed);
-                }
+    for orphan in &dirty_orphans {
+        if !OrphanManager::is_still_orphan(*orphan) {
+            continue;
+        }
+        if probe {
+            use std::sync::atomic::Ordering::Relaxed;
+            crate::display_object::AQW_INNER_ORPHAN_VISITS.fetch_add(1, Relaxed);
+            if !orphan.can_skip_frame_pass(context) {
+                crate::display_object::AQW_INNER_ORPHAN_WORK.fetch_add(1, Relaxed);
             }
-            orphan.construct_frame(context);
-        });
+        }
+        orphan.construct_frame(context);
     }
     bill(started, &crate::display_object::AQW_INNER_ORPHAN_NS);
 
@@ -297,26 +302,22 @@ fn run_inner_goto_frame_impl<'gc>(
     bill(started, &crate::display_object::AQW_INNER_STAGE_NS);
 
     let started = mark();
-    if orphans_dirty {
-        OrphanManager::each_orphan_obj(context, |orphan, context| {
-            if probe {
-                use std::sync::atomic::Ordering::Relaxed;
-                crate::display_object::AQW_INNER_ORPHAN_VISITS.fetch_add(1, Relaxed);
-                if !orphan.can_skip_frame_pass(context) {
-                    crate::display_object::AQW_INNER_ORPHAN_WORK.fetch_add(1, Relaxed);
-                }
+    for orphan in &dirty_orphans {
+        if !OrphanManager::is_still_orphan(*orphan) {
+            continue;
+        }
+        if probe {
+            use std::sync::atomic::Ordering::Relaxed;
+            crate::display_object::AQW_INNER_ORPHAN_VISITS.fetch_add(1, Relaxed);
+            if !orphan.can_skip_frame_pass(context) {
+                crate::display_object::AQW_INNER_ORPHAN_WORK.fetch_add(1, Relaxed);
             }
-            orphan.run_frame_scripts(context);
-        });
-
-        // Record the epoch read *before* the loops, not the current one. The
-        // loops run frame scripts, which can mark orphans again; recording the
-        // value from after would swallow exactly those marks.
-        ORPHAN_EPOCH_DONE.with(|done| done.set(orphan_epoch));
+        }
+        orphan.run_frame_scripts(context);
     }
 
-    // Not gated: these are named explicitly by the goto that removed them, and
-    // are not reached by walking the orphan list.
+    // Not in the batch: these are named explicitly by the goto that removed
+    // them, and are not reached through the orphan list.
     for child in removed_frame_scripts {
         child.run_frame_scripts(context);
     }
@@ -380,7 +381,7 @@ pub fn broadcast_frame_exited<'gc>(context: &mut UpdateContext<'gc>) {
 /// each clip in the queue.
 fn run_frame_script_cleanup<'gc>(context: &mut UpdateContext<'gc>) {
     while let Some(clip) = context.frame_script_cleanup_queue.pop_front() {
-        clip.set_has_pending_script(true);
+        clip.set_has_pending_script(context, true);
         clip.set_last_queued_script_frame(None);
         clip.run_local_frame_scripts(context);
     }

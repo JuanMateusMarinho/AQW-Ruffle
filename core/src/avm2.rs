@@ -634,23 +634,37 @@ impl<'gc> Avm2<'gc> {
             return;
         };
 
-        let el_length = context
-            .avm2
-            .broadcast_list
-            .entry(event_name)
-            .or_default()
-            .len();
+        context.avm2.broadcast_list.entry(event_name).or_default();
 
-        for i in 0..el_length {
-            let object = context
-                .avm2
-                .broadcast_list
-                .get(&event_name)
-                .unwrap()
-                .get(i)
-                .map(|listener| listener.object);
+        // Walk by the listener's `order`, not by index. A handler can remove
+        // itself (or anything else) from this bucket -- `removeEventListener`
+        // drops the last listener for an event through
+        // `unregister_broadcast_listener` -- and every entry after the removed
+        // one then shifts down, so an index-based walk skips exactly one
+        // listener. That is what `avm2/movieclip_displayevents_looping`
+        // catches: its `delayed_destroy` unregisters during the `exitFrame`
+        // broadcast and the next watcher never hears the event.
+        //
+        // Orders are assigned from a monotonic counter and every path that
+        // touches a bucket preserves ascending order, so a `partition_point`
+        // finds the next unvisited entry no matter how the bucket moved.
+        // Capturing the counter up front keeps the upstream rule that
+        // listeners registered *during* a broadcast do not receive it.
+        let order_limit = context.avm2.next_broadcast_listener_order;
+        let mut next_order = 0u64;
 
-            if let Some(object) = object.and_then(|obj| obj.upgrade(context.gc()))
+        loop {
+            let listener = {
+                let bucket = context.avm2.broadcast_list.get(&event_name).unwrap();
+                let index = bucket.partition_point(|entry| entry.order < next_order);
+                match bucket.get(index) {
+                    Some(entry) if entry.order < order_limit => *entry,
+                    _ => break,
+                }
+            };
+            next_order = listener.order + 1;
+
+            if let Some(object) = listener.object.upgrade(context.gc())
                 && object.is_of_type(on_type.inner_class_definition())
             {
                 // Skip AQW avatar-loader children the instant they're parentless,

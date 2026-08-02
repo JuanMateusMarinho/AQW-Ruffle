@@ -33,7 +33,7 @@ fn cleanup_unloaded_display_object_tree<'gc>(
         }
 
         if let Some(movie_clip) = dobj.as_movie_clip() {
-            movie_clip.clear_avm2_frame_script_state();
+            movie_clip.clear_avm2_frame_script_state(context);
             context
                 .frame_script_cleanup_queue
                 .retain(|queued| !std::ptr::eq(queued.as_ptr(), movie_clip.as_ptr()));

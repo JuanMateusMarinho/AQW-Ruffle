@@ -18,6 +18,23 @@ fn aqw_diagnostics_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
 }
 
+/// Whether to resolve an absent property against a child of the same name.
+///
+/// AS3 does not do this -- a timeline child gets a property on its parent when
+/// it is constructed (`set_on_parent_field`), and anything else is only
+/// reachable through `getChildByName`. Resolving every miss against the child
+/// list is AVM1 semantics, and `avm2/displayobject_name` catches it: a runtime
+/// `MovieClip` renamed by script must *not* appear as a property of its parent.
+///
+/// It was added in June 2026 to rescue AQW avatar slots that were not resolving.
+/// The load that actually broke them was fixed since (`LoaderInfo::unload`
+/// aborting an in-flight load), so the fallback should no longer have anything
+/// to catch. Off by default; set this to put it back without a rebuild.
+fn child_name_fallback_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_CHILD_NAME_FALLBACK").is_some())
+}
+
 fn is_aqw_avatar_slot(name: &str) -> bool {
     matches!(
         name,
@@ -127,6 +144,10 @@ impl<'gc> StageObject<'gc> {
         name: &Multiname<'gc>,
         activation: &mut Activation<'_, 'gc>,
     ) -> Option<Value<'gc>> {
+        if !child_name_fallback_enabled() {
+            return None;
+        }
+
         if !name.contains_public_namespace() {
             return None;
         }

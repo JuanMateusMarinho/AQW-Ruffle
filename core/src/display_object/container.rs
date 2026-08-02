@@ -27,6 +27,20 @@ use std::rc::Rc;
 
 const RENDER_LIST_INDEX_CACHE_THRESHOLD: usize = 8;
 
+/// Whether removing a named child leaves the parent's field alone when the
+/// field no longer holds that child.
+///
+/// FP does not: it nulls the field for any non-null value, even one script put
+/// there afterwards, which is what `avm2/remove_child_clear_field` records.
+/// Guarding the write was a June 2026 attempt at AQW cutscene loading; the
+/// cutscene fault was traced since to a frame script throwing `#1009` and
+/// taking its own `stop()` down with it, which this does not address. Off by
+/// default; set this to put the guard back without a rebuild.
+fn keep_removed_child_field() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_KEEP_REMOVED_FIELD").is_some())
+}
+
 /// Dispatch the `removedFromStage` event on a child and all of it's
 /// grandchildren.
 pub fn dispatch_removed_from_stage_event<'gc>(
@@ -797,12 +811,12 @@ impl<'gc> ChildContainer<'gc> {
                             // set it to `null`. This is observable:
                             // a setter method won't get called.
                         }
-                        Ok(Avm2Value::Object(current_obj))
-                            if current_obj
-                                .as_display_object()
-                                .is_some_and(|current_child| {
-                                    DisplayObject::ptr_eq(current_child, child)
-                                }) =>
+                        Ok(current)
+                            if !keep_removed_child_field()
+                                || matches!(current, Avm2Value::Object(current_obj)
+                                    if current_obj.as_display_object().is_some_and(
+                                        |current_child| DisplayObject::ptr_eq(current_child, child),
+                                    )) =>
                         {
                             let res = parent_obj.set_property(
                                 &multiname,
@@ -819,9 +833,9 @@ impl<'gc> ChildContainer<'gc> {
                             }
                         }
                         Ok(_) => {
-                            // If the parent property has already been replaced
-                            // by another child or by script, removing this child
-                            // must not clobber the current value.
+                            // Only reachable with `keep_removed_child_field`:
+                            // the field has since been replaced by another child
+                            // or by script, so the guard leaves it alone.
                         }
                         Err(_) => {
                             // In FP, errors when accessing the

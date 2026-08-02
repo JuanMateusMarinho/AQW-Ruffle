@@ -165,11 +165,40 @@ pub(crate) fn frame_skip_disabled() -> bool {
     *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_FRAME_SKIP").is_some())
 }
 
+/// Kill switch for handing a nested goto only the orphans that were marked
+/// since its last pass. `RUFFLE_AQW_NO_ORPHAN_PENDING=1` puts both orphan loops
+/// back on the whole list, every nested frame.
+pub(crate) fn orphan_pending_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_ORPHAN_PENDING").is_some())
+}
+
 /// The per-object flicker probes, which are too expensive to leave on the
 /// general diagnostics flag. `RUFFLE_AQW_FLICKER_PROBE=1`.
 fn aqw_flicker_probe_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_FLICKER_PROBE").is_some())
+}
+
+/// Restrict the tint probe to objects whose movie URL contains one of these
+/// strings, set by giving `RUFFLE_AQW_FLICKER_PROBE` anything other than
+/// `1`/`true` (e.g. `RUFFLE_AQW_FLICKER_PROBE=Assets_,IceWolfPuppy`).
+/// Comma-separated, so a hunt does not have to know up front which file the art
+/// came from.
+///
+/// Reporting whatever renders first does not survive contact with AQW: measured
+/// 2026-08-02, the whole 400-report budget went in 1.4 seconds, 365 of them on
+/// `charselect.swf`, before the session reached the skill under investigation.
+/// A budget that is reached is a budget that chooses the subject, so the subject
+/// is named instead.
+fn aqw_flicker_probe_filter() -> Option<&'static str> {
+    static FILTER: OnceLock<Option<String>> = OnceLock::new();
+    FILTER
+        .get_or_init(|| {
+            let value = std::env::var("RUFFLE_AQW_FLICKER_PROBE").ok()?;
+            (!matches!(value.as_str(), "1" | "true" | "on")).then_some(value)
+        })
+        .as_deref()
 }
 
 /// True when `url` has `segment` as a whole path segment, ignoring case, the
@@ -2913,6 +2942,28 @@ fn note_tint_mechanism<'gc>(this: DisplayObject<'gc>, context: &RenderContext<'_
     // a cap low enough to be reached is a cap that decides what you see.
     const MAX_REPORTS: usize = 400;
 
+    let url = this.movie().url().to_owned();
+    match aqw_flicker_probe_filter() {
+        Some(filter) => {
+            if !filter
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .any(|part| url.contains(part))
+            {
+                return;
+            }
+        }
+        // Unfiltered, the character-select screen alone spends the whole budget
+        // before the session is even in a room. It is never the subject, so it
+        // never gets to be the subject.
+        None => {
+            if url.contains("charselect") {
+                return;
+            }
+        }
+    }
+
     let blend = this.blend_mode();
     let filters = this.filters();
     let color = context.transform_stack.transform().color_transform;
@@ -4280,9 +4331,13 @@ pub trait TDisplayObject<'gc>:
         // The new ancestor chain has never seen this object, and the old one
         // just lost a child; both have frame work to find. Marking after the
         // reparent walks the chain the object actually hangs from now.
-        self.mark_subtree_needs_frame();
+        // A removal reaches here before `on_parent_removed` has put the object
+        // on the orphan list, so this mark finds nothing to note. That is fine:
+        // `add_orphan_obj` makes the entry pending itself, which is the same
+        // thing the mark would have said.
+        self.mark_subtree_needs_frame(context);
         if let Some(parent) = parent {
-            parent.mark_subtree_needs_frame();
+            parent.mark_subtree_needs_frame(context);
         }
 
         if parent_removed {
@@ -4788,17 +4843,17 @@ pub trait TDisplayObject<'gc>:
     /// Costs one walk of the gotoed clip's subtree, which the frame would have
     /// walked anyway. The stage's other ~360k objects stay skippable.
     #[no_dynamic]
-    fn mark_subtree_needs_frame_deep(self) {
-        self.mark_subtree_needs_frame();
+    fn mark_subtree_needs_frame_deep(self, context: &mut UpdateContext<'gc>) {
+        self.mark_subtree_needs_frame(context);
         if let Some(container) = self.as_container() {
             for child in container.iter_render_list() {
-                child.mark_subtree_needs_frame_deep();
+                child.mark_subtree_needs_frame_deep(context);
             }
         }
     }
 
     #[no_dynamic]
-    fn mark_subtree_needs_frame(self) {
+    fn mark_subtree_needs_frame(self, context: &mut UpdateContext<'gc>) {
         // Always mark self first. A freshly created object is already marked
         // while its brand new ancestors are not, so an early return on "self is
         // marked" would leave the path to it clean and unreachable.
@@ -4818,13 +4873,10 @@ pub trait TDisplayObject<'gc>:
         }
 
         // The walk ended at a parentless object. If that is not the stage, this
-        // subtree hangs off the orphan list, and a nested goto that would
-        // otherwise skip the orphan loops has to run them again.
+        // subtree hangs off the orphan list, and the next nested goto owes that
+        // root a pass.
         if !matches!(top, DisplayObject::Stage(_)) {
-            if aqw_diagnostics_enabled() {
-                AQW_MARK_BUMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            crate::orphan_manager::bump_orphan_dirty_epoch();
+            context.orphan_manager.note_orphan_root_dirty(top);
         }
     }
 

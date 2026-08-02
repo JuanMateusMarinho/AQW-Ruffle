@@ -3,7 +3,7 @@
 use crate::context::UpdateContext;
 use crate::display_object::{DisplayObject, DisplayObjectPtr, DisplayObjectWeak, TDisplayObject};
 use gc_arena::{Collect, Mutation};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 /// The list of 'orphan' objects - these objects have no parent,
@@ -19,34 +19,129 @@ use std::rc::Rc;
 #[collect(no_drop)]
 pub struct OrphanManager<'gc> {
     orphans: Rc<Vec<DisplayObjectWeak<'gc>>>,
-}
 
-/// Bumped whenever something in the orphan list might need a frame pass: a new
-/// orphan, or a mark whose walk ended at a parentless object (an orphan root --
-/// the stage is excluded, since a mark that reached the stage is about the
-/// on-stage tree).
-///
-/// A nested goto compares this against the value it last processed. If it has
-/// not moved, no orphan can have become dirty since, so both orphan loops are
-/// skipped whole. Measured 2026-08-01: with the subtree skip working, 95-99% of
-/// orphan visits in a nested frame found nothing to do -- 5.2M visits against
-/// 50k units of work in one window -- and the list only grows over a session
-/// (27 to 1764 orphans), so the waste grows with it.
-pub static ORPHAN_DIRTY_EPOCH: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
+    /// The orphans a nested goto still owes a frame pass, as a list rather than
+    /// a "something, somewhere is dirty" flag.
+    ///
+    /// The previous design was a global epoch counter, bumped by any mark that
+    /// landed on an orphan root and compared against the value the nested goto
+    /// last processed. Being global and binary, one mark anywhere reopened the
+    /// walk over every orphan: measured 2026-08-01, that gate closed for 74-95%
+    /// of nested frames while the list was small, but after a class change --
+    /// with ~1600 orphans, because AQW never releases an avatar mid-session --
+    /// it stayed open 100% of the time and the walk went back to 5-7M visits a
+    /// window for ~1% useful work. What matters is *which* orphans are dirty,
+    /// which is what this holds.
+    ///
+    /// May contain duplicates and entries that have since left the orphan list;
+    /// `take_pending` is what resolves both, so that marking stays O(1).
+    pending: Vec<DisplayObjectWeak<'gc>>,
 
-pub fn bump_orphan_dirty_epoch() {
-    ORPHAN_DIRTY_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    /// Everything currently in `orphans`, keyed by pointer, valued by the order
+    /// it was added in.
+    ///
+    /// The key answers, in O(1), whether a mark landed on a root we actually
+    /// tick -- without it the pending list would widen the nested pass to
+    /// parentless objects the orphan loops never visited (a `Graphic`, a
+    /// `Bitmap`, an `Avm2Button`; only `MovieClip` and `LoaderDisplay` are ever
+    /// added). The value restores list order to a batch that was collected in
+    /// the order things happened to be marked, so orphans still run their frames
+    /// relative to each other exactly as walking the list produced.
+    #[collect(require_static)]
+    listed: HashMap<usize, u64>,
+
+    #[collect(require_static)]
+    next_orphan_order: u64,
 }
 
 impl<'gc> OrphanManager<'gc> {
     fn orphans_mut(&mut self) -> &mut Vec<DisplayObjectWeak<'gc>> {
-        // Deliberately does *not* bump the epoch. `cleanup_dead_orphans` runs at
-        // the end of every nested goto frame and goes through here, so bumping
-        // on any mutation invalidated the epoch ~2000 times a window and the
-        // gate never engaged at all. Only *adding* an orphan can create work;
-        // removing one can only remove it. So the bump lives in `add_orphan_obj`.
         Rc::make_mut(&mut self.orphans)
+    }
+
+    /// Whether this object is still one the orphan loops would run frames for.
+    ///
+    /// The batch handed to a nested goto is resolved once, up front, so this is
+    /// re-checked before each pass over it: a construct pass can give an orphan
+    /// a parent, and the pass after it must then leave the object alone -- which
+    /// is what upgrading the weak reference per visit used to do implicitly.
+    pub fn is_still_orphan(dobj: DisplayObject<'gc>) -> bool {
+        dobj.parent().is_none() && !dobj.is_in_detached_aqw_avatar_loader()
+    }
+
+    /// Record that a mark landed on this orphan root, so the next nested goto
+    /// visits it instead of walking the whole list to find it.
+    ///
+    /// Called from the mark walk, which reaches here only when it ran out of
+    /// parents on something that is not the stage. Ignores anything not in the
+    /// orphan list: the nested pass must stay a subset of what the ordinary
+    /// frame's orphan loops do, never a superset.
+    pub fn note_orphan_root_dirty(&mut self, dobj: DisplayObject<'gc>) {
+        if !self.listed.contains_key(&(dobj.as_ptr() as usize)) {
+            return;
+        }
+
+        if crate::display_object::aqw_diagnostics_enabled() {
+            crate::display_object::AQW_MARK_BUMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        self.pending.push(dobj.downgrade());
+    }
+
+    /// Hand the nested goto the orphans it owes a pass, and start collecting
+    /// again from empty.
+    ///
+    /// Taking the list rather than clearing it afterwards is what keeps marks
+    /// made *by* the pass alive: the frame scripts it runs can dirty an orphan
+    /// again, including one in this very batch, and those marks land in the
+    /// fresh list and are honoured by the next nested frame. Clearing after the
+    /// loops would swallow exactly them -- the same trap the epoch version had
+    /// to avoid by recording the value read before the loops.
+    pub fn take_pending(&mut self, mc: &Mutation<'gc>) -> Vec<DisplayObject<'gc>> {
+        if self.pending.is_empty() {
+            return Vec::new();
+        }
+
+        let mut seen = HashSet::with_capacity(self.pending.len());
+        let mut out = Vec::with_capacity(self.pending.len());
+
+        for entry in std::mem::take(&mut self.pending) {
+            let ptr = entry.as_ptr() as usize;
+            // Left the orphan list after being marked.
+            let Some(order) = self.listed.get(&ptr).copied() else {
+                continue;
+            };
+            if !seen.insert(ptr) {
+                // Marked more than once since the last pass. Duplicates are
+                // allowed on the way in so that marking costs a push; running a
+                // frame script twice would not be.
+                continue;
+            }
+            if let Some(dobj) = valid_orphan(entry, mc) {
+                out.push((order, dobj));
+            }
+        }
+
+        out.sort_unstable_by_key(|(order, _)| *order);
+        out.into_iter().map(|(_, dobj)| dobj).collect()
+    }
+
+    /// Every live orphan, in list order. Only for the `take_pending` kill
+    /// switch, which puts a nested goto back on the whole list.
+    pub fn all_orphans(&self, mc: &Mutation<'gc>) -> Vec<DisplayObject<'gc>> {
+        self.orphans
+            .iter()
+            .filter_map(|entry| valid_orphan(*entry, mc))
+            .collect()
+    }
+
+    /// Drop the pending list because every orphan is about to be visited anyway.
+    ///
+    /// Call this *before* the ordinary frame's orphan loops, not after: they run
+    /// frame scripts too, and a mark one of them makes still has to reach the
+    /// nested gotos that come later in the same tick.
+    pub fn clear_pending(&mut self) {
+        self.pending.clear();
     }
 
     /// Adds a `MovieClip` to the orphan list. In AVM2, movies advance their
@@ -63,13 +158,16 @@ impl<'gc> OrphanManager<'gc> {
             .all(|d| !std::ptr::eq(d.as_ptr(), dobj.as_ptr()))
         {
             self.orphans_mut().push(dobj.downgrade());
-            // A list the nested goto has already cleared just gained an entry
-            // it has never looked at.
+            let order = self.next_orphan_order;
+            self.next_orphan_order = self.next_orphan_order.saturating_add(1);
+            self.listed.insert(dobj.as_ptr() as usize, order);
+            // A list the nested goto has already drained just gained an entry it
+            // has never looked at.
             if crate::display_object::aqw_diagnostics_enabled() {
                 crate::display_object::AQW_ORPHAN_ADDS
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            bump_orphan_dirty_epoch();
+            self.pending.push(dobj.downgrade());
         }
     }
 
@@ -77,6 +175,7 @@ impl<'gc> OrphanManager<'gc> {
     pub fn remove_orphan_obj(&mut self, dobj: DisplayObject<'gc>) {
         self.orphans_mut()
             .retain(|orphan| !std::ptr::eq(orphan.as_ptr(), dobj.as_ptr()));
+        self.listed.remove(&(dobj.as_ptr() as usize));
     }
 
     pub fn remove_orphan_objs(&mut self, objects: &[DisplayObject<'gc>]) {
@@ -84,6 +183,9 @@ impl<'gc> OrphanManager<'gc> {
             objects.iter().map(|object| object.as_ptr()).collect();
         self.orphans_mut()
             .retain(|orphan| !object_ptrs.contains(&orphan.as_ptr()));
+        for object in objects {
+            self.listed.remove(&(object.as_ptr() as usize));
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -111,8 +213,15 @@ impl<'gc> OrphanManager<'gc> {
     /// that have been garbage collected, or are no longer orphans
     /// (they've since acquired a parent).
     pub fn cleanup_dead_orphans(&mut self, mc: &Mutation<'gc>) {
+        // Collected here and applied after, because the retain already holds the
+        // only mutable borrow of `self`. Removing the few that leave beats
+        // rebuilding the whole set: this runs at the end of *every* frame, the
+        // nested ones included, so an O(orphans) rebuild here would cost what
+        // the pending list was built to save.
+        let mut dropped: Vec<usize> = Vec::new();
+
         self.orphans_mut().retain(|d| {
-            if let Some(dobj) = valid_orphan(*d, mc) {
+            let keep = if let Some(dobj) = valid_orphan(*d, mc) {
                 // All clips that become orphaned (have their parent removed, or start out with no parent)
                 // get added to the orphan list. However, there's a distinction between clips
                 // that are removed from a RemoveObject tag, and clips that are removed from ActionScript.
@@ -136,8 +245,17 @@ impl<'gc> OrphanManager<'gc> {
                 dobj.placed_by_avm2_script()
             } else {
                 false
+            };
+
+            if !keep {
+                dropped.push(d.as_ptr() as usize);
             }
+            keep
         });
+
+        for ptr in dropped {
+            self.listed.remove(&ptr);
+        }
     }
 }
 
@@ -145,6 +263,9 @@ impl<'gc> Default for OrphanManager<'gc> {
     fn default() -> Self {
         Self {
             orphans: Rc::new(Vec::new()),
+            pending: Vec::new(),
+            listed: HashMap::new(),
+            next_orphan_order: 0,
         }
     }
 }
@@ -157,5 +278,5 @@ fn valid_orphan<'gc>(
     mc: &Mutation<'gc>,
 ) -> Option<DisplayObject<'gc>> {
     dobj.upgrade(mc)
-        .filter(|dobj| dobj.parent().is_none() && !dobj.is_in_detached_aqw_avatar_loader())
+        .filter(|dobj| OrphanManager::is_still_orphan(*dobj))
 }

@@ -1635,11 +1635,11 @@ impl<'gc> MovieClip<'gc> {
             && self.last_queued_script_frame() != Some(self.0.queued_script_frame.get())
     }
 
-    pub fn set_has_pending_script(self, value: bool) {
+    pub fn set_has_pending_script(self, context: &mut UpdateContext<'gc>, value: bool) {
         self.0.has_pending_script.set(value);
         if value {
             // `run_frame_scripts` has something to do here now.
-            self.mark_subtree_needs_frame();
+            self.mark_subtree_needs_frame(context);
         }
     }
 
@@ -1651,8 +1651,8 @@ impl<'gc> MovieClip<'gc> {
         self.0.last_queued_script_frame.set(frame);
     }
 
-    pub fn clear_avm2_frame_script_state(self) {
-        self.set_has_pending_script(false);
+    pub fn clear_avm2_frame_script_state(self, context: &mut UpdateContext<'gc>) {
+        self.set_has_pending_script(context, false);
         self.set_last_queued_script_frame(None);
         self.0.queued_goto_frame.take();
         self.0
@@ -1805,7 +1805,7 @@ impl<'gc> MovieClip<'gc> {
 
             // A no-op goto is still observable: it re-runs this subtree's frame
             // scripts like a real one, so it has to be marked like one.
-            self.mark_subtree_needs_frame_deep();
+            self.mark_subtree_needs_frame_deep(context);
 
             // Pretend we actually did a goto, but don't do anything.
             run_inner_goto_frame(context, &[], self);
@@ -2000,11 +2000,11 @@ impl<'gc> MovieClip<'gc> {
     }
 
     /// This sets the current frame of this MovieClip to a given number.
-    pub fn set_current_frame(self, current_frame: FrameNumber) {
+    pub fn set_current_frame(self, context: &mut UpdateContext<'gc>, current_frame: FrameNumber) {
         self.0.current_frame.set(current_frame);
         // A different frame can mean different children and a different frame
         // script, which is exactly what the frame passes look for.
-        self.mark_subtree_needs_frame();
+        self.mark_subtree_needs_frame(context);
     }
 
     /// The amount of frames loaded in this movieclip.
@@ -2273,7 +2273,7 @@ impl<'gc> MovieClip<'gc> {
         // Advancing the timeline runs tags, which place and remove children and
         // can queue a frame script. Mark before doing any of it, so the marking
         // is not conditional on which branch below is taken.
-        self.mark_subtree_needs_frame();
+        self.mark_subtree_needs_frame(context);
 
         let next_frame = self.determine_next_frame();
         match next_frame {
@@ -2556,7 +2556,7 @@ impl<'gc> MovieClip<'gc> {
         // A goto rewrites this clip's children and frame, and re-runs the frame
         // scripts below it. The recursive frame it runs afterwards has to be
         // able to reach all of that.
-        self.mark_subtree_needs_frame_deep();
+        self.mark_subtree_needs_frame_deep(context);
 
         let frame_before_rewind = self.current_frame();
         self.base().set_skip_next_enter_frame(false);
@@ -3182,7 +3182,7 @@ impl<'gc> MovieClip<'gc> {
                     // Ensure newly registered frame scripts are executed,
                     // even if the frame is repeated due to goto.
                     self.set_last_queued_script_frame(None);
-                    self.set_has_pending_script(true);
+                    self.set_has_pending_script(context, true);
                 }
             }
         } else if frame_scripts.len() > index {
@@ -3479,7 +3479,7 @@ impl<'gc> MovieClip<'gc> {
                     let callable = Avm2Value::from(callable);
 
                     self.set_last_queued_script_frame(Some(frame_id));
-                    self.set_has_pending_script(false);
+                    self.set_has_pending_script(context, false);
                     self.0
                         .set_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT, true);
 
@@ -3588,9 +3588,9 @@ impl<'gc> MovieClip<'gc> {
         }
     }
 
-    fn check_has_pending_script(self) {
+    fn check_has_pending_script(self, context: &mut UpdateContext<'gc>) {
         let has_pending_script = self.has_frame_script(self.0.current_frame.get());
-        self.set_has_pending_script(has_pending_script);
+        self.set_has_pending_script(context, has_pending_script);
     }
 
     /// Whether this clip is the topmost clip of an AQW avatar-asset (item/
@@ -4035,7 +4035,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
         if *context.frame_phase == FramePhase::Construct {
             // Check for frame-scripts before starting the frame-script phase,
             // to differentiate the pre-existing scripts from those introduced during frame-script phase.
-            self.check_has_pending_script();
+            self.check_has_pending_script(context);
         }
     }
 
