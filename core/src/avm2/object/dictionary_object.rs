@@ -9,15 +9,11 @@ use crate::avm2::value::Value;
 use crate::string::AvmString;
 use core::fmt;
 use gc_arena::{Collect, Gc, GcWeak, Mutation};
-use std::cell::Cell;
 use ruffle_common::utils::HasPrefixField;
-use std::sync::OnceLock;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
-fn aqw_diagnostics_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
-}
+use crate::display_object::aqw_diagnostics_enabled;
 
 /// How many `Dictionary` instances have been allocated, and how many entries
 /// currently live in their *object* space.

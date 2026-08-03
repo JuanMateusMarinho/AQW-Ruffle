@@ -40,7 +40,7 @@ use wgpu::SubmissionIndex;
 
 pub(crate) fn aqw_diagnostics_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
+    *ENABLED.get_or_init(|| ruffle_render::backend::aqw_env_flag("RUFFLE_AQW_DIAGNOSTICS", false))
 }
 
 /// Wall time spent building the frame's command buffers, and then handing them
@@ -138,14 +138,14 @@ mod gpu_memory {
             Some(counters.PagefileUsage as u64)
         }
     }
-
 }
 
 /// Kill-switch shared with the core-side valve: `RUFFLE_AQW_NO_VRAM_VALVE`
 /// also disables the pressure-driven pool squeeze here.
 fn vram_valve_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_VRAM_VALVE").is_some())
+    *DISABLED
+        .get_or_init(|| ruffle_render::backend::aqw_env_flag("RUFFLE_AQW_NO_VRAM_VALVE", false))
 }
 
 /// Creates a wgpu instance with Ruffle's required configuration.
@@ -244,7 +244,8 @@ fn aqw_supersample_fallback_factor() -> f32 {
 /// (`RUFFLE_AQW_SHARPNESS` tunes the cubic instead; see `shaders.rs`.)
 fn aqw_sharp_upscale_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_SHARP_UPSCALE").is_some())
+    *DISABLED
+        .get_or_init(|| ruffle_render::backend::aqw_env_flag("RUFFLE_AQW_NO_SHARP_UPSCALE", false))
 }
 
 /// The SSAA factor currently in effect (post pixel-area gate), published by
@@ -383,13 +384,19 @@ fn surface_pool_idle_ticks() -> u64 {
 /// behavior, where the main-surface pool was never trimmed.
 fn surface_pool_trim_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_SURFACE_POOL_TRIM").is_some())
+    *DISABLED.get_or_init(|| {
+        ruffle_render::backend::aqw_env_flag("RUFFLE_AQW_NO_SURFACE_POOL_TRIM", false)
+    })
 }
 
-const POOL_PRESSURE_SOFT_MB: u64 = 600;
-const POOL_PRESSURE_SOFT_RELEASE_MB: u64 = 450;
-const POOL_PRESSURE_HARD_MB: u64 = 1500;
-const POOL_PRESSURE_HARD_RELEASE_MB: u64 = 1200;
+// Shared with the player half of the same valve, which clamps its cache-redraw
+// quotas from these; see `ruffle_render::backend` for the field calibration.
+use ruffle_render::backend::{
+    AQW_POOL_HARD_MB as POOL_PRESSURE_HARD_MB,
+    AQW_POOL_HARD_RELEASE_MB as POOL_PRESSURE_HARD_RELEASE_MB,
+    AQW_POOL_SOFT_MB as POOL_PRESSURE_SOFT_MB,
+    AQW_POOL_SOFT_RELEASE_MB as POOL_PRESSURE_SOFT_RELEASE_MB,
+};
 
 impl WgpuRenderBackend<SwapChainTarget> {
     #[cfg(target_family = "wasm")]
@@ -614,8 +621,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             let draw_id = draws.len();
             // Taken before the draw is moved into `PendingDraw`. Vertices are
             // already in pixels, so this is the shape's local extent as-is.
-            let draw_bounds =
-                ContentBounds::from_points(draw.vertices.iter().map(|v| (v.x, v.y)));
+            let draw_bounds = ContentBounds::from_points(draw.vertices.iter().map(|v| (v.x, v.y)));
             if let Some(draw) = PendingDraw::new(
                 self,
                 bitmap_source,
@@ -762,8 +768,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         let ss = {
             let configured = self.supersample;
             let cap = aqw_supersample_pixel_cap();
-            let ss_area =
-                f64::from(width) * f64::from(height) * f64::from(configured).powi(2);
+            let ss_area = f64::from(width) * f64::from(height) * f64::from(configured).powi(2);
             if configured > 1.0 && cap != 0 && ss_area > cap as f64 {
                 aqw_supersample_fallback_factor()
             } else {

@@ -111,7 +111,7 @@ fn aqw_small_cache_redraw_budget() -> u32 {
 fn aqw_aged_cache_redraw_budget() -> u32 {
     static BUDGET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *BUDGET.get_or_init(|| {
-        if std::env::var_os("RUFFLE_AQW_NO_CACHE_AGING").is_some() {
+        if crate::display_object::aqw_env_flag("RUFFLE_AQW_NO_CACHE_AGING", false) {
             0
         } else {
             AQW_AGED_CACHE_REDRAWS_PER_FRAME

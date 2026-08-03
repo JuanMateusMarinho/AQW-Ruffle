@@ -209,7 +209,7 @@ pub fn custom_cursors() -> Option<&'static CursorSet> {
     if !matches!(current_game().unwrap_or(ArtixGame::Aqw), ArtixGame::Aqw) {
         return None;
     }
-    if env::var_os("RUFFLE_AQW_NO_CUSTOM_CURSOR").is_some() {
+    if ruffle_render::backend::aqw_env_flag("RUFFLE_AQW_NO_CUSTOM_CURSOR", false) {
         return None;
     }
     let wanted = env::var("RUFFLE_AQW_CURSOR_SIZE")

@@ -14,7 +14,8 @@ use std::sync::{Arc, OnceLock};
 /// targets, for field A/B without a rebuild.
 fn filter_pad_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_FILTER_PAD").is_some())
+    *DISABLED
+        .get_or_init(|| ruffle_render::backend::aqw_env_flag("RUFFLE_AQW_NO_FILTER_PAD", false))
 }
 
 #[derive(Debug)]

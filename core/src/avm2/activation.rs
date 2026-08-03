@@ -33,13 +33,9 @@ use ruffle_macros::istr;
 use std::cell::Cell;
 use std::cmp::{Ordering, min};
 use std::sync::Arc;
-use std::sync::OnceLock;
 use swf::avm2::types::MethodFlags as AbcMethodFlags;
 
-fn aqw_diagnostics_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
-}
+use crate::display_object::aqw_diagnostics_enabled;
 
 fn is_aqw_avatar_slot(name: &str) -> bool {
     matches!(

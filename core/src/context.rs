@@ -627,7 +627,8 @@ const AQW_DIRTY_CACHE_REDRAW_FOLLOWER_FLOOR_PIXELS: u64 = 1_500_000;
 /// field A/B without a rebuild.
 fn aqw_large_redraw_floor_disabled() -> bool {
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_LARGE_FLOOR").is_some())
+    *DISABLED
+        .get_or_init(|| crate::display_object::aqw_env_flag("RUFFLE_AQW_NO_LARGE_FLOOR", false))
 }
 
 impl<'gc> RenderContext<'_, 'gc> {

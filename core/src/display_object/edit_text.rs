@@ -52,7 +52,8 @@ use super::interactive::Avm2MousePick;
 
 fn char_limit_hint_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_CHAR_LIMIT_HINT").is_some())
+    *DISABLED
+        .get_or_init(|| crate::display_object::aqw_env_flag("RUFFLE_AQW_NO_CHAR_LIMIT_HINT", false))
 }
 
 /// The kind of autosizing behavior an `EditText` should have, if any

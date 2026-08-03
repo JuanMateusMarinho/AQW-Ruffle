@@ -44,7 +44,7 @@ use ruffle_render::utils::{JpegTagFormat, determine_jpeg_tag_format};
 use slotmap::{SlotMap, new_key_type};
 use std::fmt;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use swf::read::{extract_swz, read_compression_type};
 use thiserror::Error;
@@ -58,10 +58,7 @@ new_key_type! {
 const LOADER_INSERTED_AVM1_DEPTH: i32 = -0xF000;
 const IMMEDIATE_PRELOAD_BYTE_LIMIT: usize = 128 * 1024;
 
-fn aqw_diagnostics_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
-}
+use crate::display_object::aqw_diagnostics_enabled;
 
 fn is_aqw_empty_asset_url(url: &str) -> bool {
     let trimmed = url.trim();

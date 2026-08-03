@@ -38,7 +38,8 @@ const RENDER_LIST_INDEX_CACHE_THRESHOLD: usize = 8;
 /// default; set this to put the guard back without a rebuild.
 fn keep_removed_child_field() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_KEEP_REMOVED_FIELD").is_some())
+    *ENABLED
+        .get_or_init(|| crate::display_object::aqw_env_flag("RUFFLE_AQW_KEEP_REMOVED_FIELD", false))
 }
 
 /// Dispatch the `removedFromStage` event on a child and all of it's
@@ -814,9 +815,9 @@ impl<'gc> ChildContainer<'gc> {
                         Ok(current)
                             if !keep_removed_child_field()
                                 || matches!(current, Avm2Value::Object(current_obj)
-                                    if current_obj.as_display_object().is_some_and(
-                                        |current_child| DisplayObject::ptr_eq(current_child, child),
-                                    )) =>
+                                if current_obj.as_display_object().is_some_and(
+                                    |current_child| DisplayObject::ptr_eq(current_child, child),
+                                )) =>
                         {
                             let res = parent_obj.set_property(
                                 &multiname,

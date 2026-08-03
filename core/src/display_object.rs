@@ -153,16 +153,37 @@ const MAX_AQW_CACHE_BITMAP_PIXELS: u32 = 8_000_000;
 /// traversal and to guard against NaN/inf matrices.
 const CACHE_DEGENERATE_SCALE: f32 = MAX_CACHE_BITMAP_DIMENSION as f32;
 
+/// Reads one of the fork's boolean environment switches.
+///
+/// Presence used to be the whole test, which meant `NO_SCALE9=0` *enabled* the
+/// kill switch it reads as disabling -- the one spelling a user is most likely
+/// to reach for. An explicit `0`, `false`, `off` or `no` (any case, surrounding
+/// whitespace ignored) now turns the switch off; any other value, including an
+/// empty one, turns it on. Unset returns `default`.
+///
+/// Callers cache the result in a `OnceLock`, so this runs once per switch.
+pub(crate) fn aqw_env_flag(name: &str, default: bool) -> bool {
+    let Some(value) = std::env::var_os(name) else {
+        return default;
+    };
+    let value = value.to_string_lossy();
+    let value = value.trim();
+    !(value == "0"
+        || value.eq_ignore_ascii_case("false")
+        || value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("no"))
+}
+
 pub(crate) fn aqw_diagnostics_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
+    *ENABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_DIAGNOSTICS", false))
 }
 
 /// Kill switch for skipping clean subtrees inside a nested goto frame.
 /// `RUFFLE_AQW_NO_FRAME_SKIP=1` restores the unconditional full-stage walk.
 pub(crate) fn frame_skip_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_FRAME_SKIP").is_some())
+    *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_FRAME_SKIP", false))
 }
 
 /// Kill switch for handing a nested goto only the orphans that were marked
@@ -170,14 +191,14 @@ pub(crate) fn frame_skip_disabled() -> bool {
 /// back on the whole list, every nested frame.
 pub(crate) fn orphan_pending_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_ORPHAN_PENDING").is_some())
+    *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_ORPHAN_PENDING", false))
 }
 
 /// The per-object flicker probes, which are too expensive to leave on the
 /// general diagnostics flag. `RUFFLE_AQW_FLICKER_PROBE=1`.
 fn aqw_flicker_probe_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_FLICKER_PROBE").is_some())
+    *ENABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_FLICKER_PROBE", false))
 }
 
 /// Restrict the tint probe to objects whose movie URL contains one of these
@@ -353,7 +374,6 @@ impl BitmapCache {
         // without reserving an extra field for.
         self.matrix_a = f32::NAN;
     }
-
 
     /// Detect a cache that rebuilds every frame while its object stands still.
     ///
@@ -719,9 +739,7 @@ impl Default for DisplayObjectBase<'_> {
             opaque_background: Default::default(),
             // A brand new object always has frame work pending: it has no AVM2
             // object yet, so `construct_frame` has to reach it.
-            flags: Cell::new(
-                DisplayObjectFlags::VISIBLE | DisplayObjectFlags::SUBTREE_NEEDS_FRAME,
-            ),
+            flags: Cell::new(DisplayObjectFlags::VISIBLE | DisplayObjectFlags::SUBTREE_NEEDS_FRAME),
             scroll_rect: Cell::new(None),
             next_scroll_rect: Default::default(),
             scaling_grid: Default::default(),
@@ -743,8 +761,9 @@ impl<'gc> DisplayObjectBase<'gc> {
     /// Reset all properties that would be adjusted by a movie load.
     fn reset_for_movie_load(&self) {
         let flags_to_keep = self.flags.get() & DisplayObjectFlags::LOCK_ROOT;
-        self.flags
-            .set(flags_to_keep | DisplayObjectFlags::VISIBLE | DisplayObjectFlags::SUBTREE_NEEDS_FRAME);
+        self.flags.set(
+            flags_to_keep | DisplayObjectFlags::VISIBLE | DisplayObjectFlags::SUBTREE_NEEDS_FRAME,
+        );
     }
 
     fn depth(&self) -> Depth {
@@ -1390,14 +1409,14 @@ const AQW_STALE_ANCHOR_MAX_DRIFT_TWIPS: i32 = 16 * 20;
 /// weapon in a busy room" artifact), for field A/B without a rebuild.
 fn aqw_stale_anchor_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_STALE_ANCHOR").is_some())
+    *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_STALE_ANCHOR", false))
 }
 
 /// Kill-switch: `RUFFLE_AQW_NO_STALE_GUARD` disables the drift guard and
 /// always draws deferred caches at their stale anchor, for field A/B.
 fn aqw_stale_guard_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_STALE_GUARD").is_some())
+    *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_STALE_GUARD", false))
 }
 
 /// Kill-switch: `RUFFLE_AQW_NO_DRIFT_NORM` restores the fixed (~1x-calibrated)
@@ -1405,14 +1424,14 @@ fn aqw_stale_guard_disabled() -> bool {
 /// A/B without a rebuild.
 fn aqw_drift_norm_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_DRIFT_NORM").is_some())
+    *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_DRIFT_NORM", false))
 }
 
 /// Kill-switch: `RUFFLE_AQW_NO_PADDED_CACHE` restores exact-size cache
 /// textures, for field A/B without a rebuild.
 fn aqw_padded_cache_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_PADDED_CACHE").is_some())
+    *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_PADDED_CACHE", false))
 }
 
 /// Round a cache texture dimension up to a coarse bucket. AQW's animated
@@ -1445,20 +1464,18 @@ pub fn aqw_vram_pressure() -> u8 {
 /// Kill-switch: `RUFFLE_AQW_NO_VRAM_VALVE` disables the VRAM pressure valve.
 fn aqw_vram_valve_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_VRAM_VALVE").is_some())
+    *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_VRAM_VALVE", false))
 }
 
-/// Refresh `AQW_VRAM_PRESSURE` from the renderer's process GPU-memory report.
-/// Offscreen render-target pool retention, in MB, that drives the GPU-pressure
-/// valve. Measured in the field: a full room with event FX retains 118-255 MB,
-/// while `castleparty` (the pathological map) retains 2458 MB - a ~10x gap, so
-/// the engage/release band sits in the empty valley between the two regimes and
-/// no observed scenario idles inside it.
-const AQW_POOL_SOFT_MB: u64 = 600;
-const AQW_POOL_SOFT_RELEASE_MB: u64 = 450;
-const AQW_POOL_HARD_MB: u64 = 1500;
-const AQW_POOL_HARD_RELEASE_MB: u64 = 1200;
+// The thresholds this valve engages on are shared with the renderer, which
+// squeezes its pools off the same numbers; see `ruffle_render::backend` for the
+// field calibration behind them.
+use ruffle_render::backend::{
+    AQW_POOL_HARD_MB, AQW_POOL_HARD_RELEASE_MB, AQW_POOL_SOFT_MB, AQW_POOL_SOFT_RELEASE_MB,
+};
 
+/// Refresh `AQW_VRAM_PRESSURE` from the renderer's process GPU-memory report.
+///
 /// Returns `(used_mb, budget_mb)` for the sweep log (`(0, 0)` if unavailable).
 ///
 /// The valve is driven by how many bytes the offscreen render-target pool is
@@ -1556,7 +1573,7 @@ pub(crate) static AQW_AVATAR_CACHES_ENABLED: std::sync::atomic::AtomicU64 =
 /// avatar art every frame, for field A/B without a rebuild.
 pub(crate) fn aqw_avatar_cache_disabled() -> bool {
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_AVATAR_CACHE").is_some())
+    *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_AVATAR_CACHE", false))
 }
 
 /// Blend commands tallied by the SWF that emitted them, so a single expensive
@@ -1653,8 +1670,7 @@ pub(crate) static AQW_BCAST_ENTER_NS: std::sync::atomic::AtomicU64 =
 /// each handler call cost ~5.4ms, or whether the cost is elsewhere in the
 /// handler, is the difference between fixing timeline seeking and fixing
 /// something else -- so it gets measured rather than assumed.
-pub(crate) static AQW_GOTO_NS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_GOTO_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `run_goto` split into its three phases, plus placement tags parsed.
 ///
@@ -1697,7 +1713,7 @@ pub(crate) static AQW_GOTO_FAST: std::sync::atomic::AtomicU64 =
 /// real fix is to make the recursive frame cheap rather than to skip it.
 pub(crate) fn aqw_goto_fastpath_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_GOTO_FASTPATH").is_some())
+    *ENABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_GOTO_FASTPATH", false))
 }
 
 pub(crate) static AQW_GOTO_PLACE_NS: std::sync::atomic::AtomicU64 =
@@ -1801,8 +1817,7 @@ pub(crate) static AQW_INNER_ORPHAN_WORK: std::sync::atomic::AtomicU64 =
 /// 3-15 per frame at one element each, and the fork's own hook is 2%.
 pub(crate) static AQW_UNQUEUE_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-pub(crate) static AQW_PLACE_NS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_PLACE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static AQW_PLACE_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -1848,8 +1863,7 @@ pub(crate) static AQW_STAGE_SCRIPT_NS: std::sync::atomic::AtomicU64 =
 /// got heavier.
 pub(crate) static AQW_HOOK_CLIPS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-pub(crate) static AQW_HOOK_NS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_HOOK_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Kill-switch for the per-clip AQW timeline hook, so its whole cost can be
 /// taken out in the field for an A/B without a rebuild. Turning it off also
@@ -1857,7 +1871,7 @@ pub(crate) static AQW_HOOK_NS: std::sync::atomic::AtomicU64 =
 /// (CPU) rather than frame rate.
 pub(crate) fn aqw_throttle_hook_disabled() -> bool {
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_THROTTLE_HOOK").is_some())
+    *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_THROTTLE_HOOK", false))
 }
 
 fn scale_twips(value: Twips, scale: f32) -> Twips {
@@ -1901,7 +1915,7 @@ fn slice_matrix(
 /// disabled, so we can measure its FPS cost against the visual fix it provides.
 fn aqw_scale9_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_SCALE9").is_some())
+    *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_SCALE9", false))
 }
 
 thread_local! {
@@ -2276,8 +2290,7 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         // filter targets and age-based eviction are meant to kill.
         static LAST_POOL_ALLOCS: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(0);
-        static LAST_POOL_FREES: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
+        static LAST_POOL_FREES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let (pool_allocs, pool_free, pool_mb) =
             if let Some((allocs, frees, retained)) = context.renderer.offscreen_pool_stats() {
                 (
@@ -2294,8 +2307,7 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         // distinct sizes. It is reported separately because the columns above
         // cover only the offscreen pool, which can look idle while this one
         // grows.
-        static LAST_TEX_ALLOCS: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
+        static LAST_TEX_ALLOCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         static LAST_TEX_FREES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let (tex_allocs, tex_free, tex_mb) =
             if let Some((allocs, frees, retained)) = context.renderer.surface_pool_stats() {
@@ -2476,9 +2488,7 @@ fn aqw_sweep_node<'gc>(
     };
 
     if object_cache_bytes > 0 {
-        let on_screen = obj
-            .world_bounds(BoundsMode::Engine)
-            .intersects(view_bounds);
+        let on_screen = obj.world_bounds(BoundsMode::Engine).intersects(view_bounds);
         if over_budget && !on_screen {
             let base = obj.base();
             let mut cache_ref = base.bitmap_cache_mut();
@@ -2735,7 +2745,13 @@ fn note_tint_mechanism<'gc>(this: DisplayObject<'gc>, context: &RenderContext<'_
 
     let filter_names = filters
         .iter()
-        .map(|f| format!("{f:?}").split('(').next().unwrap_or("?").to_string())
+        .map(|f| {
+            format!("{f:?}")
+                .split('(')
+                .next()
+                .unwrap_or("?")
+                .to_string()
+        })
         .collect::<Vec<_>>()
         .join("+");
     tracing::warn!(
@@ -2829,8 +2845,7 @@ pub fn render_base<'gc>(
                 || !m.b.is_finite()
                 || !m.c.is_finite()
                 || !m.d.is_finite()
-                || m.a.abs().max(m.b.abs()).max(m.c.abs()).max(m.d.abs())
-                    > CACHE_DEGENERATE_SCALE);
+                || m.a.abs().max(m.b.abs()).max(m.c.abs()).max(m.d.abs()) > CACHE_DEGENERATE_SCALE);
         let bounds: Rectangle<Twips> = if degenerate_transform {
             Rectangle {
                 x_min: Twips::ZERO,
@@ -2905,11 +2920,10 @@ pub fn render_base<'gc>(
                         let defer_min_pixels = (AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_PIXELS as f64
                             * view_scale
                             * view_scale) as u64;
-                        let defer_min_side = (f64::from(AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_SIDE)
-                            * view_scale) as u32;
+                        let defer_min_side =
+                            (f64::from(AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_SIDE) * view_scale) as u32;
                         let is_large = redraw_pixels >= defer_min_pixels
-                            && (actual_width >= defer_min_side
-                                || actual_height >= defer_min_side);
+                            && (actual_width >= defer_min_side || actual_height >= defer_min_side);
                         // Small caches used to bypass the budget entirely ("small is
                         // cheap"), but AQW FX storms (fireworks, ultra-boss skill spam)
                         // run hundreds of small filtered clips at once — each admitted
@@ -4544,9 +4558,7 @@ pub trait TDisplayObject<'gc>:
     /// rather than leaving an object unconstructed forever.
     #[no_dynamic]
     fn can_skip_frame_pass(self, context: &UpdateContext<'gc>) -> bool {
-        *context.aqw_nested_goto
-            && !self.base().subtree_needs_frame()
-            && !frame_skip_disabled()
+        *context.aqw_nested_goto && !self.base().subtree_needs_frame() && !frame_skip_disabled()
     }
 
     /// Recompute this object's mark from its own pending work and its children's
@@ -5602,6 +5614,57 @@ impl<'gc> DisplayObjectWeak<'gc> {
 }
 
 #[cfg(test)]
+mod env_flag_tests {
+    use super::aqw_env_flag;
+
+    /// Set a variable, read the flag, restore. Serialised by the mutex below,
+    /// because the environment is process-wide and tests run in parallel.
+    fn with_var(value: Option<&str>, default: bool) -> bool {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const NAME: &str = "RUFFLE_AQW_ENV_FLAG_TEST";
+        match value {
+            // SAFETY: no other thread touches this variable; the lock above
+            // keeps these tests from racing each other.
+            Some(v) => unsafe { std::env::set_var(NAME, v) },
+            None => unsafe { std::env::remove_var(NAME) },
+        }
+        let result = aqw_env_flag(NAME, default);
+        unsafe { std::env::remove_var(NAME) };
+        result
+    }
+
+    #[test]
+    fn unset_returns_the_default() {
+        assert!(!with_var(None, false));
+        assert!(with_var(None, true));
+    }
+
+    /// The regression this parser exists for: presence used to be the whole
+    /// test, so `NO_SOMETHING=0` switched the thing it names OFF, which is the
+    /// opposite of what it reads as.
+    #[test]
+    fn explicit_false_spellings_turn_the_flag_off() {
+        for spelling in ["0", "false", "FALSE", "off", "Off", "no", " false ", "  0"] {
+            assert!(
+                !with_var(Some(spelling), true),
+                "{spelling:?} should read as off"
+            );
+        }
+    }
+
+    #[test]
+    fn any_other_value_turns_the_flag_on() {
+        for spelling in ["1", "true", "yes", "", " ", "0.0", "00", "falsey"] {
+            assert!(
+                with_var(Some(spelling), false),
+                "{spelling:?} should read as on"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod url_tests {
     use super::{url_host, url_path_has_segment};
 
@@ -5621,8 +5684,14 @@ mod url_tests {
             "items"
         ));
         // A partial name is not a segment, and neither is a query value.
-        assert!(!url_path_has_segment("https://a/gamefiles2/x.swf", "gamefiles"));
-        assert!(!url_path_has_segment("https://a/b/x.swf?dir=items", "items"));
+        assert!(!url_path_has_segment(
+            "https://a/gamefiles2/x.swf",
+            "gamefiles"
+        ));
+        assert!(!url_path_has_segment(
+            "https://a/b/x.swf?dir=items",
+            "items"
+        ));
     }
 
     #[test]
@@ -5631,7 +5700,10 @@ mod url_tests {
             url_host("https://game.aq.com/game/gamefiles/Loader3.swf"),
             Some("game.aq.com")
         );
-        assert_eq!(url_host("http://localhost:8080/movie.swf"), Some("localhost"));
+        assert_eq!(
+            url_host("http://localhost:8080/movie.swf"),
+            Some("localhost")
+        );
         assert_eq!(url_host("relative/movie.swf"), None);
     }
 }

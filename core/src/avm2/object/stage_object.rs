@@ -13,10 +13,7 @@ use ruffle_common::utils::HasPrefixField;
 use std::fmt::Debug;
 use std::sync::OnceLock;
 
-fn aqw_diagnostics_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
-}
+use crate::display_object::aqw_diagnostics_enabled;
 
 /// Whether to resolve an absent property against a child of the same name.
 ///
@@ -32,7 +29,9 @@ fn aqw_diagnostics_enabled() -> bool {
 /// to catch. Off by default; set this to put it back without a rebuild.
 fn child_name_fallback_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_CHILD_NAME_FALLBACK").is_some())
+    *ENABLED.get_or_init(|| {
+        crate::display_object::aqw_env_flag("RUFFLE_AQW_CHILD_NAME_FALLBACK", false)
+    })
 }
 
 fn is_aqw_avatar_slot(name: &str) -> bool {

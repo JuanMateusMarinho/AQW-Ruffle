@@ -26,7 +26,9 @@ use wgpu::Backend;
 /// complex blend targets, for field A/B without a rebuild.
 fn blend_target_shrink_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_BLEND_TARGET_SHRINK").is_some())
+    *DISABLED.get_or_init(|| {
+        ruffle_render::backend::aqw_env_flag("RUFFLE_AQW_NO_BLEND_TARGET_SHRINK", false)
+    })
 }
 
 /// MEASUREMENT ONLY -- `RUFFLE_AQW_BLEND_AS_NORMAL` demotes every complex blend
@@ -39,7 +41,8 @@ fn blend_target_shrink_disabled() -> bool {
 /// building. Never a fix: it is the wrong blend maths.
 fn blend_measured_as_normal() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_BLEND_AS_NORMAL").is_some())
+    *ENABLED
+        .get_or_init(|| ruffle_render::backend::aqw_env_flag("RUFFLE_AQW_BLEND_AS_NORMAL", false))
 }
 
 /// MEASUREMENT ONLY -- `RUFFLE_AQW_SKIP_COMPLEX_BLEND` drops complex blends
@@ -51,7 +54,9 @@ fn blend_measured_as_normal() -> bool {
 /// recover -- and therefore whether any amount of that work reaches 24fps.
 fn blend_measured_skipped() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_SKIP_COMPLEX_BLEND").is_some())
+    *ENABLED.get_or_init(|| {
+        ruffle_render::backend::aqw_env_flag("RUFFLE_AQW_SKIP_COMPLEX_BLEND", false)
+    })
 }
 
 use super::target::PoolOrArcTexture;

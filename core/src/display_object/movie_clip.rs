@@ -70,10 +70,7 @@ type FrameNumber = u16;
 const AQW_AVATAR_THROTTLE_ROOTS: u32 = 96;
 const AQW_AVATAR_HEAVY_THROTTLE_ROOTS: u32 = 192;
 
-fn aqw_diagnostics_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
-}
+use crate::display_object::aqw_diagnostics_enabled;
 
 /// Releasing a frozen avatar subtree's cache texture, opt-in via
 /// `RUFFLE_AQW_AVATAR_CACHE_RELEASE=1`.
@@ -92,19 +89,23 @@ fn aqw_diagnostics_enabled() -> bool {
 /// are reclaimed while the ones cycling in and out keep their texture.
 fn aqw_avatar_cache_release_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_AVATAR_CACHE_RELEASE").is_some())
+    *ENABLED.get_or_init(|| {
+        crate::display_object::aqw_env_flag("RUFFLE_AQW_AVATAR_CACHE_RELEASE", false)
+    })
 }
 
 fn aqw_full_timeline_throttle_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_TIMELINE_THROTTLE").is_some())
+    *ENABLED
+        .get_or_init(|| crate::display_object::aqw_env_flag("RUFFLE_AQW_TIMELINE_THROTTLE", false))
 }
 
 /// Kill-switch for the hidden-subtree (TRASH) freeze, so it can be turned off
 /// in the field without a rebuild if it ever misbehaves.
 fn aqw_hidden_freeze_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_HIDDEN_FREEZE").is_some())
+    *DISABLED
+        .get_or_init(|| crate::display_object::aqw_env_flag("RUFFLE_AQW_NO_HIDDEN_FREEZE", false))
 }
 
 pub(super) fn is_aqw_avatar_asset_movie_url(url: &str) -> bool {
@@ -134,7 +135,8 @@ pub(super) fn is_aqw_avatar_asset_movie_url(url: &str) -> bool {
 /// turned off in the field without a rebuild if it ever misbehaves.
 fn aqw_orphan_freeze_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_ORPHAN_FREEZE").is_some())
+    *DISABLED
+        .get_or_init(|| crate::display_object::aqw_env_flag("RUFFLE_AQW_NO_ORPHAN_FREEZE", false))
 }
 
 /// Ticks a clip must stay on the orphan list before the orphan freeze may
@@ -168,7 +170,7 @@ fn aqw_subtree_has_avatar_asset<'gc>(obj: DisplayObject<'gc>, budget: &mut u32) 
 /// turned off in the field without a rebuild if it ever misbehaves.
 fn aqw_crt_menu_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_CRT_MENU").is_some())
+    *DISABLED.get_or_init(|| crate::display_object::aqw_env_flag("RUFFLE_AQW_NO_CRT_MENU", false))
 }
 
 /// Which Artix game the CRT-filter option row is being managed for. Each
@@ -271,7 +273,11 @@ fn aqw_crt_config_path(game: AqwCrtGame) -> Option<std::path::PathBuf> {
 fn aqw_crt_init_state(game: AqwCrtGame) {
     AQW_CRT_CONFIG.get_or_init(|| {
         let path = aqw_crt_config_path(game);
-        let on = match std::env::var("RUFFLE_AQW_CRT").ok().as_deref().map(str::trim) {
+        let on = match std::env::var("RUFFLE_AQW_CRT")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
             Some("1") => true,
             Some("0") => false,
             _ => path
@@ -1610,9 +1616,7 @@ impl<'gc> MovieClip<'gc> {
     ) -> Option<Vec<Avm2Value<'gc>>> {
         let cell = self.0.cell.borrow();
         match &cell.current_labels {
-            Some((start, length, labels))
-                if *start == scene_start && *length == scene_length =>
-            {
+            Some((start, length, labels)) if *start == scene_start && *length == scene_length => {
                 Some(labels.clone())
             }
             _ => None,
@@ -2550,8 +2554,8 @@ impl<'gc> MovieClip<'gc> {
             self.assert_expected_tag_start();
         }
 
-        let goto_probe = crate::display_object::aqw_diagnostics_enabled()
-            .then(std::time::Instant::now);
+        let goto_probe =
+            crate::display_object::aqw_diagnostics_enabled().then(std::time::Instant::now);
 
         // A goto rewrites this clip's children and frame, and re-runs the frame
         // scripts below it. The recursive frame it runs afterwards has to be
@@ -2600,8 +2604,10 @@ impl<'gc> MovieClip<'gc> {
             }
             // How many frames this seek has to step through, which is the cost
             // a rewind pays that a forward seek does not.
-            crate::display_object::AQW_GOTO_FRAMES
-                .fetch_add(frame.saturating_sub(self.current_frame()) as u64, Ordering::Relaxed);
+            crate::display_object::AQW_GOTO_FRAMES.fetch_add(
+                frame.saturating_sub(self.current_frame()) as u64,
+                Ordering::Relaxed,
+            );
         }
 
         let from_frame = self.current_frame();
@@ -2861,8 +2867,7 @@ impl<'gc> MovieClip<'gc> {
             || !removed_frame_scripts.is_empty();
 
         if !needs_recursive_frame && goto_probe.is_some() {
-            crate::display_object::AQW_GOTO_FAST
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::display_object::AQW_GOTO_FAST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         let inner_started = goto_probe.map(|_| std::time::Instant::now());
@@ -6012,7 +6017,8 @@ impl<'gc, 'a> MovieClip<'gc> {
     }
 
     pub fn constructing_frame(self) -> bool {
-        self.0.contains_flag(MovieClipFlags::RUNNING_CONSTRUCT_FRAME)
+        self.0
+            .contains_flag(MovieClipFlags::RUNNING_CONSTRUCT_FRAME)
     }
 }
 
@@ -6466,14 +6472,18 @@ mod avatar_asset_url_tests {
             "https://game.aq.com/game/gamefiles/hair/Spiky.swf"
         ));
         // Order of the two segments is not significant.
-        assert!(is_aqw_avatar_asset_movie_url("https://a/items/gamefiles/x.swf"));
+        assert!(is_aqw_avatar_asset_movie_url(
+            "https://a/items/gamefiles/x.swf"
+        ));
 
         // The root movie is under gamefiles but is not avatar art.
         assert!(!is_aqw_avatar_asset_movie_url(
             "https://game.aq.com/game/gamefiles/Loader3.swf"
         ));
         // An avatar folder outside gamefiles is some other game.
-        assert!(!is_aqw_avatar_asset_movie_url("https://other.com/game/items/Sword.swf"));
+        assert!(!is_aqw_avatar_asset_movie_url(
+            "https://other.com/game/items/Sword.swf"
+        ));
     }
 
     #[test]
@@ -6482,9 +6492,15 @@ mod avatar_asset_url_tests {
             "https://game.aq.com/GAMEFILES/Items/Sword.swf?v=2"
         ));
         // Partial names are not segments.
-        assert!(!is_aqw_avatar_asset_movie_url("https://a/gamefiles2/items/x.swf"));
-        assert!(!is_aqw_avatar_asset_movie_url("https://a/gamefiles/items2/x.swf"));
+        assert!(!is_aqw_avatar_asset_movie_url(
+            "https://a/gamefiles2/items/x.swf"
+        ));
+        assert!(!is_aqw_avatar_asset_movie_url(
+            "https://a/gamefiles/items2/x.swf"
+        ));
         // Query values are not path segments.
-        assert!(!is_aqw_avatar_asset_movie_url("https://a/gamefiles/x.swf?dir=items"));
+        assert!(!is_aqw_avatar_asset_movie_url(
+            "https://a/gamefiles/x.swf?dir=items"
+        ));
     }
 }

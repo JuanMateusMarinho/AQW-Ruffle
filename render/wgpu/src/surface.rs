@@ -24,7 +24,8 @@ use tracing::instrument;
 /// blend passes, for field A/B without a rebuild.
 fn blend_scissor_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_NO_BLEND_SCISSOR").is_some())
+    *DISABLED
+        .get_or_init(|| ruffle_render::backend::aqw_env_flag("RUFFLE_AQW_NO_BLEND_SCISSOR", false))
 }
 
 use crate::utils::run_copy_pipeline;
@@ -376,8 +377,7 @@ impl Surface {
                     // The quad covers exactly the source's footprint, which is
                     // what makes the unit-quad coordinate usable as its texture
                     // coordinate however the target was sized.
-                    let mut blend_transforms =
-                        BufferBuilder::new_for_uniform(&descriptors.limits);
+                    let mut blend_transforms = BufferBuilder::new_for_uniform(&descriptors.limits);
                     blend_transforms.set_buffer_limit(dynamic_transforms.buffer.size());
                     let blend_transform_offset = blend_transforms
                         .add(&[Transforms {

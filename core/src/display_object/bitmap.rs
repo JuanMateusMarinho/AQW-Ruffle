@@ -138,10 +138,7 @@ pub struct BitmapGraphicData<'gc> {
     probe_reported: Cell<bool>,
 }
 
-fn aqw_diagnostics_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_DIAGNOSTICS").is_some())
-}
+use crate::display_object::aqw_diagnostics_enabled;
 
 /// How many jumps to see before reporting. High enough that a bitmap which
 /// legitimately moves a pixel now and then never trips it; an oscillation

@@ -795,13 +795,51 @@ pub fn aqw_crt_aspect_43_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        if let Some(v) = std::env::var_os("RUFFLE_AQW_CRT_ASPECT_43") {
-            let v = v.to_string_lossy();
-            let v = v.trim();
-            return !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"));
-        }
         let is_df = std::env::var("ARTIX_RUFFLE_GAME").is_ok_and(|v| v == "df")
             || std::env::var("ARTIX_RUFFLE_GAME_ICON").is_ok_and(|v| v == "dragonfable");
-        !is_df
+        aqw_env_flag("RUFFLE_AQW_CRT_ASPECT_43", !is_df)
     })
+}
+
+/// Offscreen render-target pool retention, in MB, that drives the GPU-pressure
+/// valve.
+///
+/// Measured in the field: a full room with event FX retains 118-255 MB, while
+/// `castleparty` (the pathological map) retains 2458 MB — a ~10x gap, so the
+/// engage/release band sits in the empty valley between the two regimes and no
+/// observed scenario idles inside it.
+///
+/// The valve has two halves in two crates: the player clamps its cache-redraw
+/// quotas from these, and the renderer squeezes its pools. They lived as
+/// separate copies with a comment asking whoever edited one to remember the
+/// other; they are shared from here so that cannot be got wrong.
+pub const AQW_POOL_SOFT_MB: u64 = 600;
+/// Retention that releases soft pressure. Below the engage threshold, so the
+/// valve cannot chatter around a single value.
+pub const AQW_POOL_SOFT_RELEASE_MB: u64 = 450;
+/// Retention that engages hard pressure. See [`AQW_POOL_SOFT_MB`].
+pub const AQW_POOL_HARD_MB: u64 = 1500;
+/// Retention that drops hard pressure back to soft. See [`AQW_POOL_SOFT_MB`].
+pub const AQW_POOL_HARD_RELEASE_MB: u64 = 1200;
+
+/// Reads one of the fork's boolean environment switches.
+///
+/// Presence used to be the whole test in most places, which meant `NO_FOO=0`
+/// *enabled* the kill switch it reads as disabling. An explicit `0`, `false`,
+/// `off` or `no` (any case, surrounding whitespace ignored) turns the switch
+/// off; any other value, including an empty one, turns it on. Unset returns
+/// `default`.
+///
+/// Duplicated in `ruffle_core` rather than shared, to keep the crates
+/// uncoupled for six lines of parsing; the two must agree on the spellings.
+pub fn aqw_env_flag(name: &str, default: bool) -> bool {
+    let Some(value) = std::env::var_os(name) else {
+        return default;
+    };
+    let value = value.to_string_lossy();
+    let value = value.trim();
+    !(value == "0"
+        || value.eq_ignore_ascii_case("false")
+        || value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("no"))
 }
