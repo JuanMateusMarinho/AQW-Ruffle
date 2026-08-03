@@ -311,17 +311,6 @@ const OFFSCREEN_POOL_EVICT_BYTES_PER_FRAME: u64 = 32 * 1024 * 1024;
 /// pressure at all; see `TexturePool::maintain`.
 const OFFSCREEN_POOL_PRESSURE_EVICT_BYTES_PER_FRAME: u64 = 128 * 1024 * 1024;
 
-/// Pool retention (MB) that engages the GPU-pressure valve. Mirrors the core
-/// redraw valve in `display_object.rs` - keep both sides in step.
-///
-/// Measured in the field: an ordinary full room with event FX retains
-/// 118-255 MB (at or under `OFFSCREEN_POOL_BUDGET_BYTES`), while `castleparty`
-/// - the pathological map - retains 2458 MB, roughly 10x the budget. The
-/// engage/release band therefore sits in the empty valley between the two
-/// regimes. Retention replaced the OS video-memory percentage as the trigger:
-/// DXGI `CurrentUsage` parks at a constant while `Budget` moves with unrelated
-/// system load, so the old valve engaged on noise and starved combat FX in
-/// rooms that were never under real pressure.
 /// Retention budget for the main-surface pool.
 ///
 /// What that pool actually needs at once is small — the scene target plus the

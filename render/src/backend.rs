@@ -809,6 +809,11 @@ pub fn aqw_crt_aspect_43_enabled() -> bool {
 /// engage/release band sits in the empty valley between the two regimes and no
 /// observed scenario idles inside it.
 ///
+/// Retention replaced the OS video-memory percentage as the trigger: DXGI
+/// `CurrentUsage` parks at a constant while `Budget` moves with unrelated
+/// system load, so the old valve engaged on noise and starved combat FX in
+/// rooms that were never under real pressure.
+///
 /// The valve has two halves in two crates: the player clamps its cache-redraw
 /// quotas from these, and the renderer squeezes its pools. They lived as
 /// separate copies with a comment asking whoever edited one to remember the

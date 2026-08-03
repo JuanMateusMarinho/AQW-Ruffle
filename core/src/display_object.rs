@@ -259,7 +259,7 @@ fn aqw_report_gates(context: &mut UpdateContext<'_>) {
     static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let frames = FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // ~10s in, once the first room's assets are up, then once a minute.
-    if frames < 240 || (frames - 240) % 1440 != 0 {
+    if frames < 240 || !(frames - 240).is_multiple_of(1440) {
         return;
     }
 
@@ -1617,7 +1617,7 @@ fn take_blend_sources(limit: usize) -> Vec<(String, u64)> {
         return Vec::new();
     };
     let mut counts: Vec<(String, u64)> = counts.into_iter().collect();
-    counts.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    counts.sort_unstable_by_key(|(_, count)| std::cmp::Reverse(*count));
     counts.truncate(limit);
     counts
 }
@@ -1758,7 +1758,7 @@ fn aqw_listener_cost_top(n: usize) -> String {
         .map(|(class, (calls, ns))| (ns / 1_000, *calls, class.clone()))
         .collect();
     map.clear();
-    rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    rows.sort_unstable_by_key(|&(us, ..)| std::cmp::Reverse(us));
     rows.truncate(n);
     rows.iter()
         .map(|(us, calls, class)| format!("{class}={us}us/{calls}"))
@@ -2166,7 +2166,10 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
 
     // Throttle to roughly once per second.
     static SWEEP_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    if SWEEP_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 48 != 0 {
+    if !SWEEP_FRAME
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .is_multiple_of(48)
+    {
         return;
     }
 
@@ -2630,7 +2633,7 @@ fn note_map_clip_animation<'gc>(this: DisplayObject<'gc>) {
     let Some(clip) = this.as_movie_clip() else {
         return;
     };
-    if !url_path_has_segment(&clip.movie().url(), "maps") {
+    if !url_path_has_segment(clip.movie().url(), "maps") {
         return;
     }
 
@@ -2814,7 +2817,7 @@ pub fn render_base<'gc>(
     let original_commands = if blend_mode != ExtendedBlendMode::Normal {
         AQW_BLEND_LAYERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if aqw_diagnostics_enabled() {
-            note_blend_source(&this.movie().url());
+            note_blend_source(this.movie().url());
         }
         Some(std::mem::take(&mut context.commands))
     } else {
@@ -3237,12 +3240,7 @@ pub fn render_base<'gc>(
                 .commands
                 .draw_rect(background, Matrix::create_box_from_rectangle(&bounds));
         }
-        apply_standard_mask_and_scroll(
-            this,
-            context,
-            |context| this.render_self(context),
-            options,
-        );
+        apply_standard_mask_and_scroll(this, context, |context| this.render_self(context), options);
     }
 
     if let Some(original_commands) = original_commands {
@@ -4049,7 +4047,7 @@ pub trait TDisplayObject<'gc>:
     /// are attached again.
     #[no_dynamic]
     fn is_in_detached_aqw_avatar_loader(self) -> bool {
-        let mut current: Option<DisplayObject<'gc>> = Some(self.into());
+        let mut current: Option<DisplayObject<'gc>> = Some(self);
 
         while let Some(display_object) = current {
             if let DisplayObject::LoaderDisplay(loader) = display_object
@@ -4069,7 +4067,7 @@ pub trait TDisplayObject<'gc>:
     /// See `LoaderDisplay::is_currently_parentless_aqw_avatar_loader`.
     #[no_dynamic]
     fn is_in_currently_detached_aqw_avatar_loader(self) -> bool {
-        let mut current: Option<DisplayObject<'gc>> = Some(self.into());
+        let mut current: Option<DisplayObject<'gc>> = Some(self);
 
         while let Some(display_object) = current {
             if let DisplayObject::LoaderDisplay(loader) = display_object
@@ -4622,7 +4620,7 @@ pub trait TDisplayObject<'gc>:
         // marked" would leave the path to it clean and unreachable.
         self.base().set_subtree_needs_frame(true);
 
-        let mut top: DisplayObject<'gc> = self.into();
+        let mut top: DisplayObject<'gc> = self;
         let mut node = self.parent();
         while let Some(current) = node {
             top = current;

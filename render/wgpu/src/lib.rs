@@ -322,7 +322,7 @@ pub fn bitmap_texture_largest(limit: usize) -> Vec<(u32, u32, usize, u64)> {
         .iter()
         .map(|((w, h), (count, bytes))| (*w, *h, *count, *bytes))
         .collect();
-    buckets.sort_by(|a, b| b.3.cmp(&a.3));
+    buckets.sort_by_key(|&(.., bytes)| std::cmp::Reverse(bytes));
     buckets.truncate(limit);
     buckets
 }

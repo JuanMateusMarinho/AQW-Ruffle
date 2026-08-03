@@ -162,7 +162,7 @@ pub fn take_complex_blend_counts() -> Vec<(&'static str, u64)> {
             (count > 0).then_some((*name, count))
         })
         .collect();
-    counts.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    counts.sort_unstable_by_key(|(_, count)| std::cmp::Reverse(*count));
     counts
 }
 

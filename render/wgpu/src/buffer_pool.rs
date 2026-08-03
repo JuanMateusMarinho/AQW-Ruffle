@@ -140,7 +140,7 @@ impl TexturePool {
                 ))
             })
             .collect();
-        buckets.sort_unstable_by(|a, b| b.3.cmp(&a.3));
+        buckets.sort_unstable_by_key(|&(.., bytes)| std::cmp::Reverse(bytes));
         buckets.truncate(limit);
         buckets
     }
@@ -178,6 +178,7 @@ impl TexturePool {
     /// - Slow bleeding (24 MB/frame toward a 512 MB floor): a drain↔realloc
     ///   loop against the deferred working set — allocating while paging is
     ///   synchronously expensive, 5 fps.
+    ///
     /// What demonstrably recovers (observed when the window was minimized:
     /// VRAM 7.6→4.2 GB, then steady 24 fps in the same room) is a FULL
     /// one-shot drain: emptying the pool zeroes whole driver-arena blocks,
@@ -185,6 +186,7 @@ impl TexturePool {
     /// leaves every block fragmented and returns nothing. So under pressure
     /// the pool only tightens its long-idle pass, and if hard pressure
     /// *persists* it fires one full reset (one hitch), then cools down.
+    ///
     /// `healthy_idle_ticks` is how long an entry may sit unused before the
     /// long-idle pass frees it while VRAM is healthy; pressure overrides it
     /// downwards. Callers pass their own because the two pools have opposite

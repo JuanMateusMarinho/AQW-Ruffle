@@ -414,7 +414,10 @@ pub fn aqw_crt_menu_tick(context: &mut UpdateContext<'_>) {
     };
     // Cheap cadence: a full scan four times a second is plenty for UI.
     static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    if TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 6 != 0 {
+    if !TICK
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .is_multiple_of(6)
+    {
         return;
     }
     // Ahead of the row's kill-switch: it also arms the persisted state and the
@@ -3840,7 +3843,7 @@ impl<'gc> MovieClip<'gc> {
             // Armor pieces parent into the chassis asynchronously after the
             // item SWFs load, so a "no avatar art" verdict is re-probed
             // periodically instead of cached forever.
-            2 if ticks % 64 != 0 => false,
+            2 if !ticks.is_multiple_of(64) => false,
             _ => {
                 let mut budget = 128u32;
                 let freeze = aqw_subtree_has_avatar_asset(self.into(), &mut budget);
