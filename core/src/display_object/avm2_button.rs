@@ -534,6 +534,54 @@ impl<'gc> TDisplayObject<'gc> for Avm2Button<'gc> {
                 self.set_state(context, ButtonState::Up);
 
                 if has_movie_clip_state && self.movie().version() > 9 {
+                    // This runs a whole-stage construct and frame-script pass
+                    // from inside one button's construction, to reproduce the
+                    // order Flash is observed to use.
+                    //
+                    // When the button is itself being constructed from an
+                    // ancestor's `Sprite.constructChildren`, that pass reaches
+                    // clips whose current frame is only half-built: the
+                    // ancestor placing this button has not finished
+                    // constructing it, so the ancestor's own field for it is
+                    // still null. Running the ancestor's frame script there
+                    // hands it a null child, and in AVM2 a frame script that
+                    // throws abandons everything after the throw -- including
+                    // the `stop()` that authored frames end on, which is why
+                    // an AQW cutscene then plays through its own pauses.
+                    //
+                    // Skipping the pass in that case is NOT the fix: tried
+                    // 2026-08-03 and it fails ten tests whose expectations
+                    // come from the real player, `avm2/button_nested_frame`
+                    // among them. Flash runs this pass too. Whatever diverges
+                    // is in what the stage can see while it runs, not in
+                    // whether it runs, so this only reports the nesting.
+                    let nested_in_construct = self.avm2_parent().is_some_and(|mut node| {
+                        loop {
+                            if node
+                                .as_movie_clip()
+                                .is_some_and(|clip| clip.constructing_frame())
+                            {
+                                return true;
+                            }
+                            match node.avm2_parent() {
+                                Some(parent) => node = parent,
+                                None => return false,
+                            }
+                        }
+                    });
+
+                    if nested_in_construct && crate::display_object::aqw_diagnostics_enabled() {
+                        tracing::warn!(
+                            target: "aqw_diag",
+                            button = %self.name().map(|n| n.to_utf8_lossy().into_owned())
+                                .unwrap_or_else(|| "<unnamed>".to_string()),
+                            phase = ?*context.frame_phase,
+                            movie = %self.movie().url(),
+                            "Button running a whole-stage framescript pass while an \
+                             ancestor is mid-construction"
+                        );
+                    }
+
                     self.0.weird_framescript_order.set(true);
 
                     let stage = context.stage;
