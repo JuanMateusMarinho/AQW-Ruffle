@@ -3872,13 +3872,9 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     }
 
     fn enter_frame(self, context: &mut UpdateContext<'gc>) {
-        // The probe needs one exit point to attribute self-time, so the body
-        // runs in a labeled block rather than returning early.
-        let probe = crate::display_object::enter_probe_begin();
-        'enter: {
         let skip_frame = self.base().should_skip_next_enter_frame();
         if self.update_aqw_timeline_throttle(context, !skip_frame) {
-            break 'enter;
+            return;
         }
 
         //Child removals from looping gotos appear to resolve in reverse order.
@@ -3901,7 +3897,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
 
         if skip_frame {
             self.base().set_skip_next_enter_frame(false);
-            break 'enter;
+            return;
         }
 
         if self.movie().is_action_script_3() {
@@ -3955,8 +3951,6 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                 );
             }
         }
-        }
-        crate::display_object::enter_probe_end(probe, &self.movie());
     }
 
     /// Construct objects placed on this frame.

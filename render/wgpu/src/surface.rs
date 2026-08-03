@@ -158,20 +158,6 @@ impl Surface {
 
         let mut num_masks = 0;
         let mut mask_state = MaskState::NoMask;
-        // Simulation of merging complex blend passes, measured before any of it
-        // is built. A run of blends that do not overlap could share one pass and
-        // one parent snapshot; anything overlapping has to stay ordered.
-        // Diagnostics-only: costs nothing in normal play, since the numbers are
-        // only ever read from the sweep, which needs the same flag.
-        let measure_blend_groups = crate::backend::aqw_diagnostics_enabled();
-        let mut blend_group: Vec<(u32, u32, u32, u32)> = Vec::new();
-        let mut blend_group_stencil = false;
-        let close_blend_group = |group: &mut Vec<(u32, u32, u32, u32)>| {
-            if !group.is_empty() {
-                crate::blend::note_blend_group(group.len() as u64);
-                group.clear();
-            }
-        };
         let (chunks, content_bounds) = chunk_blends(
             commands,
             descriptors,
@@ -198,9 +184,6 @@ impl Surface {
                     needs_stencil,
                     transforms,
                 } => {
-                    // Anything drawn between blends has to be visible to the
-                    // next one, so it ends the run.
-                    close_blend_group(&mut blend_group);
                     transforms.copy_to(
                         staging_belt,
                         &descriptors.device,
@@ -251,7 +234,6 @@ impl Surface {
                     bounds: _,
                     rect: _,
                 } => {
-                    close_blend_group(&mut blend_group);
                     assert!(!needs_stencil, "Shader blend mode not implemented in masks");
                     // Not bounded: a PixelBender blend is arbitrary user code,
                     // with no guarantee it leaves transparent source alone the
@@ -344,34 +326,6 @@ impl Surface {
                         // Nothing covered: every fragment would have discarded.
                         continue;
                     };
-
-                    // Could this join the run, or does it have to read what the
-                    // run already wrote? Alpha and Erase composite against a
-                    // different target, so they never join.
-                    let overlaps = |a: &(u32, u32, u32, u32), b: &(u32, u32, u32, u32)| {
-                        a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3
-                    };
-                    let separate_parent =
-                        matches!(blend_mode, ComplexBlend::Alpha | ComplexBlend::Erase);
-                    if measure_blend_groups {
-                        if separate_parent
-                            // A pass is configured with or without a stencil
-                            // attachment; members have to agree.
-                            || (!blend_group.is_empty() && blend_group_stencil != needs_stencil)
-                            || blend_group.iter().any(|other| overlaps(other, &scissor))
-                            // Bound the pairwise scan; a run this long already
-                            // got the win, and the cost is quadratic.
-                            || blend_group.len() >= 128
-                        {
-                            close_blend_group(&mut blend_group);
-                        }
-                        if separate_parent {
-                            crate::blend::note_blend_group(1);
-                        } else {
-                            blend_group_stencil = needs_stencil;
-                            blend_group.push(scissor);
-                        }
-                    }
 
                     // Only the scissored region is read back, so only it needs
                     // snapshotting for the shader's `dst`.
@@ -507,8 +461,6 @@ impl Surface {
                 }
             }
         }
-
-        close_blend_group(&mut blend_group);
 
         // If nothing happened, ensure it's cleared so we don't operate on garbage data
         target.ensure_cleared(draw_encoder);

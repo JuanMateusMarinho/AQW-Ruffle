@@ -1617,13 +1617,6 @@ pub(crate) static AQW_TICK_BCAST_NS: std::sync::atomic::AtomicU64 =
 pub(crate) static AQW_ORPHANS_FROZEN: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// `tick_stage_ms` split by phase.
-///
-/// The three stage passes cost very different things -- advancing timelines,
-/// constructing newly placed objects, and running the content's own frame
-/// scripts -- and summing them hides which one grew. Measured 2026-08-01: the
-/// total is 42-58ms/frame on the updated game while the fork's own per-clip
-/// hook accounts for ~1.2ms of it, so the answer is in here.
 /// AS3 clips whose timeline actually advanced in `enter_frame`, against
 /// `aqw_clips` (every clip walked).
 ///
@@ -1646,102 +1639,6 @@ pub(crate) static AQW_CLIPS_ADVANCED: std::sync::atomic::AtomicU64 =
 /// 124ms, another walked 8079 with 71 advancing for 2253ms.
 pub(crate) static AQW_RUNFRAME_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-
-/// Render-list deep copies forced by `Rc::make_mut`, and elements copied.
-///
-/// `enter_frame` keeps a `RenderIter` alive at every level while it recurses,
-/// and each one holds a strong `Rc` to that container's render list. Any child
-/// added or removed while the walk is in flight therefore clones the whole
-/// list instead of mutating it in place -- by design, so iteration stays valid
-/// (see the comment on `ChildContainer::render_list`), but the cost lands on
-/// exactly the workload that churns children fastest.
-///
-/// Measured 2026-08-01: walking a constant ~8800 clips cost 0.12us/clip at
-/// rest and 11.19us/clip during skill spam, with timeline advance flat at
-/// ~2ms. These two counters are what tie that 100x to the copies.
-/// The queued-tag half of `enter_frame`, which `runframe_ms` does not cover:
-/// draining the pending `PlaceObject` queue (`unqueue_ms`) and executing those
-/// tags (`place_ms`, `places` = tags run).
-///
-/// This is the last unmeasured block in the phase. Everything else has been
-/// ruled out by measurement: timeline advance is ~5ms, render-list copies run
-/// 3-15 per frame at one element each, and the fork's own hook is 2%.
-/// Self-time attribution for `enter_frame`, keyed by the clip's source SWF.
-///
-/// Four hypotheses have now been refuted by measurement -- stuck-playing
-/// clips, render-list copy-on-write, timeline advance, and queued-tag work --
-/// and the sub-blocks that *are* timed sum to ~90ms of a 3800ms phase. Walking
-/// more clips is demonstrably cheaper (18824 clips for 188ms against 6991 for
-/// 3891ms), so the cost is concentrated in specific clips rather than spread
-/// over the tree. This attributes each clip's own time, excluding its
-/// children, so the expensive ones name themselves.
-static AQW_SELF_TIME: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, String)>>> =
-    std::sync::Mutex::new(None);
-
-thread_local! {
-    /// Inclusive time the clip currently being timed has spent in children.
-    static ENTER_CHILD_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-pub(crate) struct EnterFrameProbe {
-    start: std::time::Instant,
-    parent_child_ns: u64,
-}
-
-pub(crate) fn enter_probe_begin() -> Option<EnterFrameProbe> {
-    aqw_diagnostics_enabled().then(|| EnterFrameProbe {
-        start: std::time::Instant::now(),
-        parent_child_ns: ENTER_CHILD_NS.with(|c| c.replace(0)),
-    })
-}
-
-pub(crate) fn enter_probe_end(probe: Option<EnterFrameProbe>, movie: &std::sync::Arc<SwfMovie>) {
-    let Some(probe) = probe else { return };
-    let inclusive = probe.start.elapsed().as_nanos() as u64;
-    // Hand the parent its own accumulator back, plus what this subtree cost.
-    let children = ENTER_CHILD_NS.with(|c| c.replace(probe.parent_child_ns + inclusive));
-    let exclusive = inclusive.saturating_sub(children);
-
-    if let Ok(mut guard) = AQW_SELF_TIME.lock() {
-        let map = guard.get_or_insert_with(Default::default);
-        map.entry(std::sync::Arc::as_ptr(movie) as usize)
-            .or_insert_with(|| (0, short_swf_name(movie.url())))
-            .0 += exclusive;
-    }
-}
-
-/// `.../classes/M/LegionRevenantr2.swf` -> `LegionRevenantr2.swf`
-fn short_swf_name(url: &str) -> String {
-    url.split(['?', '#'])
-        .next()
-        .unwrap_or(url)
-        .rsplit('/')
-        .next()
-        .unwrap_or(url)
-        .to_string()
-}
-
-/// Top `n` SWFs by self-time since the last call, as `name=ms` pairs.
-fn aqw_self_time_top(n: usize) -> String {
-    let Ok(mut guard) = AQW_SELF_TIME.lock() else {
-        return String::new();
-    };
-    let Some(map) = guard.as_mut() else {
-        return String::new();
-    };
-    let mut rows: Vec<_> = map
-        .values()
-        .filter(|(ns, _)| *ns > 1_000_000)
-        .map(|(ns, name)| (*ns / 1_000_000, name.clone()))
-        .collect();
-    map.clear();
-    rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-    rows.truncate(n);
-    rows.iter()
-        .map(|(ms, name)| format!("{name}={ms}"))
-        .collect::<Vec<_>>()
-        .join(",")
-}
 
 /// Time in `broadcast_frame_entered`. Nested inside the stage's `enter_frame`,
 /// so `stage_enter_ms` has been reporting it as walk cost all along.
@@ -1853,158 +1750,6 @@ fn aqw_listener_cost_top(n: usize) -> String {
         .join(",")
 }
 
-/// Exclusive ("self") time per AVM2 method called inside a broadcast handler.
-///
-/// Measured 2026-08-01: with the goto fast path on, `run_goto` is only 9.6% of
-/// an aura handler call, and the three runs without it agree that the goto is
-/// almost exactly half. So half the cost is somewhere the `swf_version` gate on
-/// the recursive goto frame does not explain, and the remaining version gates
-/// in the tree are all on paths an `enterFrame` listener never takes. Guessing
-/// has already cost nine dead hypotheses; record which method spends the time.
-///
-/// Self time rather than inclusive, so a parent doesn't hide behind its
-/// children: if the handler's own bytecode is the cost, `countDownAct` itself
-/// tops the table, and if a builtin is, the builtin does.
-///
-/// Off unless `RUFFLE_AQW_AVM2_PROFILE=1`. This times every single `exec` and
-/// keeps a map keyed by method identity -- far too expensive to sit on the
-/// general diagnostics flag, same reasoning as the flicker probes.
-pub(crate) fn aqw_avm2_profile_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AQW_AVM2_PROFILE").is_some())
-}
-
-#[derive(Default)]
-struct Avm2Profile {
-    /// Open windows, not a flag. Broadcasts nest: an explicit goto inside a
-    /// handler runs a recursive frame that broadcasts `frameConstructed` and
-    /// `exitFrame` through this same path, so a bool let the inner broadcast
-    /// close the window mid-`gotoAndStop` and every enclosing sample was
-    /// dropped. That is why the first run profiled 390ms of a 4300ms phase and
-    /// `gotoAndStop` -- 1500ms of it by `goto_ms` -- did not appear at all.
-    depth: u32,
-    /// Inclusive time of the calls each open frame has made, so a method can
-    /// subtract its children and report exclusive time. One entry per open
-    /// `exec`.
-    child_ns: Vec<u64>,
-    /// Method identity -> (display name, calls, exclusive ns). The name is
-    /// built once, when the method is first seen.
-    entries: std::collections::HashMap<usize, (String, u64, u64)>,
-}
-
-thread_local! {
-    static AVM2_PROFILE: RefCell<Avm2Profile> = RefCell::new(Avm2Profile::default());
-}
-
-/// Ops executed while a profile window was open. Separates "this build runs far
-/// more bytecode" from "it runs the same bytecode but something native inside
-/// got slow", which need different fixes.
-pub(crate) static AQW_AVM2_OPS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Mirrors `Avm2Profile::active` as a plain atomic. The op dispatch loop is the
-/// hottest loop in the VM and cannot afford a thread-local borrow per op.
-pub(crate) static AQW_AVM2_PROFILE_ACTIVE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Open the accumulation window, or nest one level deeper into it.
-pub(crate) fn aqw_avm2_profile_push_window() {
-    let opened = AVM2_PROFILE.with(|cell| {
-        let Ok(mut profile) = cell.try_borrow_mut() else {
-            return false;
-        };
-        profile.depth += 1;
-        profile.depth == 1
-    });
-    if opened {
-        AQW_AVM2_PROFILE_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// Leave one level. The outermost exit also drops any frames still open, which
-/// can only happen if a call unwound past the window.
-pub(crate) fn aqw_avm2_profile_pop_window() {
-    let closed = AVM2_PROFILE.with(|cell| {
-        let Ok(mut profile) = cell.try_borrow_mut() else {
-            return false;
-        };
-        profile.depth = profile.depth.saturating_sub(1);
-        if profile.depth == 0 {
-            profile.child_ns.clear();
-            return true;
-        }
-        false
-    });
-    if closed {
-        AQW_AVM2_PROFILE_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// Push a frame. `None` means the window is closed and the caller should not
-/// record an exit.
-pub(crate) fn aqw_avm2_profile_enter() -> Option<std::time::Instant> {
-    // `exec` runs constantly, so the disabled path must cost one relaxed load
-    // and nothing else -- not a thread-local access.
-    if !AQW_AVM2_PROFILE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
-        return None;
-    }
-    AVM2_PROFILE.with(|cell| {
-        let mut profile = cell.try_borrow_mut().ok()?;
-        if profile.depth == 0 {
-            return None;
-        }
-        profile.child_ns.push(0);
-        Some(std::time::Instant::now())
-    })
-}
-
-/// Pop a frame and bill its exclusive time. `name` is only called the first
-/// time a method is seen, because building it formats the class and method.
-pub(crate) fn aqw_avm2_profile_exit(
-    started: std::time::Instant,
-    key: usize,
-    name: impl FnOnce() -> String,
-) {
-    let elapsed = started.elapsed().as_nanos() as u64;
-    AVM2_PROFILE.with(|cell| {
-        let Ok(mut profile) = cell.try_borrow_mut() else {
-            return;
-        };
-        if profile.depth == 0 {
-            return;
-        }
-        let children = profile.child_ns.pop().unwrap_or(0);
-        // This call is a child of whatever is still open above it.
-        if let Some(parent) = profile.child_ns.last_mut() {
-            *parent += elapsed;
-        }
-        let entry = profile.entries.entry(key).or_insert_with(|| (name(), 0, 0));
-        entry.1 += 1;
-        entry.2 += elapsed.saturating_sub(children);
-    });
-}
-
-/// Top `n` methods by exclusive time since the last call, as `Name=us/calls`.
-fn aqw_avm2_profile_top(n: usize) -> String {
-    AVM2_PROFILE.with(|cell| {
-        let Ok(mut profile) = cell.try_borrow_mut() else {
-            return String::new();
-        };
-        let mut rows: Vec<_> = profile
-            .entries
-            .values()
-            .map(|(name, calls, ns)| (ns / 1_000, *calls, name.clone()))
-            .collect();
-        profile.entries.clear();
-        rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-        rows.truncate(n);
-        rows.iter()
-            .map(|(us, calls, name)| format!("{name}={us}us/{calls}"))
-            .collect::<Vec<_>>()
-            .join(",")
-    })
-}
-
 /// `run_inner_goto_frame_impl` split into its steps.
 ///
 /// The subtree skip took `gotoAndStop` from ~1590us to ~500us per call, but it
@@ -2047,6 +1792,13 @@ pub(crate) static AQW_INNER_ORPHAN_VISITS: std::sync::atomic::AtomicU64 =
 pub(crate) static AQW_INNER_ORPHAN_WORK: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// The queued-tag half of `enter_frame`, which `runframe_ms` does not cover:
+/// draining the pending `PlaceObject` queue (`unqueue_ms`) and executing those
+/// tags (`place_ms`, `places` = tags run).
+///
+/// This is the last unmeasured block in the phase. Everything else has been
+/// ruled out by measurement: timeline advance is ~5ms, render-list copies run
+/// 3-15 per frame at one element each, and the fork's own hook is 2%.
 pub(crate) static AQW_UNQUEUE_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static AQW_PLACE_NS: std::sync::atomic::AtomicU64 =
@@ -2054,11 +1806,30 @@ pub(crate) static AQW_PLACE_NS: std::sync::atomic::AtomicU64 =
 pub(crate) static AQW_PLACE_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Render-list deep copies forced by `Rc::make_mut`, and elements copied.
+///
+/// `enter_frame` keeps a `RenderIter` alive at every level while it recurses,
+/// and each one holds a strong `Rc` to that container's render list. Any child
+/// added or removed while the walk is in flight therefore clones the whole
+/// list instead of mutating it in place -- by design, so iteration stays valid
+/// (see the comment on `ChildContainer::render_list`), but the cost lands on
+/// exactly the workload that churns children fastest.
+///
+/// Measured 2026-08-01: walking a constant ~8800 clips cost 0.12us/clip at
+/// rest and 11.19us/clip during skill spam, with timeline advance flat at
+/// ~2ms. These two counters are what tie that 100x to the copies.
 pub(crate) static AQW_RENDERLIST_COPIES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static AQW_RENDERLIST_COPIED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// `tick_stage_ms` split by phase.
+///
+/// The three stage passes cost very different things -- advancing timelines,
+/// constructing newly placed objects, and running the content's own frame
+/// scripts -- and summing them hides which one grew. Measured 2026-08-01: the
+/// total is 42-58ms/frame on the updated game while the fork's own per-clip
+/// hook accounts for ~1.2ms of it, so the answer is in here.
 pub(crate) static AQW_STAGE_ENTER_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static AQW_STAGE_CTOR_NS: std::sync::atomic::AtomicU64 =
@@ -2478,8 +2249,6 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         let goto_place_ms = AQW_GOTO_PLACE_NS.swap(0, Ordering::Relaxed) / 1_000_000;
         let goto_inner_ms = AQW_GOTO_INNER_NS.swap(0, Ordering::Relaxed) / 1_000_000;
         let bcast_top = aqw_listener_cost_top(6);
-        let avm2_prof = aqw_avm2_profile_top(10);
-        let avm2_ops = AQW_AVM2_OPS.swap(0, Ordering::Relaxed);
         let inner_orphan_ms = AQW_INNER_ORPHAN_NS.swap(0, Ordering::Relaxed) / 1_000_000;
         let inner_stage_ms = AQW_INNER_STAGE_NS.swap(0, Ordering::Relaxed) / 1_000_000;
         let inner_bcast_ms = AQW_INNER_BCAST_NS.swap(0, Ordering::Relaxed) / 1_000_000;
@@ -2490,7 +2259,6 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         let gate_open = AQW_GATE_OPEN.swap(0, Ordering::Relaxed);
         let orphan_adds = AQW_ORPHAN_ADDS.swap(0, Ordering::Relaxed);
         let mark_bumps = AQW_MARK_BUMPS.swap(0, Ordering::Relaxed);
-        let enter_top = aqw_self_time_top(6);
         let unqueue_ms = AQW_UNQUEUE_NS.swap(0, Ordering::Relaxed) / 1_000_000;
         let place_ms = AQW_PLACE_NS.swap(0, Ordering::Relaxed) / 1_000_000;
         let places = AQW_PLACE_COUNT.swap(0, Ordering::Relaxed);
@@ -2579,11 +2347,6 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         // while VRAM sat well inside its budget -- they run out separately.
         let (render_encode_ms, render_submit_ms, render_frames, commit_mb) =
             context.renderer.take_render_timings();
-        // What merging those blend passes could buy, simulated without changing
-        // any rendering: `blend_passes / blend_groups` is the ceiling, because
-        // overlapping blends have to stay sequential.
-        let (blend_passes, blend_groups, blend_group_max) =
-            context.renderer.take_blend_grouping();
         // Which files those blends came from. If one item dominates, the cost
         // is that item's art, not the number of players -- which is what the
         // field reports and what a stuttering single-character page implies.
@@ -2605,11 +2368,6 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         // stage, so a cache on a detached subtree -- an orphaned avatar, a
         // clip parked in AQW's TRASH -- stops being counted while its texture
         // stays alive. `bmp_mb` counts it regardless of where the owner sits.
-        // The last unmeasured share. With this, `commit_mb` is fully
-        // attributed: heap + bitmap textures + the two pools + whatever the
-        // driver holds. The driver's share is what is left, and it is the one
-        // no change in this codebase can reach.
-        let heap_mb = crate::heap_stats::heap_bytes() / (1024 * 1024);
         let (bmp_tex, bmp_mb) = context
             .renderer
             .bitmap_texture_stats()
@@ -2639,60 +2397,56 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
             .collect::<Vec<_>>()
             .join("/");
 
-        tracing::info!(
-            target: "aqw_diag",
-            orphans,
-            loaders,
-            cached_objects,
-            cache_mb,
-            evicted_mb,
-            over_budget,
-            movie_libs_total,
-            movie_libs_aqw,
-            avatar_roots,
-            redraw_large,
-            redraw_small,
-            redraw_aged,
-            redraw_deferred,
-            stale_fallback,
-            blend_layers,
-            tick_orphan_ms,
-            tick_stage_ms,
-            tick_bcast_ms,
-            orphans_frozen,
-            vram_mb,
-            vram_budget_mb,
-            vram_pressure,
-            pool_allocs,
-            pool_free,
-            pool_mb,
-            tex_allocs,
-            tex_free,
-            tex_mb,
-            tex_top = tex_top.as_str(),
-            blend_modes = blend_modes.as_str(),
-            blend_cover,
-            blend_cover_hist = blend_cover_hist.as_str(),
-            blend_alloc,
-            render_encode_ms,
-            render_submit_ms,
-            render_frames,
-            commit_mb,
-            blend_passes,
-            blend_groups,
-            blend_group_max,
-            blend_swfs = blend_swfs.as_str(),
-            avatar_caches,
-            dicts,
-            dict_okeys,
-            bmp_tex,
-            bmp_mb,
-            bmp_top = bmp_top.as_str(),
-            bmp_sizes,
-            bmp_tracked_mb,
-            heap_mb,
-            "AQW memory sweep"
+        // Built once, emitted twice. The two destinations used to carry their
+        // own field lists and had already drifted ~30 columns apart -- the
+        // console was missing every `goto_*`, `inner_*` and `stage_*` the file
+        // had. Nothing checks two hand-written lists of eighty names against
+        // each other, so there is deliberately only one.
+        let line = format!(
+            "orphans={orphans} loaders={loaders} cached_objects={cached_objects} \
+             cache_mb={cache_mb} evicted_mb={evicted_mb} over_budget={over_budget} \
+             movie_libs_total={movie_libs_total} movie_libs_aqw={movie_libs_aqw} \
+             avatar_roots={avatar_roots} \
+             redraw_large={redraw_large} redraw_small={redraw_small} \
+             redraw_aged={redraw_aged} redraw_deferred={redraw_deferred} \
+             stale_fallback={stale_fallback} blend_layers={blend_layers} \
+             tick_orphan_ms={tick_orphan_ms} tick_stage_ms={tick_stage_ms} \
+             tick_bcast_ms={tick_bcast_ms} aqw_hook_ms={aqw_hook_ms} \
+             aqw_clips={aqw_clips} aqw_playing={aqw_playing} \
+             runframe_ms={runframe_ms} bcast_enter_ms={bcast_enter_ms} \
+             listeners={listeners} listeners_susp={listeners_susp} \
+             bcast_max={bcast_max}:{bcast_max_event} \
+             goto_ms={goto_ms} goto_calls={goto_calls} goto_rewinds={goto_rewinds} \
+             goto_frames={goto_frames} goto_scan_ms={goto_scan_ms} \
+             goto_remove_ms={goto_remove_ms} goto_apply_ms={goto_apply_ms} \
+             goto_place_ms={goto_place_ms} goto_inner_ms={goto_inner_ms} \
+             goto_fast={goto_fast} goto_tags={goto_tags} bcast_top={bcast_top} \
+             unqueue_ms={unqueue_ms} place_ms={place_ms} places={places} \
+             list_copies={list_copies} list_copied={list_copied} \
+             stage_enter_ms={stage_enter_ms} stage_ctor_ms={stage_ctor_ms} \
+             stage_script_ms={stage_script_ms} orphans_frozen={orphans_frozen} \
+             vram_mb={vram_mb} vram_budget_mb={vram_budget_mb} \
+             vram_pressure={vram_pressure} \
+             pool_allocs={pool_allocs} pool_free={pool_free} pool_mb={pool_mb} \
+             tex_allocs={tex_allocs} tex_free={tex_free} tex_mb={tex_mb} \
+             tex_top={tex_top} blend_modes={blend_modes} \
+             blend_cover={blend_cover}% blend_cover_hist={blend_cover_hist} \
+             blend_alloc={blend_alloc}% \
+             render_encode_ms={render_encode_ms} render_submit_ms={render_submit_ms} \
+             render_frames={render_frames} commit_mb={commit_mb} \
+             blend_swfs={blend_swfs} avatar_caches={avatar_caches} \
+             dicts={dicts} dict_okeys={dict_okeys} \
+             bmp_tex={bmp_tex} bmp_mb={bmp_mb} bmp_top={bmp_top} \
+             bmp_sizes={bmp_sizes} bmp_tracked_mb={bmp_tracked_mb} \
+             inner_frames={inner_frames} inner_orphan_ms={inner_orphan_ms} \
+             inner_stage_ms={inner_stage_ms} inner_bcast_ms={inner_bcast_ms} \
+             inner_cleanup_ms={inner_cleanup_ms} \
+             inner_orphan_visits={inner_orphan_visits} \
+             inner_orphan_work={inner_orphan_work} gate_open={gate_open} \
+             orphan_adds={orphan_adds} mark_bumps={mark_bumps}"
         );
+
+        tracing::info!(target: "aqw_diag", "AQW sweep: {line}");
 
         // Also append to a file so the sweep is captured even when the game is
         // spawned detached (the normal launcher discards stdout/stderr).
@@ -2702,10 +2456,7 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
             .append(true)
             .open(std::env::temp_dir().join("aqw-memory.log"))
         {
-            let _ = writeln!(
-                file,
-                "AQW sweep: orphans={orphans} loaders={loaders} cached_objects={cached_objects} cache_mb={cache_mb} evicted_mb={evicted_mb} over_budget={over_budget} movie_libs_total={movie_libs_total} movie_libs_aqw={movie_libs_aqw} avatar_roots={avatar_roots} redraw_large={redraw_large} redraw_small={redraw_small} redraw_aged={redraw_aged} redraw_deferred={redraw_deferred} stale_fallback={stale_fallback} blend_layers={blend_layers} tick_orphan_ms={tick_orphan_ms} tick_stage_ms={tick_stage_ms} tick_bcast_ms={tick_bcast_ms} aqw_hook_ms={aqw_hook_ms} aqw_clips={aqw_clips} aqw_playing={aqw_playing} runframe_ms={runframe_ms} bcast_enter_ms={bcast_enter_ms} listeners={listeners} listeners_susp={listeners_susp} bcast_max={bcast_max}:{bcast_max_event} goto_ms={goto_ms} goto_calls={goto_calls} goto_rewinds={goto_rewinds} goto_frames={goto_frames} goto_scan_ms={goto_scan_ms} goto_remove_ms={goto_remove_ms} goto_apply_ms={goto_apply_ms} goto_place_ms={goto_place_ms} goto_inner_ms={goto_inner_ms} goto_fast={goto_fast} goto_tags={goto_tags} bcast_top={bcast_top} enter_top={enter_top} unqueue_ms={unqueue_ms} place_ms={place_ms} places={places} list_copies={list_copies} list_copied={list_copied} stage_enter_ms={stage_enter_ms} stage_ctor_ms={stage_ctor_ms} stage_script_ms={stage_script_ms} orphans_frozen={orphans_frozen} vram_mb={vram_mb} vram_budget_mb={vram_budget_mb} vram_pressure={vram_pressure} pool_allocs={pool_allocs} pool_free={pool_free} pool_mb={pool_mb} tex_allocs={tex_allocs} tex_free={tex_free} tex_mb={tex_mb} tex_top={tex_top} blend_modes={blend_modes} blend_cover={blend_cover}% blend_cover_hist={blend_cover_hist} blend_alloc={blend_alloc}% render_encode_ms={render_encode_ms} render_submit_ms={render_submit_ms} render_frames={render_frames} commit_mb={commit_mb} blend_passes={blend_passes} blend_groups={blend_groups} blend_group_max={blend_group_max} blend_swfs={blend_swfs} avatar_caches={avatar_caches} dicts={dicts} dict_okeys={dict_okeys} bmp_tex={bmp_tex} bmp_mb={bmp_mb} bmp_top={bmp_top} bmp_sizes={bmp_sizes} bmp_tracked_mb={bmp_tracked_mb} heap_mb={heap_mb} avm2_ops={avm2_ops} inner_frames={inner_frames} inner_orphan_ms={inner_orphan_ms} inner_stage_ms={inner_stage_ms} inner_bcast_ms={inner_bcast_ms} inner_cleanup_ms={inner_cleanup_ms} inner_orphan_visits={inner_orphan_visits} inner_orphan_work={inner_orphan_work} gate_open={gate_open} orphan_adds={orphan_adds} mark_bumps={mark_bumps} avm2_prof={avm2_prof}"
-            );
+            let _ = writeln!(file, "AQW sweep: {line}");
         }
     }
 }

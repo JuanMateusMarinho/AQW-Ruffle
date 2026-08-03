@@ -687,17 +687,6 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             ip += 1;
             avm_debug!(self.avm2(), "Opcode: {op:?}");
 
-            // Counts only inside an open profile window, so the number answers
-            // "how much bytecode does this handler run" rather than "how much
-            // bytecode does the player run". Free when the env var is unset:
-            // the gate is a `OnceLock<bool>` load the branch predictor pins.
-            if crate::display_object::AQW_AVM2_PROFILE_ACTIVE
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
-                crate::display_object::AQW_AVM2_OPS
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-
             let result = match op {
                 Op::PushDouble { value } => self.op_push_double(*value),
                 Op::PushFalse => self.op_push_false(),

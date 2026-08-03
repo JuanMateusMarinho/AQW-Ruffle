@@ -8,9 +8,10 @@
 //! defined by subtraction; only a global allocator can attribute it directly.
 //!
 //! NOTE: installing [`CountingAllocator`] taxes every allocation in the
-//! process with two atomics, so it is deliberately NOT installed. Shipping
-//! builds leave it out and the sweep's `heap_mb` reads zero. To take the
-//! measurement again, add to `desktop/src/main.rs`:
+//! process with two atomics, so it is deliberately NOT installed. Because it
+//! is not, [`heap_bytes`] reads zero, and the sweep's `heap_mb` column was
+//! dropped rather than keep reporting a constant zero. To take the measurement
+//! again, add to `desktop/src/main.rs`:
 //!
 //! ```ignore
 //! #[global_allocator]
@@ -18,7 +19,8 @@
 //!     ruffle_core::heap_stats::CountingAllocator;
 //! ```
 //!
-//! and take it back out before building the release.
+//! and read [`heap_bytes`] from wherever the number is wanted — then take the
+//! allocator back out before building the release.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicI64, Ordering};

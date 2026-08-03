@@ -692,21 +692,8 @@ impl<'gc> Avm2<'gc> {
                     let probe = crate::display_object::aqw_diagnostics_enabled()
                         .then(std::time::Instant::now);
 
-                    // Profile only what the handler itself runs. Opening the
-                    // window around the whole frame would bury the handler in
-                    // the rest of the tick, which is the mistake the listener
-                    // timer above already had to correct for.
-                    let profiling = crate::display_object::aqw_avm2_profile_enabled();
-                    if profiling {
-                        crate::display_object::aqw_avm2_profile_push_window();
-                    }
-
                     let mut activation = Activation::from_nothing(context);
                     events::broadcast_event(&mut activation, object, event);
-
-                    if profiling {
-                        crate::display_object::aqw_avm2_profile_pop_window();
-                    }
 
                     if let Some(started) = probe {
                         // Record every call, not just slow ones. A 100us floor

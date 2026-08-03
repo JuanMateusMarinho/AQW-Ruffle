@@ -1380,10 +1380,6 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         crate::blend::take_blend_alloc()
     }
 
-    fn take_blend_grouping(&mut self) -> (u64, u64, u64) {
-        crate::blend::take_blend_grouping()
-    }
-
     fn take_render_timings(&mut self) -> (u64, u64, u64, u64) {
         use std::sync::atomic::Ordering;
         (

@@ -173,15 +173,6 @@ pub trait RenderBackend: Any {
         (0, 0, 0, 0)
     }
 
-    /// How well complex blend passes could be merged, as
-    /// `(passes, groups, biggest_group)`.
-    ///
-    /// Overlapping blends must stay sequential, so `passes / groups` is the
-    /// most that merging them could ever save.
-    fn take_blend_grouping(&mut self) -> (u64, u64, u64) {
-        (0, 0, 0)
-    }
-
     fn submit_frame(
         &mut self,
         clear: swf::Color,

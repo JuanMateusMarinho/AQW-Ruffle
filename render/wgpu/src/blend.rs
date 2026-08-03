@@ -105,32 +105,11 @@ pub fn take_blend_alloc() -> u64 {
     alloc.saturating_mul(100).checked_div(full).unwrap_or(0)
 }
 
-/// Complex blend passes, against how few passes they could be merged into.
-///
-/// Blends that overlap must stay sequential -- the later one has to read the
-/// earlier one's output -- so only a run of mutually disjoint ones can share a
-/// pass and a single parent snapshot. Chunks arrive in render order, which
-/// means consecutive ones tend to be pieces of the same avatar, and those
-/// overlap. This counts what merging would actually achieve before any of it
-/// is built: `passes / groups` is the speedup ceiling.
-static BLEND_PASSES: AtomicU64 = AtomicU64::new(0);
-static BLEND_GROUPS: AtomicU64 = AtomicU64::new(0);
-static BLEND_BIGGEST_GROUP: AtomicU64 = AtomicU64::new(0);
-
-pub fn note_blend_group(members: u64) {
-    BLEND_PASSES.fetch_add(members, Ordering::Relaxed);
-    BLEND_GROUPS.fetch_add(1, Ordering::Relaxed);
-    BLEND_BIGGEST_GROUP.fetch_max(members, Ordering::Relaxed);
-}
-
-/// Drains the grouping tally as `(passes, groups, biggest_group)`.
-pub fn take_blend_grouping() -> (u64, u64, u64) {
-    (
-        BLEND_PASSES.swap(0, Ordering::Relaxed),
-        BLEND_GROUPS.swap(0, Ordering::Relaxed),
-        BLEND_BIGGEST_GROUP.swap(0, Ordering::Relaxed),
-    )
-}
+// NOTE: merging complex blend passes was simulated here and REJECTED by the
+// measurement (2026-07-22): 20734 passes collapsed into 20350 groups, a 1.02x
+// ceiling, because consecutive chunks are pieces of the same avatar and those
+// overlap -- and overlapping blends have to stay sequential. The simulation
+// counters have been removed along with the idea. Do not rebuild them.
 
 pub fn note_blend_coverage(covered_px: u64, surface_px: u64) {
     BLEND_COVERED_PX.fetch_add(covered_px, Ordering::Relaxed);
