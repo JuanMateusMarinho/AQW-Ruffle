@@ -2107,7 +2107,7 @@ fn render_aqw_scaling_grid<'gc>(
 fn should_bypass_offscreen_bitmap_cache<'gc>(
     this: DisplayObject<'gc>,
     context: &RenderContext<'_, 'gc>,
-    options: &RenderOptions,
+    options: RenderOptions,
     bounds: &Rectangle<Twips>,
     filters: &[Filter],
 ) -> bool {
@@ -2865,7 +2865,7 @@ pub fn render_base<'gc>(
         let swf_version = this.swf_version();
         filters.retain(|f| !f.impotent());
         let bypass_bitmap_cache = degenerate_transform
-            || should_bypass_offscreen_bitmap_cache(this, context, &options, &bounds, &filters);
+            || should_bypass_offscreen_bitmap_cache(this, context, options, &bounds, &filters);
         // Padded cache textures are only safe when the redraw clear is
         // transparent; an opaque background would paint the padding margin.
         let allow_size_padding = allow_aqw_large_cache
@@ -3222,7 +3222,7 @@ pub fn render_base<'gc>(
                     pixel_snapping,
                 )
             },
-            &options,
+            options,
         );
     } else {
         if let Some(background) = this.opaque_background() {
@@ -3241,7 +3241,7 @@ pub fn render_base<'gc>(
             this,
             context,
             |context| this.render_self(context),
-            &options,
+            options,
         );
     }
 
@@ -3278,7 +3278,7 @@ pub fn apply_standard_mask_and_scroll<'gc, F>(
     this: DisplayObject<'gc>,
     context: &mut RenderContext<'_, 'gc>,
     draw: F,
-    options: &RenderOptions,
+    options: RenderOptions,
 ) where
     F: FnOnce(&mut RenderContext<'_, 'gc>),
 {
