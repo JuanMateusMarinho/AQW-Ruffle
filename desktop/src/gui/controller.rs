@@ -210,19 +210,17 @@ impl GuiController {
         let Some(set) = crate::artix::custom_cursors() else {
             return;
         };
-        let build = |art: &crate::artix::CursorArt| {
-            match CustomCursor::from_rgba(
-                art.rgba.to_vec(),
-                art.size,
-                art.size,
-                art.hotspot_x,
-                art.hotspot_y,
-            ) {
-                Ok(source) => Some(event_loop.create_custom_cursor(source)),
-                Err(e) => {
-                    tracing::warn!("Custom cursor rejected, keeping the system one: {e}");
-                    None
-                }
+        let build = |art: &crate::artix::CursorArt| match CustomCursor::from_rgba(
+            art.rgba.to_vec(),
+            art.size,
+            art.size,
+            art.hotspot_x,
+            art.hotspot_y,
+        ) {
+            Ok(source) => Some(event_loop.create_custom_cursor(source)),
+            Err(e) => {
+                tracing::warn!("Custom cursor rejected, keeping the system one: {e}");
+                None
             }
         };
         if let (Some(arrow), Some(hand)) = (build(&set.arrow), build(&set.hand)) {
@@ -440,7 +438,8 @@ impl GuiController {
         let ss = f64::from(aqw_current_supersample());
         // Present order is squeeze -> warp, so window -> movie applies the same:
         // squeeze first, then warp.
-        let (sx, sy) = self.crt_squeeze_window_position(position.x, position.y - self.height_offset());
+        let (sx, sy) =
+            self.crt_squeeze_window_position(position.x, position.y - self.height_offset());
         let (wx, wy) = self.crt_warp_window_position(sx, sy);
         (wx * ss, wy * ss)
     }
@@ -483,7 +482,9 @@ impl GuiController {
                 // as it is in the AQW render path (the VRAM valve drains it).
                 // Neither is worth killing the game over: treat both like
                 // Lost/Outdated — reconfigure and skip this frame.
-                tracing::error!("Surface acquire failed: {e:?}; reconfiguring and skipping a frame");
+                tracing::error!(
+                    "Surface acquire failed: {e:?}; reconfiguring and skipping a frame"
+                );
                 self.reconfigure_surface();
                 return;
             }

@@ -95,7 +95,10 @@ impl<'a> FilterSource<'a> {
                     source_left as f32 / source_width,
                     source_top as f32 / source_height,
                 ],
-                blur_uv: [blur_left / blur_texture_dims.0, blur_top / blur_texture_dims.1],
+                blur_uv: [
+                    blur_left / blur_texture_dims.0,
+                    blur_top / blur_texture_dims.1,
+                ],
             },
             FilterVertexWithBlur {
                 position: [1.0, 0.0],

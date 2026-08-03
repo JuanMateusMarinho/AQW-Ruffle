@@ -679,11 +679,9 @@ impl<'gc> Avm2<'gc> {
                 // steady-state (e.g. a crowded room with stable avatars), where no
                 // loader is mid-detach.
                 let suspended = context.avm2.aqw_has_pending_detach()
-                    && object
-                        .as_display_object()
-                        .is_some_and(|display_object| {
-                            display_object.is_in_currently_detached_aqw_avatar_loader()
-                        });
+                    && object.as_display_object().is_some_and(|display_object| {
+                        display_object.is_in_currently_detached_aqw_avatar_loader()
+                    });
                 if !suspended {
                     // Attribute the handler's cost to its class. Measured
                     // 2026-08-01: ~23 `enterFrame` listeners account for 96%

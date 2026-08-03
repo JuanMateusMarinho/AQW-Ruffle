@@ -127,7 +127,9 @@ impl Descriptors {
         format: wgpu::TextureFormat,
         msaa_sample_count: u32,
     ) -> wgpu::RenderPipeline {
-        let mut pipelines = cache.lock().expect("Pipelines should not be already locked");
+        let mut pipelines = cache
+            .lock()
+            .expect("Pipelines should not be already locked");
         pipelines
             .entry((msaa_sample_count, format))
             .or_insert_with(|| {

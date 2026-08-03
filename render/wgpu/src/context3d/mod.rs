@@ -638,9 +638,8 @@ impl Context3D for WgpuContext3D {
                     // We always use a non-multisampled texture as our raw texture handle,
                     // which is what the Stage rendering code expects. In multisample mode,
                     // this is our resolve texture.
-                    self.back_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture::new(
-                        back_buffer_resolve_texture.unwrap(),
-                    )));
+                    self.back_buffer_raw_texture_handle =
+                        BitmapHandle(Arc::new(Texture::new(back_buffer_resolve_texture.unwrap())));
                     self.front_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture::new(
                         front_buffer_resolve_texture.unwrap(),
                     )));

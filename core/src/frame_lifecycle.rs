@@ -253,8 +253,7 @@ fn run_inner_goto_frame_impl<'gc>(
         }
     };
     if probe {
-        crate::display_object::AQW_INNER_FRAMES
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::display_object::AQW_INNER_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     // Both orphan loops walk the same batch: they are the pair that reads the
@@ -346,8 +345,7 @@ pub fn broadcast_frame_entered<'gc>(context: &mut UpdateContext<'gc>) {
     // Timed apart from the stage walk it is nested inside: this dispatches to
     // every `enterFrame` listener, which is where AQW runs its combat and FX
     // logic, and it is not proportional to the display tree at all.
-    let started = crate::display_object::aqw_diagnostics_enabled()
-        .then(std::time::Instant::now);
+    let started = crate::display_object::aqw_diagnostics_enabled().then(std::time::Instant::now);
 
     let enter_frame_evt = EventObject::bare_default_event(context, "enterFrame");
     let dobject_constr = context.avm2.classes().display_object;

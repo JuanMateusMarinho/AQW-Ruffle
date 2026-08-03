@@ -42,9 +42,9 @@ pub mod backend;
 mod blend;
 mod buffer_builder;
 mod buffer_pool;
-mod content_bounds;
 #[cfg(feature = "clap")]
 pub mod clap;
+mod content_bounds;
 pub mod descriptors;
 mod dynamic_transforms;
 mod filters;
@@ -273,9 +273,8 @@ pub fn bitmap_texture_stats() -> (i64, i64) {
 /// nothing to do with each other. The shape names the source.
 fn bitmap_texture_sizes()
 -> &'static std::sync::Mutex<std::collections::HashMap<(u32, u32), (usize, u64)>> {
-    static SIZES: OnceLock<
-        std::sync::Mutex<std::collections::HashMap<(u32, u32), (usize, u64)>>,
-    > = OnceLock::new();
+    static SIZES: OnceLock<std::sync::Mutex<std::collections::HashMap<(u32, u32), (usize, u64)>>> =
+        OnceLock::new();
     SIZES.get_or_init(Default::default)
 }
 

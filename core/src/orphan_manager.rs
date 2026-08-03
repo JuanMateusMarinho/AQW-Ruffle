@@ -82,7 +82,8 @@ impl<'gc> OrphanManager<'gc> {
         }
 
         if crate::display_object::aqw_diagnostics_enabled() {
-            crate::display_object::AQW_MARK_BUMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::display_object::AQW_MARK_BUMPS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         self.pending.push(dobj.downgrade());

@@ -225,7 +225,12 @@ mod tests {
     #[test]
     fn unit_quad_scaled_and_translated() {
         // What `render_bitmap` builds: the texture size folded into the matrix.
-        let matrix = Matrix::create_box(40.0, 20.0, Twips::from_pixels(10.0), Twips::from_pixels(5.0));
+        let matrix = Matrix::create_box(
+            40.0,
+            20.0,
+            Twips::from_pixels(10.0),
+            Twips::from_pixels(5.0),
+        );
         let mut bounds = ContentBounds::EMPTY;
         bounds.union_transformed(&matrix, ContentBounds::UNIT);
         assert_eq!(bounds.to_scissor(1600, 841, 0), Some((10, 5, 40, 20)));
@@ -318,12 +323,8 @@ mod tests {
 
     #[test]
     fn unbounded_local_stays_unbounded() {
-        let matrix = Matrix::create_box(
-            1.0,
-            1.0,
-            Twips::from_pixels(10.0),
-            Twips::from_pixels(10.0),
-        );
+        let matrix =
+            Matrix::create_box(1.0, 1.0, Twips::from_pixels(10.0), Twips::from_pixels(10.0));
         let mut bounds = ContentBounds::EMPTY;
         bounds.union_transformed(&matrix, ContentBounds::UNBOUNDED);
         assert_eq!(bounds, ContentBounds::UNBOUNDED);
@@ -383,12 +384,18 @@ mod tests {
         );
         let mut bounds = ContentBounds::EMPTY;
         bounds.union_transformed(&matrix, ContentBounds::UNIT);
-        assert_eq!(bounds.to_snapped_rect(1600, 841, bucket), Some((0, 0, 1600, 841)));
+        assert_eq!(
+            bounds.to_snapped_rect(1600, 841, bucket),
+            Some((0, 0, 1600, 841))
+        );
     }
 
     #[test]
     fn snapped_rect_is_none_when_nothing_is_covered() {
-        assert_eq!(ContentBounds::EMPTY.to_snapped_rect(1600, 841, bucket), None);
+        assert_eq!(
+            ContentBounds::EMPTY.to_snapped_rect(1600, 841, bucket),
+            None
+        );
     }
 
     #[test]

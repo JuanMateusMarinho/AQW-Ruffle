@@ -88,7 +88,11 @@ impl Shaders {
                         "const HALATION: f32 = {:.4};",
                         aqw_crt_env_strength(
                             "RUFFLE_AQW_CRT_HALATION",
-                            if artix_game_is_dragonfable() { 0.08 } else { 0.12 }
+                            if artix_game_is_dragonfable() {
+                                0.08
+                            } else {
+                                0.12
+                            }
                         )
                     ),
                 )
@@ -98,7 +102,11 @@ impl Shaders {
                         "const GLOW: f32 = {:.4};",
                         aqw_crt_env_strength(
                             "RUFFLE_AQW_CRT_GLOW",
-                            if artix_game_is_dragonfable() { 0.3 } else { 0.45 }
+                            if artix_game_is_dragonfable() {
+                                0.3
+                            } else {
+                                0.45
+                            }
                         )
                     ),
                 )
@@ -111,7 +119,11 @@ impl Shaders {
                             .and_then(|v| v.trim().parse::<f32>().ok())
                             .filter(|n| n.is_finite())
                             .map(|n| n.clamp(0.0, 1.5))
-                            .unwrap_or(if artix_game_is_dragonfable() { 0.85 } else { 1.0 })
+                            .unwrap_or(if artix_game_is_dragonfable() {
+                                0.85
+                            } else {
+                                1.0
+                            })
                     ),
                 )
                 .replace(

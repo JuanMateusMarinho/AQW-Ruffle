@@ -262,9 +262,12 @@ impl BevelFilter {
                 self.vertices_size,
                 &descriptors.device,
             )
-            .copy_from_slice(bytemuck::cast_slice(&[
-                source.vertices_with_highlight_and_shadow(blur_offset, blur_dims, blur_origin)
-            ]));
+            .copy_from_slice(bytemuck::cast_slice(&[source
+                .vertices_with_highlight_and_shadow(
+                    blur_offset,
+                    blur_dims,
+                    blur_origin,
+                )]));
         let filter_group = descriptors
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
