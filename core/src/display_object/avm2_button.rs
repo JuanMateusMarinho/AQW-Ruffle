@@ -549,38 +549,65 @@ impl<'gc> TDisplayObject<'gc> for Avm2Button<'gc> {
                     // the `stop()` that authored frames end on, which is why
                     // an AQW cutscene then plays through its own pauses.
                     //
-                    // Skipping the pass in that case is NOT the fix: tried
-                    // 2026-08-03 and it fails ten tests whose expectations
-                    // come from the real player, `avm2/button_nested_frame`
-                    // among them. Flash runs this pass too. Whatever diverges
-                    // is in what the stage can see while it runs, not in
-                    // whether it runs, so this only reports the nesting.
-                    let nested_in_construct = self.avm2_parent().is_some_and(|mut node| {
+                    // Two shapes of fix are already ruled out here, both tried
+                    // on 2026-08-03 against expectations captured from the real
+                    // player. Skipping the pass when nested fails ten tests,
+                    // `avm2/button_nested_frame` among them. Narrowing it to
+                    // the button's own states -- `self.run_frame_scripts`
+                    // instead of the stage's -- fails seven. Flash runs this
+                    // pass, over the whole stage. Whatever diverges is in what
+                    // the stage can see while it runs, not in whether or how
+                    // widely it runs, so this only measures.
+                    // Nearest ancestor still inside its own `constructChildren`.
+                    let constructing = {
+                        let mut node = self.avm2_parent();
                         loop {
-                            if node
-                                .as_movie_clip()
-                                .is_some_and(|clip| clip.constructing_frame())
-                            {
-                                return true;
-                            }
-                            match node.avm2_parent() {
-                                Some(parent) => node = parent,
-                                None => return false,
+                            match node {
+                                Some(current) => {
+                                    match current
+                                        .as_movie_clip()
+                                        .filter(|clip| clip.constructing_frame())
+                                    {
+                                        Some(clip) => break Some(clip),
+                                        None => node = current.avm2_parent(),
+                                    }
+                                }
+                                None => break None,
                             }
                         }
-                    });
+                    };
 
-                    if nested_in_construct && crate::display_object::aqw_diagnostics_enabled() {
-                        tracing::warn!(
-                            target: "aqw_diag",
-                            button = %self.name().map(|n| n.to_utf8_lossy().into_owned())
-                                .unwrap_or_else(|| "<unnamed>".to_string()),
-                            phase = ?*context.frame_phase,
-                            movie = %self.movie().url(),
-                            "Button running a whole-stage framescript pass while an \
-                             ancestor is mid-construction"
-                        );
-                    }
+                    // The clip that placed the one being constructed is the one
+                    // whose framescript this pass pulls forward, and whose field
+                    // for that child is still unwritten.
+                    //
+                    // `fresh` is the predicate that actually decides a script
+                    // runs, so it answers the open question -- but only if it is
+                    // sampled at the right instant. Sampling it once, before the
+                    // pass, said `false` on every occurrence while the script
+                    // demonstrably ran: the pass has two halves, and the stage
+                    // construct is free to queue the script that the stage
+                    // framescript walk then runs. So sample on both sides of
+                    // that construct. `false -> true` means the construct half
+                    // is what makes it pending, and Flash must be deferring
+                    // exactly that; `false -> false` means the script is reached
+                    // by neither half and the hypothesis is dead.
+                    let placer = constructing
+                        .and_then(|clip| clip.avm2_parent())
+                        .and_then(|parent| parent.as_movie_clip());
+                    let sample = |clip: Option<MovieClip<'gc>>| {
+                        clip.map(|c| {
+                            (
+                                c.current_frame(),
+                                c.has_pending_script(),
+                                c.has_fresh_frame_script(),
+                            )
+                        })
+                        .unwrap_or((0, false, false))
+                    };
+                    let probing =
+                        constructing.is_some() && crate::display_object::aqw_diagnostics_enabled();
+                    let before = probing.then(|| sample(placer));
 
                     self.0.weird_framescript_order.set(true);
 
@@ -588,6 +615,32 @@ impl<'gc> TDisplayObject<'gc> for Avm2Button<'gc> {
                     stage.construct_frame(context);
                     broadcast_frame_constructed(context);
                     self.set_state(context, ButtonState::Up);
+
+                    if let Some((frame_before, pending_before, fresh_before)) = before {
+                        let (frame_after, pending_after, fresh_after) = sample(placer);
+                        let name_of = |clip: Option<MovieClip<'gc>>| {
+                            clip.and_then(|c| c.name())
+                                .map(|n| n.to_utf8_lossy().into_owned())
+                                .unwrap_or_else(|| "<none>".to_string())
+                        };
+                        tracing::warn!(
+                            target: "aqw_diag",
+                            button = %self.name().map(|n| n.to_utf8_lossy().into_owned())
+                                .unwrap_or_else(|| "<unnamed>".to_string()),
+                            constructing = %name_of(constructing),
+                            placer = %name_of(placer),
+                            frame_before,
+                            frame_after,
+                            pending_before,
+                            pending_after,
+                            fresh_before,
+                            fresh_after,
+                            movie = %self.movie().url(),
+                            "Button framescript pass, placer script state across the \
+                             stage construct"
+                        );
+                    }
+
                     stage.run_frame_scripts(context);
                     broadcast_frame_exited(context);
                 }
