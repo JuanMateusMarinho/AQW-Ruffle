@@ -71,6 +71,7 @@ const AQW_AVATAR_THROTTLE_ROOTS: u32 = 96;
 const AQW_AVATAR_HEAVY_THROTTLE_ROOTS: u32 = 192;
 
 use crate::display_object::aqw_diagnostics_enabled;
+use crate::display_object::script_requeue_disabled;
 
 /// Releasing a frozen avatar subtree's cache texture, opt-in via
 /// `RUFFLE_AQW_AVATAR_CACHE_RELEASE=1`.
@@ -956,6 +957,9 @@ pub struct MovieClipData<'gc> {
     drawing: OnceCell<Box<RefCell<Drawing>>>,
 
     last_queued_script_frame: Cell<Option<FrameNumber>>,
+    /// The frame whose script was last handed back after throwing out of turn,
+    /// so it is handed back at most once.
+    requeued_script_frame: Cell<Option<FrameNumber>>,
     queued_script_frame: Cell<FrameNumber>,
     queued_goto_frame: Cell<Option<FrameNumber>>,
 
@@ -1032,6 +1036,7 @@ impl<'gc> MovieClipData<'gc> {
             avm2_use_hand_cursor: Cell::new(true),
             button_mode: Cell::new(false),
             last_queued_script_frame: Cell::new(None),
+            requeued_script_frame: Cell::new(None),
             queued_script_frame: Cell::new(0),
             has_pending_script: Cell::new(false),
             aqw_timeline_counter: Cell::new(0),
@@ -3500,11 +3505,36 @@ impl<'gc> MovieClip<'gc> {
 
                     let mut activation = Avm2Activation::from_domain(context, domain);
 
+                    // Set when a script the button's whole-stage pass pulled
+                    // forward throws. A clip that pass reaches has a half-built
+                    // frame: the child being constructed is placed, but the
+                    // field the script reads it through is written by
+                    // `on_construction_complete`, after the constructor we are
+                    // inside. The slot is marked consumed above, before the
+                    // call, so the throw also costs the script its turn in the
+                    // frame-script phase -- the one where the frame is finished
+                    // and the field is bound. Hand that turn back.
+                    let mut requeue_after_throw = false;
+
                     if let Err(e) = callable.call(
                         &mut activation,
                         avm2_object.into(),
                         Avm2FunctionArgs::empty(),
                     ) {
+                        // Narrow to the shape this exists for: a script the
+                        // button's out-of-turn pass pulled forward. Gating on
+                        // the construct phase instead is far too broad --
+                        // `run_inner_goto_frame` enters that phase on every
+                        // explicit goto, of which AQW issues roughly 1300 per
+                        // 48-frame window, so a script that throws for any
+                        // unrelated reason would buy a second attempt thousands
+                        // of times a second, each paying another AVM2 error
+                        // construction. Capping at one requeue per frame is the
+                        // other half: without it the script becomes eligible
+                        // again inside the same pass.
+                        requeue_after_throw = !script_requeue_disabled()
+                            && super::avm2_button::in_framescript_pass()
+                            && self.0.requeued_script_frame.get() != Some(frame_id);
                         // A throwing frame script abandons everything after the
                         // throw, and authored frames overwhelmingly end with
                         // `stop()`. The clip is then left running by an error
@@ -3513,25 +3543,21 @@ impl<'gc> MovieClip<'gc> {
                         // like this. `playing` is the field that matters: still
                         // true means the stop never happened.
                         if aqw_diagnostics_enabled() {
-                            // Is an ancestor mid-`Sprite.constructChildren`?
-                            // That is the claim under test: the script runs
-                            // inside construction, so the siblings it is
-                            // written to configure may not be placed yet, and
-                            // the first one it touches is null. `children` is
+                            // Is a button's out-of-turn pass on the stack? That
+                            // is the claim under test: the script runs inside
+                            // construction, so the siblings it is written to
+                            // configure may not be bound yet, and the first one
+                            // it touches is null.
+                            //
+                            // This used to walk up from here looking for an
+                            // ancestor inside `Sprite.constructChildren`, which
+                            // is the wrong direction and read `false` on every
+                            // throw ever recorded: the clip being constructed
+                            // is this clip's *child*. `children` is
                             // the corroborating count -- a frame script that
                             // configures components on a clip reporting very
                             // few children is looking at an unfinished list.
-                            let mut constructing_ancestor = false;
-                            let mut node: Option<DisplayObject<'gc>> = Some(self.into());
-                            while let Some(current) = node {
-                                if let Some(clip) = current.as_movie_clip()
-                                    && clip.constructing_frame()
-                                {
-                                    constructing_ancestor = true;
-                                    break;
-                                }
-                                node = current.parent();
-                            }
+                            let in_button_pass = super::avm2_button::in_framescript_pass();
                             // Name and class of every child present at the
                             // moment of the throw. The script died reaching a
                             // null child while the clip already had dozens, so
@@ -3565,7 +3591,8 @@ impl<'gc> MovieClip<'gc> {
                                 name = self.name().map(|n| n.to_string()).unwrap_or_default(),
                                 frame = self.current_frame(),
                                 playing = self.playing(),
-                                constructing = constructing_ancestor,
+                                in_button_pass,
+                                requeued = requeue_after_throw,
                                 children = self.num_children(),
                                 child_list = children_list.as_str(),
                                 movie = self.movie().url(),
@@ -3580,8 +3607,34 @@ impl<'gc> MovieClip<'gc> {
                         );
                     }
 
+                    drop(activation);
+
                     self.0
                         .set_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT, false);
+
+                    if requeue_after_throw {
+                        self.0.requeued_script_frame.set(Some(frame_id));
+                        self.set_last_queued_script_frame(None);
+                        self.set_has_pending_script(context, true);
+
+                        if aqw_diagnostics_enabled() {
+                            // Pairs with the throw line above, which reports
+                            // `playing=true`. Seeing this one for the same clip
+                            // and frame means the script gets a second attempt
+                            // in the frame-script phase; whether that attempt
+                            // reaches the `stop()` shows up as the clip no
+                            // longer playing.
+                            tracing::warn!(
+                                target: "aqw_diag",
+                                name = self.name().map(|n| n.to_string()).unwrap_or_default(),
+                                frame = self.current_frame(),
+                                frame_id,
+                                movie = self.movie().url(),
+                                "Frame script threw mid-construction; requeued for \
+                                 the frame-script phase"
+                            );
+                        }
+                    }
                 }
             }
         }

@@ -30,6 +30,19 @@ use ruffle_render::filters::Filter;
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
+thread_local! {
+    /// How many button framescript passes are on the stack right now.
+    static FRAMESCRIPT_PASS_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Whether a button is currently running its whole-stage construct and
+/// framescript pass. Frame scripts reached during one are running out of turn:
+/// the clip that placed the button is mid-way through constructing it, so the
+/// field it holds that child in is still unwritten.
+pub(super) fn in_framescript_pass() -> bool {
+    FRAMESCRIPT_PASS_DEPTH.with(|depth| depth.get() > 0)
+}
+
 #[derive(Clone, Collect, Copy)]
 #[collect(no_drop)]
 pub struct Avm2Button<'gc>(Gc<'gc, Avm2ButtonData<'gc>>);
@@ -611,6 +624,8 @@ impl<'gc> TDisplayObject<'gc> for Avm2Button<'gc> {
 
                     self.0.weird_framescript_order.set(true);
 
+                    FRAMESCRIPT_PASS_DEPTH.with(|depth| depth.set(depth.get() + 1));
+
                     let stage = context.stage;
                     stage.construct_frame(context);
                     broadcast_frame_constructed(context);
@@ -643,6 +658,8 @@ impl<'gc> TDisplayObject<'gc> for Avm2Button<'gc> {
 
                     stage.run_frame_scripts(context);
                     broadcast_frame_exited(context);
+
+                    FRAMESCRIPT_PASS_DEPTH.with(|depth| depth.set(depth.get() - 1));
                 }
 
                 if let Some(avm2_object) = self.0.object.get() {

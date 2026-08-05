@@ -194,6 +194,13 @@ pub(crate) fn orphan_pending_disabled() -> bool {
     *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_ORPHAN_PENDING", false))
 }
 
+/// Stop handing a frame script back when it throws out of turn, mid-construction.
+/// `RUFFLE_AQW_NO_SCRIPT_REQUEUE=1`.
+pub(crate) fn script_requeue_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_SCRIPT_REQUEUE", false))
+}
+
 /// The per-object flicker probes, which are too expensive to leave on the
 /// general diagnostics flag. `RUFFLE_AQW_FLICKER_PROBE=1`.
 fn aqw_flicker_probe_enabled() -> bool {
