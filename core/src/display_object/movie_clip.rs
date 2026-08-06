@@ -3750,6 +3750,14 @@ impl<'gc> MovieClip<'gc> {
         // into a texture and are reused until the art really moves. Set here,
         // in the tick, rather than mid-render, because enabling it takes a
         // mutable borrow of the object. Kill-switch `RUFFLE_AQW_NO_AVATAR_CACHE`.
+        // Withholding this cache from subtrees that contain a blend was tried
+        // on 2026-08-06 and measured, not guessed: it was a suspect for an item
+        // whose colour came out wrong while cached, because caching does change
+        // what inner blends composite against. A crowded room put 28% of avatar
+        // roots in that category and doubled the frame time -- 41.9ms to 88.3ms
+        // against a 41.7ms budget -- so the whole approach is closed. (The real
+        // cause was descendants losing their *filters* inside the bake; see
+        // `render_base`.) Do not reopen without a new mechanism.
         if !crate::display_object::aqw_avatar_cache_disabled()
             && !self.is_bitmap_cached_preference()
         {

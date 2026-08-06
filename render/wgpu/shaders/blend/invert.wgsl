@@ -34,6 +34,11 @@ fn main_fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     var src: vec4<f32> = textureSample(current_texture, texture_sampler, in.src_uv);
 
     if (src.a > 0.0) {
+        // See the note in `overlay.wgsl`: defensive against 0/0 only, and
+        // measured to change no pixel of any blend test.
+        if (dst.a <= 0.0) {
+            return src;
+        }
         return vec4<f32>(src.rgb * (1.0 - dst.a) + dst.rgb * (1.0 - src.a) + src.a * dst.a * (1.0 - dst.rgb / dst.a), src.a + dst.a * (1.0 - src.a));
     } else {
         if (true) {

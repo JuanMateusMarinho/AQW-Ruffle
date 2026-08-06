@@ -240,6 +240,14 @@ pub(crate) fn redraw_defer_disabled() -> bool {
     *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_REDRAW_DEFER", true))
 }
 
+/// Kill-switch for letting a filtered child keep its cache inside an AQW bake,
+/// which is the only way its filters get applied at all.
+/// `RUFFLE_AQW_NO_NESTED_FILTER_CACHE=1` drops them again.
+fn aqw_nested_filter_cache_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_NESTED_FILTER_CACHE", false))
+}
+
 /// The per-object flicker probes, which are too expensive to leave on the
 /// general diagnostics flag. `RUFFLE_AQW_FLICKER_PROBE=1`.
 fn aqw_flicker_probe_enabled() -> bool {
@@ -266,6 +274,29 @@ fn aqw_flicker_probe_filter() -> Option<&'static str> {
             (!matches!(value.as_str(), "1" | "true" | "on")).then_some(value)
         })
         .as_deref()
+}
+
+/// Whether the probes should look at art from `url`.
+///
+/// Unfiltered, the character-select screen alone spends a whole report budget
+/// before the session is even in a room, so it is never the subject and never
+/// gets to be the subject. The game shell and the map are on screen for the
+/// whole session and do the same thing more slowly: a run on 2026-08-05 spent
+/// 219 of 400 reports on `Game3098*` and `Loader3` and never reached the cast
+/// FX.
+fn flicker_probe_covers(url: &str) -> bool {
+    match aqw_flicker_probe_filter() {
+        Some(filter) => filter
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .any(|part| url.contains(part)),
+        None => {
+            const NEVER_THE_SUBJECT: [&str; 4] =
+                ["charselect", "Game3098", "Loader3", "town-battleon"];
+            !NEVER_THE_SUBJECT.iter().any(|part| url.contains(part))
+        }
+    }
 }
 
 /// True when `url` has `segment` as a whole path segment, ignoring case, the
@@ -533,7 +564,15 @@ impl BitmapCache {
         let acceptable_size = (flash_acceptable_size && practical_acceptable_size)
             || (aqw_flash_acceptable_size && aqw_practical_acceptable_size);
 
-        if aqw_diagnostics_enabled() && !acceptable_size && !self.warned_for_oversize {
+        // The flicker probe reports a refused allocation as `has_texture=false`
+        // but cannot say why: it runs after `update`, and the sizes that decide
+        // this are the post-filter ones, which never leave here. Letting the
+        // probe arm this line too spares a run that reads "no texture" with no
+        // reason attached -- which is what the 2026-08-06 run was.
+        if (aqw_diagnostics_enabled() || aqw_flicker_probe_enabled())
+            && !acceptable_size
+            && !self.warned_for_oversize
+        {
             tracing::warn!(
                 target: "aqw_diag",
                 source_width,
@@ -1646,6 +1685,7 @@ static AQW_BLEND_LAYERS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// Avatar-asset subtrees switched to a bitmap cache, cumulative.
 pub(crate) static AQW_AVATAR_CACHES_ENABLED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
 
 /// Kill-switch: `RUFFLE_AQW_NO_AVATAR_CACHE` restores live re-rendering of
 /// avatar art every frame, for field A/B without a rebuild.
@@ -2828,28 +2868,8 @@ fn note_tint_progression<'gc>(this: DisplayObject<'gc>, context: &RenderContext<
     };
 
     let url = clip.movie().url().to_owned();
-    match aqw_flicker_probe_filter() {
-        Some(filter) => {
-            if !filter
-                .split(',')
-                .map(str::trim)
-                .filter(|part| !part.is_empty())
-                .any(|part| url.contains(part))
-            {
-                return;
-            }
-        }
-        // The subject is always a skill's own FX file. The game shell and the
-        // map are on screen the whole session and would spend the budget
-        // before the skill is ever cast -- the first run of this probe burned
-        // 219 of 400 slots on `Game3098*` and `Loader3` and never saw the FX.
-        None => {
-            const NEVER_THE_SUBJECT: [&str; 4] =
-                ["charselect", "Game3098", "Loader3", "town-battleon"];
-            if NEVER_THE_SUBJECT.iter().any(|part| url.contains(part)) {
-                return;
-            }
-        }
+    if !flicker_probe_covers(&url) {
+        return;
     }
 
     let color = context.transform_stack.transform().color_transform;
@@ -2958,30 +2978,8 @@ fn note_tint_mechanism<'gc>(this: DisplayObject<'gc>, context: &RenderContext<'_
     const MAX_REPORTS: usize = 4000;
 
     let url = this.movie().url().to_owned();
-    match aqw_flicker_probe_filter() {
-        Some(filter) => {
-            if !filter
-                .split(',')
-                .map(str::trim)
-                .filter(|part| !part.is_empty())
-                .any(|part| url.contains(part))
-            {
-                return;
-            }
-        }
-        // Unfiltered, the character-select screen alone spends the whole budget
-        // before the session is even in a room. It is never the subject, so it
-        // never gets to be the subject. The game shell and the map are on
-        // screen for the whole session and do the same thing more slowly: a
-        // run on 2026-08-05 spent 219 of these 400 reports on `Game3098*` and
-        // `Loader3` and never reached the cast FX.
-        None => {
-            const NEVER_THE_SUBJECT: [&str; 4] =
-                ["charselect", "Game3098", "Loader3", "town-battleon"];
-            if NEVER_THE_SUBJECT.iter().any(|part| url.contains(part)) {
-                return;
-            }
-        }
+    if !flicker_probe_covers(&url) {
+        return;
     }
 
     let blend = this.blend_mode();
@@ -3035,6 +3033,287 @@ fn note_tint_mechanism<'gc>(this: DisplayObject<'gc>, context: &RenderContext<'_
     );
 }
 
+thread_local! {
+    /// Per object: the last state `note_cache_decision` reported, and how many
+    /// lines it has spent.
+    ///
+    /// The first version keyed on (object, camera distance) and reported each
+    /// once. That cannot see the thing being chased -- art that is right and
+    /// then goes wrong again while the camera holds still -- because the key
+    /// does not change when that happens. It also spent its whole budget in 12
+    /// seconds, 96% of it on children inside bakes, and a budget that runs out
+    /// decides what you get to see.
+    static CACHE_DECISION_STATE:
+        std::cell::RefCell<std::collections::HashMap<usize, (u64, u32)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// A colour quantized coarsely enough that a fade -- which walks a multiplier a
+/// little every frame -- reports a few steps instead of a line per frame.
+fn coarse_colour(ct: &ColorTransform) -> (i8, i8, i8, i8, i8, i8) {
+    let step = |m: f32| (m * 8.0).round().clamp(-128.0, 127.0) as i8;
+    let add = |a: i16| (a / 32) as i8;
+    (
+        step(ct.r_multiply.to_f32()),
+        step(ct.g_multiply.to_f32()),
+        step(ct.b_multiply.to_f32()),
+        add(ct.r_add),
+        add(ct.g_add),
+        add(ct.b_add),
+    )
+}
+
+/// The names of up to `levels` ancestors, nearest first, for probe output.
+fn ancestor_names<'gc>(this: DisplayObject<'gc>, levels: usize) -> String {
+    let mut names = Vec::with_capacity(levels);
+    let mut node = this.parent();
+    while let Some(parent) = node {
+        if names.len() >= levels {
+            break;
+        }
+        names.push(
+            parent
+                .name()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        );
+        node = parent.parent();
+    }
+    names.join("<")
+}
+
+/// Log every colour written to filtered art, and who received it.
+///
+/// The cache-decision probe found cape instances whose tinted node carried
+/// identity colour through every bake of its life, alongside another instance
+/// of the same class, in the same room, that got its tint 0.2s after appearing.
+/// Two very different causes fit that -- the tint was written and then lost, or
+/// it was never written to that instance -- and the read side cannot tell them
+/// apart. A write that never happens leaves nothing to see.
+///
+/// Note the hole this does not cover: AVM2's `DisplayObject.transform` setter
+/// writes through `DisplayObjectBase::set_color_transform` directly rather than
+/// the trait method below, so a whole-transform assignment does not appear
+/// here. It invalidates the parent's cache on its own, so it is not a
+/// correctness gap, but a silent log is not proof on its own.
+fn note_colour_write<'gc>(this: DisplayObject<'gc>, new: &ColorTransform) {
+    const MAX_REPORTS: usize = 4000;
+
+    let movie = this.movie();
+    if !flicker_probe_covers(movie.url()) {
+        return;
+    }
+    static REPORTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if REPORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= MAX_REPORTS {
+        return;
+    }
+
+    let class = this
+        .object2()
+        .map(|o| {
+            use crate::avm2::object::TObject;
+            o.instance_class().name().local_name().to_string()
+        })
+        .unwrap_or_else(|| "-".to_string());
+    tracing::warn!(
+        target: "aqw_diag",
+        name = this.name().map(|n| n.to_string()).unwrap_or_default(),
+        class = class.as_str(),
+        depth = this.depth(),
+        holders = ancestor_names(this, 4).as_str(),
+        mult = format!(
+            "{:.3},{:.3},{:.3}",
+            new.r_multiply.to_f32(),
+            new.g_multiply.to_f32(),
+            new.b_multiply.to_f32()
+        ),
+        add = format!("{},{},{}", new.r_add, new.g_add, new.b_add),
+        movie = movie.url(),
+        "AQW colour written to this object"
+    );
+}
+
+/// Report how an object is drawn -- cache or vectors -- every time that answer,
+/// its texture, or its colour changes.
+///
+/// Item Color Custom comes out right with the camera close and wrong -- the
+/// untinted base art -- with it far, and goes wrong again the moment the camera
+/// moves after a zoom has put it right. A cache bakes its descendants' colour
+/// into the texture while vector rendering composes the tint live, which would
+/// explain a colour that depends on how the object is drawn and on nothing the
+/// content did.
+///
+/// What the first run established, on a Necromancer2016JuneDragonCape:
+///
+/// - the tint is an ordinary `ColorTransform`, on a descendant four levels down
+///   (`Symbol168_6`, multiply 0 / add 255,0,0). The note claiming AQW's tint
+///   does not arrive through `set_color_transform` was measured on skill FX and
+///   does not hold for items.
+/// - the cape's first bake ran while every child still carried identity colour,
+///   so that texture is untinted art. The tint appeared 1.2s later.
+/// - `wants_cache=true` with `has_texture=false` and non-zero `tex` was caught
+///   in the same run: `update` ran and the allocation was refused, which is
+///   `acceptable_size` and not `should_bypass_offscreen_bitmap_cache` -- the
+///   latter returns early, keeping the cache, whenever the bounds meet the
+///   view, so its limits only ever apply to art entirely off screen.
+///
+/// `tex` matters because "cached" alone does not mean a texture was composited:
+/// a cache whose allocation was refused holds none and renders as vectors too.
+///
+/// Reporting on change rather than once per camera distance is what the first
+/// run forced. The thing being chased is art that is right and then goes wrong
+/// while the camera holds still, and a key that does not move when that happens
+/// cannot record it.
+fn note_cache_decision<'gc>(
+    this: DisplayObject<'gc>,
+    context: &RenderContext<'_, 'gc>,
+    cache_info: Option<&DrawCacheInfo>,
+) {
+    // A line per state change is bounded by how much actually changes, so these
+    // only stop a pathological oscillator. One object that flips every frame
+    // must not be able to silence the rest, hence the per-object share.
+    const MAX_REPORTS_PER_OBJECT: u32 = 80;
+    const MAX_TRACKED: usize = 40000;
+
+    let movie = this.movie();
+    if !flicker_probe_covers(movie.url()) {
+        return;
+    }
+
+    let matrix = context.transform_stack.transform().matrix;
+    let scale = f64::from(matrix.a.abs().max(matrix.d.abs()));
+    if !scale.is_finite() {
+        return;
+    }
+
+    let outcome = match cache_info {
+        Some(info) if info.dirty => "cache-baked-now",
+        Some(_) => "cache-composited",
+        None => "vectors",
+    };
+    let mut has_texture = false;
+    let mut cache_size = (0u32, 0u32);
+    let mut has_cache = false;
+    if let Some(cache) = &*this.base().bitmap_cache_mut() {
+        has_cache = true;
+        has_texture = cache.bitmap.is_some();
+        cache_size = (cache.source_width, cache.source_height);
+    }
+    let composed = context.transform_stack.transform().color_transform;
+    let own = this.base().color_transform();
+
+    // The camera sits at a handful of distances, so bucketing by eighths keeps
+    // a slow drift from counting as a new state every frame.
+    let bucket = (scale * 8.0).round() as i32;
+    let state = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (
+            outcome,
+            has_texture,
+            has_cache,
+            cache_size,
+            bucket,
+            context.is_offscreen,
+            coarse_colour(&composed),
+            coarse_colour(&own),
+        )
+            .hash(&mut hasher);
+        hasher.finish()
+    };
+    let changed = CACHE_DECISION_STATE.with(|tracked| {
+        let mut tracked = tracked.borrow_mut();
+        let key = this.as_ptr() as usize;
+        if tracked.len() >= MAX_TRACKED && !tracked.contains_key(&key) {
+            return false;
+        }
+        match tracked.get_mut(&key) {
+            Some((last, spent)) => {
+                if *last == state || *spent >= MAX_REPORTS_PER_OBJECT {
+                    return false;
+                }
+                *last = state;
+                *spent += 1;
+                true
+            }
+            None => {
+                tracked.insert(key, (state, 1));
+                true
+            }
+        }
+    });
+    if !changed {
+        return;
+    }
+
+    let texture_size = if has_cache {
+        format!("{}x{}", cache_size.0, cache_size.1)
+    } else {
+        String::from("-")
+    };
+
+    let view = context.stage.view_matrix();
+    let view_scale = f64::from(view.a.abs().max(view.d.abs()));
+    let class = this
+        .object2()
+        .map(|o| {
+            use crate::avm2::object::TObject;
+            o.instance_class().name().local_name().to_string()
+        })
+        .unwrap_or_else(|| "-".to_string());
+
+    tracing::warn!(
+        target: "aqw_diag",
+        outcome,
+        // Read this first. Baking a cache renders the subtree again with
+        // `use_bitmap_cache` off for AQW, so every child inside a bake arrives
+        // here and reports `vectors` -- without this field, a properly cached
+        // item looks like a vector-drawn one from its children's lines alone.
+        offscreen = context.is_offscreen,
+        // Whether anything asked for a cache at all, which separates "not
+        // cached because nobody wanted one" from "wanted one and did not get
+        // a texture".
+        wants_cache = this.is_bitmap_cached(),
+        has_texture,
+        tex = texture_size.as_str(),
+        // The composed scale is what sizes the cache texture, and it moves with
+        // the window as well as the camera; the view scale is logged beside it
+        // so a zoom can be told from a resize.
+        scale = format!("{scale:.3}"),
+        view_scale = format!("{view_scale:.3}"),
+        name = this.name().map(|n| n.to_string()).unwrap_or_default(),
+        class = class.as_str(),
+        depth = this.depth(),
+        // Which avatar this belongs to. Instances of the same item class that
+        // behave differently are the whole puzzle, and the holder is the first
+        // thing that could distinguish them -- the player's own avatar from
+        // another player's, or one of AQW's offscreen holders.
+        holders = ancestor_names(this, 4).as_str(),
+        // Composed against own, the same split the tint probes use: a tint that
+        // shows up composed but not own was written above this object, and one
+        // that shows in neither was written below -- which is the case a cache
+        // bakes and this log cannot see directly.
+        mult = format!(
+            "{:.3},{:.3},{:.3}",
+            composed.r_multiply.to_f32(),
+            composed.g_multiply.to_f32(),
+            composed.b_multiply.to_f32()
+        ),
+        add = format!("{},{},{}", composed.r_add, composed.g_add, composed.b_add),
+        own = format!(
+            "{:.3},{:.3},{:.3}/{},{},{}",
+            own.r_multiply.to_f32(),
+            own.g_multiply.to_f32(),
+            own.b_multiply.to_f32(),
+            own.r_add,
+            own.g_add,
+            own.b_add
+        ),
+        movie = movie.url(),
+        "AQW cache decision at this camera distance"
+    );
+}
+
 pub fn render_base<'gc>(
     this: DisplayObject<'gc>,
     context: &mut RenderContext<'_, 'gc>,
@@ -3081,7 +3360,16 @@ pub fn render_base<'gc>(
         None
     };
 
-    let cache_info = if context.use_bitmap_cache && this.is_bitmap_cached() {
+    // A filtered object has no other way to get its filters applied, which is
+    // why `recheck_cache_as_bitmap` forces a cache on to anything carrying one.
+    // Inside an AQW bake `use_bitmap_cache` is off (see the offscreen context
+    // below), and without this exemption the filter would simply not happen.
+    // Kill-switch: `RUFFLE_AQW_NO_NESTED_FILTER_CACHE=1`.
+    let nested_filter_cache = !context.use_bitmap_cache
+        && !aqw_nested_filter_cache_disabled()
+        && !this.filters().is_empty();
+    let cache_info = if (context.use_bitmap_cache || nested_filter_cache) && this.is_bitmap_cached()
+    {
         let mut cache_info: Option<DrawCacheInfo> = None;
         let base_transform = context.transform_stack.transform();
         let allow_aqw_large_cache = is_aqw_movie_url(this.movie().url());
@@ -3401,6 +3689,13 @@ pub fn render_base<'gc>(
         None
     };
 
+    // Placed here rather than beside the other probes at the top of the
+    // function because this is the first point where the outcome exists: the
+    // preference, the size gates and the redraw budget have all had their say.
+    if aqw_flicker_probe_enabled() {
+        note_cache_decision(this, context, cache_info.as_ref());
+    }
+
     // We can't hold `cache` (which will hold `base`), so this is split up
     if let Some(cache_info) = cache_info {
         // In order to render an object to a texture, we need to draw its entire bounds.
@@ -3440,15 +3735,31 @@ pub fn render_base<'gc>(
                 is_offscreen: true,
                 // The outer cache already captures this subtree. Reusing child
                 // cacheAsBitmap objects here duplicates textures and can explode
-                // memory in crowded AQW rooms.
+                // memory in crowded AQW rooms. Filtered children are exempt:
+                // a filter is applied when a cache texture is drawn and the
+                // vector path has no step that applies one, so switching the
+                // cache off silently drops them -- and a ColorMatrixFilter is a
+                // colour operation, which is how an item can draw in the wrong
+                // colour for exactly as long as an ancestor is cached.
                 use_bitmap_cache: !is_aqw_movie_url(this.movie().url()),
-                dirty_cache_redraws_remaining: 0,
+                // Not zero, which is what the first attempt at that exemption
+                // (2026-08-06) tripped over: `try_reserve_*` refuses on a zero
+                // budget, so a nested cache that went dirty could never be
+                // admitted and composited its *stale* texture into the parent's
+                // -- art from another moment baked into everything. Deferring is
+                // never right in here anyway. It trades freshness for frame
+                // time across frames, and a bake is a single frame's work whose
+                // result is then held; a deferral inside one is not paid back,
+                // it is preserved. The allowance is unbounded because what can
+                // reach it is bounded already: only filtered children get a
+                // cache here at all.
+                dirty_cache_redraws_remaining: u32::MAX,
                 dirty_cache_redraws_reserved: 0,
-                dirty_cache_redraw_pixels_remaining: 0,
-                small_cache_redraws_remaining: 0,
+                dirty_cache_redraw_pixels_remaining: u64::MAX,
+                small_cache_redraws_remaining: u32::MAX,
                 small_cache_redraws_reserved: 0,
-                small_cache_redraw_pixels_remaining: 0,
-                aged_cache_redraws_remaining: 0,
+                small_cache_redraw_pixels_remaining: u64::MAX,
+                aged_cache_redraws_remaining: u32::MAX,
                 stage: context.stage,
             };
             this.render_self(&mut offscreen_context);
@@ -3877,7 +4188,11 @@ pub trait TDisplayObject<'gc>:
         // exists therefore keeps the untinted texture, and whether the tint
         // survives comes down to which happened first. That reads as the same
         // asset drawing in different colours from one instance to the next.
-        if self.base().set_color_transform(color_transform)
+        let changed = self.base().set_color_transform(color_transform);
+        if changed && aqw_flicker_probe_enabled() {
+            note_colour_write(self, &color_transform);
+        }
+        if changed
             && let Some(parent) = self.parent()
         {
             // Self-transform changes are handled when the cache is drawn, so

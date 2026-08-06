@@ -38,6 +38,20 @@ fn main_fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     var src: vec4<f32> = textureSample(current_texture, texture_sampler, in.src_uv);
 
     if (src.a > 0.0) {
+        // With nothing underneath, the backdrop contributes nothing and the
+        // formula below reduces to `src` -- but it gets there through
+        // `dst.rgb / dst.a`, which is 0/0. Defensive only: `multiply.wgsl` has
+        // always had this branch and the rest of the family had not, and 0/0 is
+        // undefined rather than guaranteed to fold away. Every blend image test
+        // is byte-identical with and without it, which also says the drivers
+        // tested here already fold `0.0 * x` to zero.
+        //
+        // Do not read this as a fix for anything: it was written on 2026-08-06
+        // chasing an AQW item whose colour is wrong while an ancestor is
+        // cached, and it did not change that symptom at all.
+        if (dst.a <= 0.0) {
+            return src;
+        }
         return vec4<f32>(src.rgb * (1.0 - dst.a) + dst.rgb * (1.0 - src.a) + src.a * dst.a * blend_func(src.rgb / src.a, dst.rgb / dst.a), src.a + dst.a * (1.0 - src.a));
     } else {
         if (true) {
