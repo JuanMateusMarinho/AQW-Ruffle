@@ -168,6 +168,14 @@ pub(crate) fn aqw_env_flag(name: &str, default: bool) -> bool {
     };
     let value = value.to_string_lossy();
     let value = value.trim();
+    // An empty value means unset. `$env:VAR = ""` is the obvious way to clear a
+    // switch in PowerShell but it leaves the variable defined and empty, and
+    // reading that as "set" silently keeps the switch on -- which invalidated
+    // several field A/Bs on 2026-08-05 before anyone noticed the runs were
+    // comparing a lever against itself.
+    if value.is_empty() {
+        return default;
+    }
     !(value == "0"
         || value.eq_ignore_ascii_case("false")
         || value.eq_ignore_ascii_case("off")
@@ -199,6 +207,37 @@ pub(crate) fn orphan_pending_disabled() -> bool {
 pub(crate) fn script_requeue_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_SCRIPT_REQUEUE", false))
+}
+/// Let every dirty cache redraw in the frame it goes dirty, instead of letting
+/// the budget defer it and compose the previous texture. **On by default.**
+/// `RUFFLE_AQW_NO_REDRAW_DEFER=0` restores deferral.
+///
+/// A deferred cache stands in with its last texture, and that texture carries
+/// the colour its contents had when it was rendered. For a skill FX whose
+/// colour is rewritten once as it is cast, the stand-in is the *old* colour --
+/// so the effect flashes between the two while instances take turns being
+/// admitted. That is the bug this addresses, and removing deferral is the only
+/// thing measured to remove it: four separate confirmations on 2026-08-05,
+/// including one unasked-for, when fixing an unrelated env-parsing bug silently
+/// re-enabled deferral and the flicker came back with it.
+///
+/// Bounding how long a cache may stay stale is not enough -- lowering the
+/// starvation threshold from 24 frames to 4 shortened each flash and removed
+/// none, because a stand-in is the wrong colour on its very first frame.
+///
+/// Cost, measured in the same session at 1080p fullscreen: submit time per
+/// frame went from 6.8-9.8 ms to 8.9-11.1 ms, against a 41.7 ms budget at
+/// 24fps. `redraw_large` rose from ~130-200 to ~190-235 per window, which is
+/// exactly the deferred work now being done on time.
+///
+/// **Not yet measured in a crowded room**, which is what the deferral budget
+/// was built for in the first place (event FX storms, full towns). If frame
+/// time suffers there, `RUFFLE_AQW_NO_REDRAW_DEFER=0` restores the old
+/// behaviour without a rebuild, and the real answer is likely a budget that
+/// reacts to actual frame cost rather than a fixed per-frame allowance.
+pub(crate) fn redraw_defer_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_REDRAW_DEFER", true))
 }
 
 /// The per-object flicker probes, which are too expensive to leave on the
@@ -1402,7 +1441,31 @@ const AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_PIXELS: u64 = 16_384;
 const AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_SIDE: u32 = 128;
 /// Consecutive deferred frames after which a starving cache may claim the
 /// aged-redraw quota (~1s at AQW's 24fps).
-const AQW_STALE_CACHE_AGED_FRAMES: u32 = 24;
+///
+/// Measured in fullscreen during a Wicked Purgatory cast on 2026-08-05:
+/// `defer_max` sits pinned at exactly this value while `starved` and
+/// `redraw_aged` are both ~3 against a quota of ~96 per window, so every
+/// deferred cache rides the threshold to the end and the rescue quota is
+/// almost entirely idle. Lowering it to 4 was tried on the strength of that:
+/// it bounded the staleness as intended and **did not** fix the wrong colours
+/// it was aimed at, while tripling aged redraws. A deferred cache composites
+/// the old colour on its very first frame, so shortening the wait shortens
+/// each flash and removes none -- duration was never what made it visible.
+/// Reverted rather than shipped, since it was cost without a demonstrated
+/// benefit.
+///
+/// `RUFFLE_AQW_STALE_CACHE_FRAMES=N` overrides, for calibrating in the field.
+const AQW_STALE_CACHE_AGED_FRAMES_DEFAULT: u32 = 24;
+
+fn aqw_stale_cache_aged_frames() -> u32 {
+    static FRAMES: OnceLock<u32> = OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("RUFFLE_AQW_STALE_CACHE_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(AQW_STALE_CACHE_AGED_FRAMES_DEFAULT)
+    })
+}
 
 /// How far (in twips, per axis) a deferred cache's live offset may drift from
 /// its stale anchor before the stale texture stops being a plausible stand-in.
@@ -1570,6 +1633,14 @@ static AQW_CACHE_REDRAWS_DEFERRED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static AQW_CACHE_STALE_FALLBACKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Longest run of consecutive deferred frames any one cache reached in the
+/// window: how stale the worst object on screen actually got, in frames.
+static AQW_CACHE_DEFER_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Deferrals of caches that were already past `aqw_stale_cache_aged_frames` and
+/// still lost -- the backlog queueing for the aged quota. Compared against
+/// `redraw_aged`, this says whether the threshold or the quota is the binding
+/// constraint, which want different fixes.
+static AQW_CACHE_STARVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AQW_BLEND_LAYERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Avatar-asset subtrees switched to a bitmap cache, cumulative.
@@ -2245,6 +2316,8 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         let redraw_aged = AQW_CACHE_REDRAWS_AGED.swap(0, Ordering::Relaxed);
         let redraw_deferred = AQW_CACHE_REDRAWS_DEFERRED.swap(0, Ordering::Relaxed);
         let stale_fallback = AQW_CACHE_STALE_FALLBACKS.swap(0, Ordering::Relaxed);
+        let defer_max = AQW_CACHE_DEFER_MAX.swap(0, Ordering::Relaxed);
+        let starved = AQW_CACHE_STARVED.swap(0, Ordering::Relaxed);
         let blend_layers = AQW_BLEND_LAYERS.swap(0, Ordering::Relaxed);
         let tick_orphan_ms = AQW_TICK_ORPHAN_NS.swap(0, Ordering::Relaxed) / 1_000_000;
         let tick_stage_ms = AQW_TICK_STAGE_NS.swap(0, Ordering::Relaxed) / 1_000_000;
@@ -2431,6 +2504,7 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
              avatar_roots={avatar_roots} \
              redraw_large={redraw_large} redraw_small={redraw_small} \
              redraw_aged={redraw_aged} redraw_deferred={redraw_deferred} \
+             defer_max={defer_max} starved={starved} \
              stale_fallback={stale_fallback} blend_layers={blend_layers} \
              tick_orphan_ms={tick_orphan_ms} tick_stage_ms={tick_stage_ms} \
              tick_bcast_ms={tick_bcast_ms} aqw_hook_ms={aqw_hook_ms} \
@@ -2698,6 +2772,174 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
+/// What `note_tint_progression` accumulates for one object across frames.
+struct TintProgress {
+    last_frame: u16,
+    frame_changes: u32,
+    last_color: ColorTransform,
+    color_changes: u32,
+    samples: u32,
+}
+
+thread_local! {
+    static TINT_PROGRESS: std::cell::RefCell<std::collections::HashMap<usize, TintProgress>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Keys already reported. Reported entries leave the map above so their
+    /// slot is reusable -- holding them there let long-lived scenery fill the
+    /// table and lock out every object that appeared afterwards, which is what
+    /// the FX under investigation always does.
+    static TINT_PROGRESS_DONE: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Follow a tinted object over time instead of photographing it once.
+///
+/// `note_tint_mechanism` already established what the wrong-coloured instances
+/// carry: a colour transform, tweened from a darkened base toward blue, and the
+/// orange ones sit at the base value. It cannot say *why* they sit there,
+/// because it reports each object once. This one films: it counts how often the
+/// clip's own timeline advances and how often the composed colour changes, then
+/// reports both.
+///
+/// The two outcomes want opposite fixes, which is the whole point of measuring
+/// before writing another one:
+///
+/// - frames advancing but the colour never changing means the tween does not
+///   come from this clip's timeline, so nothing that freezes this clip is
+///   responsible and the source of the transform is the thing to find.
+/// - frames not advancing means this clip is stuck, and `playing` splits that
+///   again: stopped by content versus still playing but not being stepped.
+fn note_tint_progression<'gc>(this: DisplayObject<'gc>, context: &RenderContext<'_, 'gc>) {
+    // 48 samples is two seconds at 24fps, and a cast FX can be gone before
+    // that -- a threshold the subject cannot reach is a threshold that decides
+    // what you see, the same way a low cap does. 16 is still long enough for a
+    // tween to visibly progress.
+    const SAMPLES_BEFORE_REPORT: u32 = 16;
+    // Both caps were reached on 2026-08-05 while the wrong-coloured instances
+    // were on screen, and a cap that is reached stops reporting for the rest of
+    // the session -- so everything after it is invisible. A session's worth of
+    // these lines is a couple of MB, which is nothing next to missing the
+    // subject for the third run in a row.
+    const MAX_TRACKED: usize = 8192;
+    const MAX_REPORTS: usize = 4000;
+
+    let Some(clip) = this.as_movie_clip() else {
+        return;
+    };
+
+    let url = clip.movie().url().to_owned();
+    match aqw_flicker_probe_filter() {
+        Some(filter) => {
+            if !filter
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .any(|part| url.contains(part))
+            {
+                return;
+            }
+        }
+        // The subject is always a skill's own FX file. The game shell and the
+        // map are on screen the whole session and would spend the budget
+        // before the skill is ever cast -- the first run of this probe burned
+        // 219 of 400 slots on `Game3098*` and `Loader3` and never saw the FX.
+        None => {
+            const NEVER_THE_SUBJECT: [&str; 4] =
+                ["charselect", "Game3098", "Loader3", "town-battleon"];
+            if NEVER_THE_SUBJECT.iter().any(|part| url.contains(part)) {
+                return;
+            }
+        }
+    }
+
+    let color = context.transform_stack.transform().color_transform;
+    if color == Default::default() {
+        return;
+    }
+    let own_color = this.base().color_transform();
+
+    let frame = clip.current_frame();
+    let key = this.as_ptr() as usize;
+    if TINT_PROGRESS_DONE.with(|done| done.borrow().contains(&key)) {
+        return;
+    }
+    let report = TINT_PROGRESS.with(|tracked| {
+        let mut tracked = tracked.borrow_mut();
+        if tracked.len() >= MAX_TRACKED && !tracked.contains_key(&key) {
+            return None;
+        }
+        let entry = tracked.entry(key).or_insert(TintProgress {
+            last_frame: frame,
+            frame_changes: 0,
+            last_color: color,
+            color_changes: 0,
+            samples: 0,
+        });
+        if entry.last_frame != frame {
+            entry.last_frame = frame;
+            entry.frame_changes += 1;
+        }
+        if entry.last_color != color {
+            entry.last_color = color;
+            entry.color_changes += 1;
+        }
+        entry.samples += 1;
+        if entry.samples < SAMPLES_BEFORE_REPORT {
+            return None;
+        }
+        let counts = (entry.frame_changes, entry.color_changes);
+        tracked.remove(&key);
+        TINT_PROGRESS_DONE.with(|done| done.borrow_mut().insert(key));
+        Some(counts)
+    });
+    let Some((frame_changes, color_changes)) = report else {
+        return;
+    };
+
+    static REPORTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if REPORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= MAX_REPORTS {
+        return;
+    }
+
+    tracing::warn!(
+        target: "aqw_diag",
+        name = this.name().map(|n| n.to_string()).unwrap_or_default(),
+        depth = this.depth(),
+        frame,
+        frame_changes,
+        color_changes,
+        playing = clip.playing(),
+        mult = format!(
+            "{:.3},{:.3},{:.3}",
+            color.r_multiply.to_f32(),
+            color.g_multiply.to_f32(),
+            color.b_multiply.to_f32()
+        ),
+        add = format!("{},{},{}", color.r_add, color.g_add, color.b_add),
+        // The composed transform above cannot say *where* the colour was
+        // written. This is the object's own, and the two split the remaining
+        // explanations: differing here means the write is per instance and some
+        // are skipped; identical here, with the composed values differing,
+        // means the write is on an ancestor and the wrong-coloured instances
+        // hang off a different one.
+        own = format!(
+            "{:.3},{:.3},{:.3}/{},{},{}",
+            own_color.r_multiply.to_f32(),
+            own_color.g_multiply.to_f32(),
+            own_color.b_multiply.to_f32(),
+            own_color.r_add,
+            own_color.g_add,
+            own_color.b_add
+        ),
+        parent = this
+            .parent()
+            .and_then(|p| p.name().map(|n| n.to_string()))
+            .unwrap_or_default(),
+        movie = url.as_str(),
+        "AQW tint progression over 48 samples"
+    );
+}
+
 /// Report how a tinted object is actually tinted.
 ///
 /// Two instances of one asset drawing in different colours in the same frame
@@ -2710,8 +2952,10 @@ fn note_tint_mechanism<'gc>(this: DisplayObject<'gc>, context: &RenderContext<'_
     // Each object reports once, so the cap only exists to bound a pathological
     // scene. The first version set it at 40 and the whole budget was spent on
     // startup objects before the skill under investigation was ever cast --
-    // a cap low enough to be reached is a cap that decides what you see.
-    const MAX_REPORTS: usize = 400;
+    // a cap low enough to be reached is a cap that decides what you see. 400
+    // was reached too, on 2026-08-05, in a run where the wrong-coloured FX was
+    // on screen and went unrecorded.
+    const MAX_REPORTS: usize = 4000;
 
     let url = this.movie().url().to_owned();
     match aqw_flicker_probe_filter() {
@@ -2727,9 +2971,14 @@ fn note_tint_mechanism<'gc>(this: DisplayObject<'gc>, context: &RenderContext<'_
         }
         // Unfiltered, the character-select screen alone spends the whole budget
         // before the session is even in a room. It is never the subject, so it
-        // never gets to be the subject.
+        // never gets to be the subject. The game shell and the map are on
+        // screen for the whole session and do the same thing more slowly: a
+        // run on 2026-08-05 spent 219 of these 400 reports on `Game3098*` and
+        // `Loader3` and never reached the cast FX.
         None => {
-            if url.contains("charselect") {
+            const NEVER_THE_SUBJECT: [&str; 4] =
+                ["charselect", "Game3098", "Loader3", "town-battleon"];
+            if NEVER_THE_SUBJECT.iter().any(|part| url.contains(part)) {
                 return;
             }
         }
@@ -2817,6 +3066,7 @@ pub fn render_base<'gc>(
             note_position_oscillation(this, context);
             note_map_clip_animation(this);
             note_tint_mechanism(this, context);
+            note_tint_progression(this, context);
         }
     }
 
@@ -2957,7 +3207,7 @@ pub fn render_base<'gc>(
                         // lose the race every frame and stay stale indefinitely. Let
                         // long-starved caches through a small reserved quota.
                         if !can_redraw_cache
-                            && cache.deferred_frames >= AQW_STALE_CACHE_AGED_FRAMES
+                            && cache.deferred_frames >= aqw_stale_cache_aged_frames()
                             && context.try_reserve_aged_cache_redraw()
                         {
                             can_redraw_cache = true;
@@ -3045,6 +3295,16 @@ pub fn render_base<'gc>(
                             cache.deferred_frames = cache.deferred_frames.saturating_add(1);
                             AQW_CACHE_REDRAWS_DEFERRED
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if aqw_diagnostics_enabled() {
+                                AQW_CACHE_DEFER_MAX.fetch_max(
+                                    cache.deferred_frames as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                if cache.deferred_frames >= aqw_stale_cache_aged_frames() {
+                                    AQW_CACHE_STARVED
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
                             // A stale texture only stands in convincingly while the
                             // object's bounds still sit near where its contents were
                             // rendered. A fast animation (a weapon swing) moves them
@@ -3626,7 +3886,12 @@ pub trait TDisplayObject<'gc>:
             // Exempting these from the redraw budget was tried and reverted:
             // content animates colour (fades) every frame, so "the colour
             // changed" is true almost always, and the exemption removed the
-            // budget rather than making an exception to it.
+            // budget rather than making an exception to it. The mark below is
+            // not that: the budget still applies, and a cache that loses the
+            // race still waits. What it stops is the *stale texture* standing
+            // in while it waits, which for colour is a visible flash in the old
+            // colour. Such a cache renders as vectors until it is admitted --
+            // the same escape the drift guard already takes for position.
             parent.invalidate_cached_bitmap();
         }
     }

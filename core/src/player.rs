@@ -2129,6 +2129,7 @@ impl Player {
             // detached at its stale anchor mid-swing. Hard pressure throttles
             // small FX too (stale but bounded), still leaving a trickle.
             let vram_pressure = crate::display_object::aqw_vram_pressure();
+            let no_defer = crate::display_object::redraw_defer_disabled();
             // Note: both pixel budgets below are deliberately in *screen*
             // pixels, NOT scaled by the view matrix. They bound actual GPU
             // fill/filter work per frame, which is what crowded fullscreen
@@ -2146,23 +2147,31 @@ impl Player {
                 is_offscreen: false,
                 use_bitmap_cache: true,
                 dirty_cache_redraws_remaining: match vram_pressure {
+                    _ if no_defer => u32::MAX,
                     0 => AQW_DIRTY_CACHE_REDRAWS_PER_FRAME,
                     1 => 2,
                     _ => 0,
                 },
                 dirty_cache_redraws_reserved: 0,
                 dirty_cache_redraw_pixels_remaining: match vram_pressure {
+                    _ if no_defer => u64::MAX,
                     0 => AQW_DIRTY_CACHE_REDRAW_PIXELS_PER_FRAME,
                     1 => AQW_DIRTY_CACHE_REDRAW_PIXELS_PER_FRAME / 2,
                     _ => 0,
                 },
                 small_cache_redraws_remaining: match vram_pressure {
+                    _ if no_defer => u32::MAX,
                     0 | 1 => aqw_small_cache_redraw_budget(),
                     _ => 8,
                 },
                 small_cache_redraws_reserved: 0,
-                small_cache_redraw_pixels_remaining: aqw_small_cache_redraw_pixel_budget(),
+                small_cache_redraw_pixels_remaining: if no_defer {
+                    u64::MAX
+                } else {
+                    aqw_small_cache_redraw_pixel_budget()
+                },
                 aged_cache_redraws_remaining: match vram_pressure {
+                    _ if no_defer => u32::MAX,
                     0 | 1 => aqw_aged_cache_redraw_budget(),
                     _ => 1,
                 },
