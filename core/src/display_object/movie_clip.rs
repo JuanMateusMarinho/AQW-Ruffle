@@ -167,6 +167,82 @@ fn aqw_subtree_has_avatar_asset<'gc>(obj: DisplayObject<'gc>, budget: &mut u32) 
     false
 }
 
+/// Kill-switch for the *inert* half of the orphan freeze, so the widened
+/// predicate can be A/B'd in the field against the avatar-art one it was added
+/// beside. `RUFFLE_AQW_NO_INERT_ORPHAN_FREEZE=1` leaves only the art freeze.
+fn aqw_inert_orphan_freeze_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        crate::display_object::aqw_env_flag("RUFFLE_AQW_NO_INERT_ORPHAN_FREEZE", false)
+    })
+}
+
+/// Nodes the inert probe may visit before it gives up. Inventory rows and item
+/// icons -- what the census found the list is actually made of -- are a handful
+/// of nodes each, so this is generous for the case it exists to catch.
+const AQW_ORPHAN_INERT_PROBE_BUDGET: u32 = 128;
+
+/// Ticks an orphan must survive before the *inert* freeze may engage (~1s).
+///
+/// The art freeze waits 5s because it cannot tell a subtree that is mid-init
+/// from one that is finished -- the grace is standing in for a guarantee it
+/// does not have. The inert probe *is* that guarantee: nothing under here is
+/// playing, holds a queued script, or still needs constructing. Measured
+/// 2026-08-07: with the 5s grace, scrolling the inventory replenishes the list
+/// faster than it drains, so ~1400 orphans are always inside the grace and the
+/// phase stayed at 1666ms even with 1592 subtrees frozen.
+const AQW_ORPHAN_INERT_GRACE_TICKS: u16 = 24;
+
+/// Ticks between re-probes of a subtree already frozen as inert (~0.7s).
+///
+/// The avatar-art verdict is cached forever because it only ever becomes more
+/// true: art parents into the chassis asynchronously, it does not leave.
+/// Inertness is not like that -- AS3 can call `play()` on a detached clip -- and
+/// a frozen clip is not visited, so nothing else would ever notice. Re-probing
+/// while the freeze *holds* is what bounds that, and it is affordable: the
+/// probe is a fraction of one pass, amortised over 16 ticks, against the three
+/// full passes it replaces.
+const AQW_ORPHAN_INERT_REPROBE_TICKS: u16 = 16;
+
+/// Bounded depth-first answer to "will anything in this subtree advance?".
+///
+/// `None` means the walk hit its budget before it could be sure, and the caller
+/// must read that as "maybe". This is the opposite of
+/// `aqw_subtree_has_avatar_asset` above, where exhausting the budget yields
+/// `false` and the safe thing follows from it -- no art found, no freeze. Here
+/// a truncated walk returning `false` would freeze a subtree that is still
+/// animating, so truncation has to refuse instead.
+fn aqw_subtree_will_advance<'gc>(obj: DisplayObject<'gc>, budget: &mut u32) -> Option<bool> {
+    if *budget == 0 {
+        return None;
+    }
+    *budget -= 1;
+    // One test per pass the freeze skips, which is the whole point: `playing`
+    // for `enter_frame`, `has_pending_script` for `run_frame_scripts`, and
+    // `needs_frame_construction` for `construct_frame`. Leaving the last one
+    // out is what would let a child added to a frozen subtree -- a Loader
+    // completing into it, say -- sit there with no AVM2 object forever, since
+    // a stopped new child is not playing and has no script queued either, so
+    // nothing would ever unfreeze it.
+    if let Some(clip) = obj.as_movie_clip()
+        && (clip.playing() || clip.has_pending_script())
+    {
+        return Some(true);
+    }
+    if obj.needs_frame_construction() {
+        return Some(true);
+    }
+    if let Some(container) = obj.as_container() {
+        for child in container.iter_render_list() {
+            match aqw_subtree_will_advance(child, budget) {
+                Some(false) => {}
+                verdict => return verdict,
+            }
+        }
+    }
+    Some(false)
+}
+
 /// Kill-switch for the injected "CRT Filter" Options-menu row, so it can be
 /// turned off in the field without a rebuild if it ever misbehaves.
 fn aqw_crt_menu_disabled() -> bool {
@@ -3896,7 +3972,9 @@ impl<'gc> MovieClip<'gc> {
         }
         let ticks = self.0.aqw_orphan_ticks.get().saturating_add(1);
         self.0.aqw_orphan_ticks.set(ticks);
-        if ticks < AQW_ORPHAN_FREEZE_GRACE_TICKS {
+        // The shorter of the two graces gates getting here at all; the art
+        // probe below still waits for its own.
+        if ticks < AQW_ORPHAN_INERT_GRACE_TICKS {
             return false;
         }
         match self.0.aqw_orphan_freeze.get() {
@@ -3905,21 +3983,103 @@ impl<'gc> MovieClip<'gc> {
             // item SWFs load, so a "no avatar art" verdict is re-probed
             // periodically instead of cached forever.
             2 if !ticks.is_multiple_of(64) => false,
+            // Frozen as inert. Unlike the art verdict this one can stop being
+            // true, so it is re-probed while it holds rather than only while it
+            // fails; see `AQW_ORPHAN_INERT_REPROBE_TICKS`.
+            3 if !ticks.is_multiple_of(AQW_ORPHAN_INERT_REPROBE_TICKS) => true,
             _ => {
                 let mut budget = 128u32;
-                let freeze = aqw_subtree_has_avatar_asset(self.into(), &mut budget);
-                self.0.aqw_orphan_freeze.set(if freeze { 1 } else { 2 });
-                freeze
+                if ticks >= AQW_ORPHAN_FREEZE_GRACE_TICKS
+                    && aqw_subtree_has_avatar_asset(self.into(), &mut budget)
+                {
+                    self.0.aqw_orphan_freeze.set(1);
+                    return true;
+                }
+                // Measured 2026-08-07: 84% of a post-inventory orphan list is
+                // `LPFElementListItemItem` rows and `ii*`/`iw*` item icons, all
+                // from `Game3098*.swf` and `Assets_*.swf` -- so the art
+                // predicate above matched 11 of 3110 and the phase cost 86% of
+                // a core. Freezing on *structure* rather than on which file the
+                // art came from is what covers them, and it survives an AQW
+                // update in a way matching those class names would not.
+                let inert = !aqw_inert_orphan_freeze_disabled() && {
+                    let mut budget = AQW_ORPHAN_INERT_PROBE_BUDGET;
+                    aqw_subtree_will_advance(self.into(), &mut budget) == Some(false)
+                };
+                self.0.aqw_orphan_freeze.set(if inert { 3 } else { 2 });
+                inert
             }
+        }
+    }
+
+    /// Consecutive ticks this clip has been processed as an orphan, for the
+    /// census's age buckets. Read against the freeze's own grace period: an
+    /// orphan older than that is one the freeze looked at and declined.
+    pub(crate) fn aqw_orphan_age_ticks(self) -> u16 {
+        self.0.aqw_orphan_ticks.get()
+    }
+
+    /// Whether this clip is frozen as *inert* rather than as avatar art, so the
+    /// census can show the widened predicate's share of the freezes.
+    pub(crate) fn aqw_orphan_frozen_inert(self) -> bool {
+        self.0.aqw_orphan_freeze.get() == 3 && self.aqw_orphan_frozen()
+    }
+
+    /// Classify one orphan for the sweep's population columns.
+    ///
+    /// Called once per tick per orphan, from the Enter pass, and only under
+    /// diagnostics. Answers the question the 2026-08-07 measurement left open:
+    /// 3010 orphans cost 1720ms per window and only ~200 of them freeze, so
+    /// either the other 2800 are doing real work -- and no skip is available --
+    /// or they are inert in a way the avatar-art predicate simply does not
+    /// describe, and the freeze can be widened to cover them.
+    ///
+    /// `quiet` is the freeze-shaped test: a clip that is not advancing and has
+    /// no frame script queued has nothing for the three passes to find. It is
+    /// deliberately about this clip only, not its subtree -- the subtree
+    /// question is the *other* candidate, and the sweep's `orph_clean_*` pair
+    /// answers that one separately.
+    pub(crate) fn aqw_note_orphan_shape(self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let playing = self.playing();
+        let pending_script = self.has_pending_script();
+        super::AQW_ORPHAN_POP.fetch_add(1, Relaxed);
+        if playing {
+            super::AQW_ORPHAN_POP_PLAYING.fetch_add(1, Relaxed);
+        }
+        if pending_script {
+            super::AQW_ORPHAN_POP_SCRIPT.fetch_add(1, Relaxed);
+        }
+        if self.is_aqw_avatar_asset_root() {
+            super::AQW_ORPHAN_POP_AVATAR.fetch_add(1, Relaxed);
+        }
+        if !playing && !pending_script {
+            super::AQW_ORPHAN_POP_QUIET.fetch_add(1, Relaxed);
         }
     }
 
     /// Read-only companion to `update_aqw_orphan_freeze` for the construct
     /// and frame-script orphan passes, so every phase of one tick agrees.
+    ///
+    /// Both freeze verdicts count. Reading only the avatar-art one (`1`) is
+    /// what the widened freeze shipped with on its first build: the Enter pass
+    /// froze 1604 of 1801 orphans and skipped them, and then these two passes
+    /// walked every one of them anyway, because they asked a question that
+    /// still meant "is this avatar art". Two thirds of the work survived a
+    /// freeze that looked, in the counters, like it was working -- the phase
+    /// only halved. This is the same trap the V2.5 notes name: the signal has
+    /// to mirror exactly the condition the consumer acts on.
     pub(crate) fn aqw_orphan_frozen(self) -> bool {
-        self.0.aqw_orphan_freeze.get() == 1
-            && self.0.aqw_orphan_ticks.get() >= AQW_ORPHAN_FREEZE_GRACE_TICKS
-            && !aqw_orphan_freeze_disabled()
+        let ticks = self.0.aqw_orphan_ticks.get();
+        // Each verdict against its own grace. Sharing one here while the
+        // decider used two is the same disagreement that let the construct and
+        // frame-script passes walk everything the Enter pass had frozen.
+        let held = match self.0.aqw_orphan_freeze.get() {
+            1 => ticks >= AQW_ORPHAN_FREEZE_GRACE_TICKS,
+            3 => ticks >= AQW_ORPHAN_INERT_GRACE_TICKS,
+            _ => false,
+        };
+        held && !aqw_orphan_freeze_disabled()
     }
 }
 

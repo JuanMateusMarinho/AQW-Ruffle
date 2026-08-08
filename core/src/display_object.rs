@@ -323,6 +323,120 @@ fn is_aqw_movie_url(url: &str) -> bool {
     url_path_has_segment(url, "gamefiles")
 }
 
+/// The last path segment of `url`, for grouping art by file.
+fn url_basename(url: &str) -> &str {
+    url.split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .rsplit('/')
+        .next()
+        .unwrap_or(url)
+}
+
+/// Tally `items` and render the busiest `limit` as `name:count`.
+fn top_counts(items: impl IntoIterator<Item = String>, limit: usize) -> String {
+    let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for item in items {
+        *counts.entry(item).or_insert(0) += 1;
+    }
+    let mut counts: Vec<(String, u64)> = counts.into_iter().collect();
+    counts.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    counts.truncate(limit);
+    counts
+        .into_iter()
+        .map(|(name, count)| format!("{name}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Name the orphan list: what these objects are, and how long they have been
+/// there.
+///
+/// The population probe answered "are they inert" (2994 of 2998 neither playing
+/// nor holding a queued script) but not "what are they". That gap is what
+/// decides the only remaining cheap fix. The freeze is the right shape for this
+/// -- it stops the per-frame cost without releasing anything, so it cannot
+/// reproduce the #1009 storms that every actual release attempt caused (see the
+/// avatar-retention notes) -- but it currently only matches avatar-asset art,
+/// and the probe measured just 11 of 3035 orphans matching that. Widening it
+/// safely means knowing what the other 3024 are.
+///
+/// The orphan manager already records the half of this that was known: AQW does
+/// not release an avatar mid-session. That explains retention, not the class of
+/// object, and the freeze predicate needs the class.
+///
+/// Once per sweep, so a 3000-entry walk and its strings cost once a second.
+fn aqw_report_orphan_census(context: &UpdateContext<'_>) {
+    use crate::avm2::object::TObject;
+
+    let orphans = context.orphan_manager.all_orphans(context.gc());
+    let total = orphans.len();
+    if total == 0 {
+        return;
+    }
+
+    let (mut clips, mut constructed, mut frozen, mut quiet, mut playing) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
+    // Of the freezes, how many the widened (structural) predicate accounts for
+    // rather than the avatar-art one.
+    let mut frozen_inert = 0u64;
+    // Ticks on the orphan list, bucketed at AQW's 24fps: under a second, under
+    // the freeze's own 5s grace, under 25s, and everything that outlived that.
+    let mut age = [0u64; 4];
+    let mut classes: Vec<String> = Vec::with_capacity(total);
+    let mut movies: Vec<String> = Vec::with_capacity(total);
+
+    for orphan in &orphans {
+        classes.push(
+            orphan
+                .object2()
+                .map(|o| o.instance_class().name().local_name().to_string())
+                .unwrap_or_else(|| "<unconstructed>".to_string()),
+        );
+        movies.push(url_basename(orphan.movie().url()).to_string());
+        if orphan.object2().is_some() {
+            constructed += 1;
+        }
+        if let Some(clip) = orphan.as_movie_clip() {
+            clips += 1;
+            if clip.aqw_orphan_frozen() {
+                frozen += 1;
+                if clip.aqw_orphan_frozen_inert() {
+                    frozen_inert += 1;
+                }
+            }
+            if clip.playing() {
+                playing += 1;
+            } else if !clip.has_pending_script() {
+                quiet += 1;
+            }
+            let ticks = clip.aqw_orphan_age_ticks();
+            let bucket = match ticks {
+                0..=23 => 0,
+                24..=119 => 1,
+                120..=599 => 2,
+                _ => 3,
+            };
+            age[bucket] += 1;
+        }
+    }
+
+    tracing::info!(
+        target: "aqw_diag",
+        total,
+        clips,
+        constructed,
+        frozen,
+        frozen_inert,
+        playing,
+        quiet,
+        age = format!("<1s:{},<5s:{},<25s:{},older:{}", age[0], age[1], age[2], age[3]).as_str(),
+        by_class = top_counts(classes, 8).as_str(),
+        by_movie = top_counts(movies, 8).as_str(),
+        "AQW orphan census"
+    );
+}
+
 /// Report the URL gates that every game-specific path here hangs off.
 ///
 /// All of them fail closed and silent, so a game update that moved its asset
@@ -499,6 +613,43 @@ impl BitmapCache {
             || self.source_width != source_width
             || self.source_height != source_height
             || self.bitmap.is_none()
+    }
+
+    /// Which of `is_dirty`'s conditions fired, for the sweep's `dirty_*`
+    /// columns.
+    ///
+    /// Measured 2026-08-07: restoring the redraw budget cut admitted small
+    /// redraws from ~45 to ~5 per frame while `redraw_deferred` stayed at zero.
+    /// Deferral cannot do that -- a deferred redraw is a *refused* one and
+    /// would show up as deferred -- so the caches were not going dirty in the
+    /// first place, and the budget is not what decides that. This says which of
+    /// the three conditions is actually firing.
+    ///
+    /// Ordered by how much each explains, not by how `is_dirty` evaluates them.
+    /// A missing texture is the one that would point somewhere other than the
+    /// content: nothing the art does removes a texture, but `clear()` on the
+    /// offscreen-cache bypass does, and that bypass has a known coordinate-space
+    /// defect that makes it fire on art which is plainly on screen.
+    fn dirty_reason(
+        &self,
+        other: &Matrix,
+        source_width: u32,
+        source_height: u32,
+    ) -> Option<CacheDirtyReason> {
+        if self.bitmap.is_none() {
+            return Some(CacheDirtyReason::NoTexture);
+        }
+        if self.source_width != source_width || self.source_height != source_height {
+            return Some(CacheDirtyReason::Size);
+        }
+        if self.matrix_a != other.a
+            || self.matrix_b != other.b
+            || self.matrix_c != other.c
+            || self.matrix_d != other.d
+        {
+            return Some(CacheDirtyReason::Matrix);
+        }
+        None
     }
 
     /// Clears any dirtiness and ensure there's an appropriately sized texture allocated
@@ -1752,6 +1903,92 @@ pub(crate) static AQW_TICK_BCAST_NS: std::sync::atomic::AtomicU64 =
 pub(crate) static AQW_ORPHANS_FROZEN: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Why a bitmap cache was found dirty, for the sweep's `dirty_*` columns.
+#[derive(Copy, Clone)]
+pub(crate) enum CacheDirtyReason {
+    /// The cache holds no texture, so there is nothing to composite and the
+    /// redraw is forced. Nothing the content does causes this -- only a
+    /// `clear()`, or an allocation that was refused.
+    NoTexture,
+    /// The subtree's pixel size changed.
+    Size,
+    /// The composed transform changed: the object moved or scaled, or the
+    /// window resized under it.
+    Matrix,
+}
+
+/// Dirty-cache attribution, plus how many caches the offscreen-cache bypass
+/// threw away.
+///
+/// `dirty_notex` tracking `bypass_cleared` is the signature to look for: a
+/// cache cleared and then immediately rebuilt is work the content never asked
+/// for, and the bypass that clears it compares two different coordinate spaces
+/// (`render_bounds_with_transform`, which carries the viewport matrix, against
+/// `stage.view_bounds()`, which does not). At the view scale this fork runs, the
+/// rectangle it calls "on screen" is a fraction of the stage, so art in plain
+/// view is judged off it.
+pub(crate) static AQW_CACHE_DIRTY_NOTEX: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_CACHE_DIRTY_SIZE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_CACHE_DIRTY_MATRIX: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_CACHE_BYPASS_CLEARED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// What the orphan list is made of, and what a skip could win.
+///
+/// Measured 2026-08-07: opening the inventory and switching class takes the
+/// orphan list from ~105 to 3010 and `tick_orphan_ms` from ~240 to 1720 per
+/// ~2s window -- 86% of a core, on a CPU whose single-core speed is AQW's real
+/// cap -- and neither number comes back down for the rest of the session. Only
+/// ~200 of those orphans are frozen, because the V1.4 freeze only matches
+/// avatar art. The history says this is chronic rather than new: past sessions
+/// peak at 3000-5700 orphans and 1800-2800ms.
+///
+/// Two candidate fixes need different facts, so this measures both at once:
+///
+/// - widening the *freeze* (low risk, the mechanism and its kill-switch exist)
+///   needs the population split -- how many orphans are inert and why.
+/// - extending the V2.5 subtree mark to the ordinary tick (it is deliberately
+///   nested-goto-only, see `can_skip_frame_pass`, because the ordinary frame is
+///   the safety net for a mark the scheme fails to set) needs the *prize*:
+///   `orph_clean_ms` is the time that a mark-driven skip would not have spent.
+///
+/// Population counters are per tick, from the Enter pass; the `_ns` pair covers
+/// all three passes. Diagnostics-only: one timer pair per orphan visit.
+pub(crate) static AQW_ORPHAN_POP: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_ORPHAN_POP_PLAYING: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_ORPHAN_POP_SCRIPT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_ORPHAN_POP_AVATAR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_ORPHAN_POP_QUIET: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_ORPHAN_CLEAN_VISITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_ORPHAN_DIRTY_VISITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_ORPHAN_CLEAN_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_ORPHAN_DIRTY_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Bill one orphan visit to the clean/dirty split, `clean` being what the V2.5
+/// subtree mark says about it.
+pub(crate) fn aqw_note_orphan_visit(clean: bool, elapsed_ns: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if clean {
+        AQW_ORPHAN_CLEAN_VISITS.fetch_add(1, Relaxed);
+        AQW_ORPHAN_CLEAN_NS.fetch_add(elapsed_ns, Relaxed);
+    } else {
+        AQW_ORPHAN_DIRTY_VISITS.fetch_add(1, Relaxed);
+        AQW_ORPHAN_DIRTY_NS.fetch_add(elapsed_ns, Relaxed);
+    }
+}
+
 /// AS3 clips whose timeline actually advanced in `enter_frame`, against
 /// `aqw_clips` (every clip walked).
 ///
@@ -2172,6 +2409,13 @@ fn render_aqw_scaling_grid<'gc>(
     let src_y = [bounds.y_min, grid.y_min, grid.y_max, bounds.y_max];
     let old_use_bitmap_cache = context.use_bitmap_cache;
     context.use_bitmap_cache = false;
+    // Each slice draws the subtree under its own matrix, so a cache down there
+    // is dirty on nearly every one of the nine and would be baked -- and often
+    // reallocated -- nine times a frame. That is why this path clears the flag
+    // above, and the filter exemption has to be cleared with it: a panel drawn
+    // inside a bake arrives here with it set.
+    let old_cache_filtered_children = context.cache_filtered_children;
+    context.cache_filtered_children = false;
 
     let mut slice_options = options;
     slice_options.apply_transform = false;
@@ -2219,6 +2463,7 @@ fn render_aqw_scaling_grid<'gc>(
     }
 
     context.use_bitmap_cache = old_use_bitmap_cache;
+    context.cache_filtered_children = old_cache_filtered_children;
     true
 }
 
@@ -2324,6 +2569,7 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
     LAST_CACHE_BYTES.store(cache_bytes, std::sync::atomic::Ordering::Relaxed);
 
     if diagnostics {
+        aqw_report_orphan_census(context);
         let orphans = context.orphan_manager.len();
         let loaders = context.load_manager.len();
         let cache_mb = cache_bytes / (1024 * 1024);
@@ -2363,6 +2609,23 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         let tick_stage_ms = AQW_TICK_STAGE_NS.swap(0, Ordering::Relaxed) / 1_000_000;
         let tick_bcast_ms = AQW_TICK_BCAST_NS.swap(0, Ordering::Relaxed) / 1_000_000;
         let orphans_frozen = AQW_ORPHANS_FROZEN.swap(0, Ordering::Relaxed);
+        // Population of the orphan list (per tick, so divide by `render_frames`
+        // for a headcount) and the clean/dirty cost split across all three
+        // passes. `orph_clean_ms` against `tick_orphan_ms` is the ceiling on
+        // what a mark-driven skip in the ordinary tick could win.
+        let dirty_notex = AQW_CACHE_DIRTY_NOTEX.swap(0, Ordering::Relaxed);
+        let dirty_size = AQW_CACHE_DIRTY_SIZE.swap(0, Ordering::Relaxed);
+        let dirty_matrix = AQW_CACHE_DIRTY_MATRIX.swap(0, Ordering::Relaxed);
+        let bypass_cleared = AQW_CACHE_BYPASS_CLEARED.swap(0, Ordering::Relaxed);
+        let orph_pop = AQW_ORPHAN_POP.swap(0, Ordering::Relaxed);
+        let orph_playing = AQW_ORPHAN_POP_PLAYING.swap(0, Ordering::Relaxed);
+        let orph_script = AQW_ORPHAN_POP_SCRIPT.swap(0, Ordering::Relaxed);
+        let orph_avatar = AQW_ORPHAN_POP_AVATAR.swap(0, Ordering::Relaxed);
+        let orph_quiet = AQW_ORPHAN_POP_QUIET.swap(0, Ordering::Relaxed);
+        let orph_clean_visits = AQW_ORPHAN_CLEAN_VISITS.swap(0, Ordering::Relaxed);
+        let orph_dirty_visits = AQW_ORPHAN_DIRTY_VISITS.swap(0, Ordering::Relaxed);
+        let orph_clean_ms = AQW_ORPHAN_CLEAN_NS.swap(0, Ordering::Relaxed) / 1_000_000;
+        let orph_dirty_ms = AQW_ORPHAN_DIRTY_NS.swap(0, Ordering::Relaxed) / 1_000_000;
         // Read against `tick_stage_ms`: the share of the stage phases that is
         // our per-clip hook rather than AQW's own scripts. `aqw_clips` is the
         // display-list size it walks, which is what a content update moves.
@@ -2561,6 +2824,12 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
              list_copies={list_copies} list_copied={list_copied} \
              stage_enter_ms={stage_enter_ms} stage_ctor_ms={stage_ctor_ms} \
              stage_script_ms={stage_script_ms} orphans_frozen={orphans_frozen} \
+             dirty_notex={dirty_notex} dirty_size={dirty_size} \
+             dirty_matrix={dirty_matrix} bypass_cleared={bypass_cleared} \
+             orph_pop={orph_pop} orph_playing={orph_playing} orph_script={orph_script} \
+             orph_avatar={orph_avatar} orph_quiet={orph_quiet} \
+             orph_clean_visits={orph_clean_visits} orph_dirty_visits={orph_dirty_visits} \
+             orph_clean_ms={orph_clean_ms} orph_dirty_ms={orph_dirty_ms} \
              vram_mb={vram_mb} vram_budget_mb={vram_budget_mb} \
              vram_pressure={vram_pressure} \
              pool_allocs={pool_allocs} pool_free={pool_free} pool_mb={pool_mb} \
@@ -3365,7 +3634,18 @@ pub fn render_base<'gc>(
     // Inside an AQW bake `use_bitmap_cache` is off (see the offscreen context
     // below), and without this exemption the filter would simply not happen.
     // Kill-switch: `RUFFLE_AQW_NO_NESTED_FILTER_CACHE=1`.
+    //
+    // `cache_filtered_children` is what limits this to the bake. Reading
+    // `use_bitmap_cache` alone was the first version and it also caught the two
+    // other places that switch caching off, where the exemption is not wanted
+    // and is expensive: the scaling grid turns it off on the *live* context and
+    // draws the subtree nine times, each slice under a different matrix, so a
+    // filtered descendant of an AQW panel is dirty on every slice -- nine bakes
+    // and up to nine texture allocations per frame, each. AQW's windows are
+    // scaling-grid panels and its item icons carry a ColorMatrixFilter, so the
+    // inventory is a gridful of them.
     let nested_filter_cache = !context.use_bitmap_cache
+        && context.cache_filtered_children
         && !aqw_nested_filter_cache_disabled()
         && !this.filters().is_empty();
     let cache_info = if (context.use_bitmap_cache || nested_filter_cache) && this.is_bitmap_cached()
@@ -3422,6 +3702,11 @@ pub fn render_base<'gc>(
 
         if let Some(cache) = &mut *this.base().bitmap_cache_mut() {
             if bypass_bitmap_cache {
+                // Only a clear that threw a texture away counts: clearing an
+                // already-empty cache costs nothing and would drown the signal.
+                if aqw_diagnostics_enabled() && cache.bitmap.is_some() {
+                    AQW_CACHE_BYPASS_CLEARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 cache.clear();
             } else {
                 let width = bounds.width().to_pixels().ceil().max(0.0);
@@ -3451,6 +3736,21 @@ pub fn render_base<'gc>(
                     let actual_width = filter_rect.width().max(0) as u32;
                     let actual_height = filter_rect.height().max(0) as u32;
                     if cache.is_dirty(&base_transform.matrix, width, height) {
+                        if aqw_diagnostics_enabled() {
+                            use std::sync::atomic::Ordering::Relaxed;
+                            match cache.dirty_reason(&base_transform.matrix, width, height) {
+                                Some(CacheDirtyReason::NoTexture) => {
+                                    AQW_CACHE_DIRTY_NOTEX.fetch_add(1, Relaxed)
+                                }
+                                Some(CacheDirtyReason::Size) => {
+                                    AQW_CACHE_DIRTY_SIZE.fetch_add(1, Relaxed)
+                                }
+                                Some(CacheDirtyReason::Matrix) => {
+                                    AQW_CACHE_DIRTY_MATRIX.fetch_add(1, Relaxed)
+                                }
+                                None => 0,
+                            };
+                        }
                         let redraw_pixels = u64::from(actual_width) * u64::from(actual_height);
                         // The large/small split (and the per-frame pixel budget in
                         // `Player::render`) is calibrated in ~1x windowed pixels.
@@ -3742,6 +4042,12 @@ pub fn render_base<'gc>(
                 // colour operation, which is how an item can draw in the wrong
                 // colour for exactly as long as an ancestor is cached.
                 use_bitmap_cache: !is_aqw_movie_url(this.movie().url()),
+                // The exemption belongs to this context and to no other. The
+                // two other places that clear `use_bitmap_cache` -- the scaling
+                // grid and `BitmapData.draw` -- want the plain behaviour, and
+                // inferring the exemption from the flag alone gave the scaling
+                // grid nine bakes per frame for every filtered descendant.
+                cache_filtered_children: true,
                 // Not zero, which is what the first attempt at that exemption
                 // (2026-08-06) tripped over: `try_reserve_*` refuses on a zero
                 // budget, so a nested cache that went dirty could never be
@@ -5144,6 +5450,33 @@ pub trait TDisplayObject<'gc>:
     #[no_dynamic]
     fn can_skip_frame_pass(self, context: &UpdateContext<'gc>) -> bool {
         *context.aqw_nested_goto && !self.base().subtree_needs_frame() && !frame_skip_disabled()
+    }
+
+    /// The subtree mark on its own, without the nested-goto gate above.
+    ///
+    /// Probe-only, and it must stay that way. **Honouring this mark in the
+    /// ordinary tick's orphan walk was built and disproved on 2026-08-07: it
+    /// fails `avm2/orphan_movie_complex`, `avm2/orphan_movie_reorder`,
+    /// `avm2/orphan_removeobject`, `avm2/avm2_catchup_dobj` and
+    /// `timeline/missing_frame_scripts`.** A periodic full walk to bound the
+    /// damage (every 24 ticks, staggered by address) did not save it either.
+    ///
+    /// The reason is structural rather than a missing mark somewhere. This flag
+    /// tracks *construction* -- `needs_frame_construction` is literally "does
+    /// `construct_frame` still have something to do" -- while the tick's orphan
+    /// walk runs three passes, and `enter_frame` has to advance every playing
+    /// timeline in the subtree. Nothing sets the mark for that, and nothing
+    /// should: inside a nested goto the mark is a verdict precisely because the
+    /// ordinary tick is the backstop that catches what it misses.
+    ///
+    /// A sound skip needs a *different* signal -- one that says no timeline
+    /// under here will advance, which means propagating a playing-descendant
+    /// count the way this mark propagates. That is new machinery, not a wider
+    /// read of this one. What it would be worth is measured: see the
+    /// `orph_clean_*` columns and `AQW_ORPHAN_POP`.
+    #[no_dynamic]
+    fn aqw_subtree_clean(self) -> bool {
+        !self.base().subtree_needs_frame()
     }
 
     /// Recompute this object's mark from its own pending work and its children's

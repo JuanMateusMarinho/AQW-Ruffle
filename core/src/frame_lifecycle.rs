@@ -19,6 +19,32 @@ use crate::orphan_manager::OrphanManager;
 use tracing::instrument;
 use web_time::Instant;
 
+/// Run one orphan's pass, billing its cost to the probe's clean/dirty split.
+///
+/// The split is by the V2.5 subtree mark, which the ordinary tick deliberately
+/// does not honour (see `can_skip_frame_pass`). Timing it here is how the value
+/// of honouring it gets measured before the safety net is given up: whatever
+/// lands in `orph_clean_ms` is what such a skip would not have spent.
+///
+/// `probe` off is the shipping path and must stay free of the timer.
+fn billed_orphan_visit<'gc>(
+    probe: bool,
+    orphan: DisplayObject<'gc>,
+    context: &mut UpdateContext<'gc>,
+    run: impl FnOnce(DisplayObject<'gc>, &mut UpdateContext<'gc>),
+) {
+    if !probe {
+        run(orphan, context);
+        return;
+    }
+    // Read before the pass: it is the pass that settles the mark, so reading
+    // after would classify every orphan by the state it was left in.
+    let clean = orphan.aqw_subtree_clean();
+    let started = Instant::now();
+    run(orphan, context);
+    crate::display_object::aqw_note_orphan_visit(clean, started.elapsed().as_nanos() as u64);
+}
+
 /// Which phase of the frame we're currently in.
 ///
 /// AVM2 frames exist in one of four phases: `Enter`, `Construct`,
@@ -94,6 +120,12 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
     let mut stage_ns = 0u64;
     let mut bcast_ns = 0u64;
 
+    // Probe for the sweep's `orph_*` columns: what this list is made of, and
+    // how much of its cost lands on orphans the V2.5 subtree mark already calls
+    // clean. Off outside diagnostics -- it adds a timer pair per orphan visit,
+    // and the list runs to thousands after an inventory open.
+    let orphan_probe = crate::display_object::aqw_diagnostics_enabled();
+
     *context.frame_phase = FramePhase::Enter;
     // Every orphan is about to be visited three times over, so whatever was
     // queued for a nested goto is about to be done anyway. Dropped *before* the
@@ -107,8 +139,13 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
                 AQW_ORPHANS_FROZEN.fetch_add(1, Ordering::Relaxed);
                 return;
             }
+            // After the freeze check, so the population columns describe the
+            // orphans that actually cost something.
+            if orphan_probe {
+                clip.aqw_note_orphan_shape();
+            }
         }
-        orphan.enter_frame(context);
+        billed_orphan_visit(orphan_probe, orphan, context, |o, c| o.enter_frame(c));
     });
     orphan_ns += started.elapsed().as_nanos() as u64;
     let started = Instant::now();
@@ -126,7 +163,7 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
         {
             return;
         }
-        orphan.construct_frame(context);
+        billed_orphan_visit(orphan_probe, orphan, context, |o, c| o.construct_frame(c));
     });
     orphan_ns += started.elapsed().as_nanos() as u64;
     let started = Instant::now();
@@ -147,7 +184,7 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
         {
             return;
         }
-        orphan.run_frame_scripts(context);
+        billed_orphan_visit(orphan_probe, orphan, context, |o, c| o.run_frame_scripts(c));
     });
     orphan_ns += started.elapsed().as_nanos() as u64;
     let started = Instant::now();

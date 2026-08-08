@@ -2146,6 +2146,9 @@ impl Player {
                 transform_stack: &mut this.transform_stack,
                 is_offscreen: false,
                 use_bitmap_cache: true,
+                // Moot here -- the exemption only reads this while caching is
+                // off -- but it is the bake's flag, and the bake is below.
+                cache_filtered_children: false,
                 dirty_cache_redraws_remaining: match vram_pressure {
                     _ if no_defer => u32::MAX,
                     0 => AQW_DIRTY_CACHE_REDRAWS_PER_FRAME,

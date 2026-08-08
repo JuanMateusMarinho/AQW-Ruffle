@@ -572,6 +572,18 @@ pub struct RenderContext<'a, 'gc> {
     /// Whether to use cacheAsBitmap, vs drawing everything explicitly
     pub use_bitmap_cache: bool,
 
+    /// Whether a child carrying filters keeps its cache even though
+    /// `use_bitmap_cache` is off.
+    ///
+    /// A filter is only applied when a cache's texture is drawn, so switching
+    /// the cache off drops it. Baking an AQW subtree has to exempt filtered
+    /// children for that reason, and it is the *only* place that should:
+    /// `use_bitmap_cache` alone cannot say why it is off, and the other two
+    /// places that turn it off must keep their old behaviour. See the
+    /// scaling-grid path in `display_object.rs`, which turns it off on the
+    /// live context and then draws the same subtree nine times.
+    pub cache_filtered_children: bool,
+
     /// Maximum number of dirty AQW bitmap caches that can be redrawn during this frame.
     ///
     /// Clean caches remain available. This spreads texture allocation and redraw work
