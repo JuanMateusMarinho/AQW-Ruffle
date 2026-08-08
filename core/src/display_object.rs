@@ -1855,6 +1855,32 @@ pub(crate) fn aqw_avatar_cache_disabled() -> bool {
 static AQW_BLEND_BY_SWF: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
     std::sync::Mutex::new(None);
 
+/// These nine composite through a render pass of their own, and a pass costs a
+/// copy of the target plus a read of that copy -- a serialisation point the GPU
+/// cannot overlap with anything. The rest fold into fixed-function blend state
+/// on an ordinary draw. `blend_layers` counts both populations together, which
+/// is why it overstates: 42% of the non-Normal blends in the accumulated sweep
+/// are the cheap kind. Mirrors `BlendType::from` in
+/// `render/wgpu/src/blend.rs` -- if that mapping moves, this moves with it.
+///
+/// `Shader` is deliberately not counted here even though it also takes a pass
+/// of its own: the renderer tallies it separately from the nine, and the
+/// control this feeds (`blend_modes`) is the nine. AQW emits none.
+fn is_complex_blend(mode: ExtendedBlendMode) -> bool {
+    matches!(
+        mode,
+        ExtendedBlendMode::Multiply
+            | ExtendedBlendMode::Lighten
+            | ExtendedBlendMode::Darken
+            | ExtendedBlendMode::Difference
+            | ExtendedBlendMode::Invert
+            | ExtendedBlendMode::Alpha
+            | ExtendedBlendMode::Erase
+            | ExtendedBlendMode::Overlay
+            | ExtendedBlendMode::HardLight
+    )
+}
+
 fn note_blend_source(url: &str) {
     // Just the file name; the directory is the same for every item.
     let name = url
@@ -1889,6 +1915,321 @@ fn take_blend_sources(limit: usize) -> Vec<(String, u64)> {
     counts.sort_unstable_by_key(|(_, count)| std::cmp::Reverse(*count));
     counts.truncate(limit);
     counts
+}
+
+/// Blend attribution, second generation. `blend_swfs` above names the *file* a
+/// blend came from, which was enough to convict one item in the V2.0 work but
+/// cannot answer the question left open after it: a cached subtree is supposed
+/// to collapse its blends into a single texture draw, so the ones still being
+/// emitted are either art no cache ever covers, or art whose cache is rebaked
+/// so often the cache buys nothing. Those two want opposite fixes and the file
+/// name cannot tell them apart -- the same SWF appears on both sides.
+///
+/// So each blend is booked against the *bake* it happened inside, or against
+/// the object itself when it happened live. A bake root that emits dozens
+/// means the cost is inside one subtree; many roots emitting one or two each
+/// means the cost is how many bakes there are.
+///
+/// Diagnostics-only: it locks and allocates per blend, and pushes a label per
+/// bake.
+struct BakeTally {
+    /// Bakes started with this object as the outermost cached root.
+    bakes: u64,
+    /// Complex blends emitted anywhere inside those bakes.
+    complex: u64,
+    /// Everything else non-Normal, which the renderer folds into blend state.
+    trivial: u64,
+}
+
+static AQW_BLEND_BY_BAKE: std::sync::Mutex<Option<std::collections::HashMap<String, BakeTally>>> =
+    std::sync::Mutex::new(None);
+static AQW_BLEND_BY_LIVE: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+    std::sync::Mutex::new(None);
+
+/// Complex blends split by where they were emitted from. Read against
+/// `blend_modes`, whose sum is the renderer's own count of the same passes:
+/// `blend_bake + blend_live` has to land on it, or something is emitting
+/// blends this attribution never sees and the split below describes a fraction.
+static AQW_BLEND_COMPLEX_BAKED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static AQW_BLEND_COMPLEX_LIVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static AQW_BLEND_TRIVIAL_BAKED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static AQW_BLEND_TRIVIAL_LIVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Bakes started, and the deepest nesting reached. A cache inside a bake is
+/// possible since the filtered-children exemption (2026-08-06), so depth is
+/// worth watching: it multiplies the work a single outer bake stands for.
+static AQW_BAKES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static AQW_BAKE_DEPTH_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// The chain of cache bakes currently being rendered into. Rendering is
+    /// single-threaded, and `render_base` pushes on the way into an offscreen
+    /// context and pops on the way out, so the bottom of this stack is the
+    /// outermost cached root a blend is being emitted underneath.
+    static AQW_BAKE_STACK: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `Class@file.swf` -- what a reader needs to find the art. The class name is
+/// the useful half (`town-battleon` holds hundreds of distinct clips), the file
+/// is what can actually be downloaded and opened.
+fn aqw_blend_label<'gc>(this: DisplayObject<'gc>) -> String {
+    let class = this
+        .object2()
+        .map(|o| {
+            use crate::avm2::object::TObject;
+            o.instance_class().name().local_name().to_string()
+        })
+        .unwrap_or_else(|| this.name().map(|n| n.to_string()).unwrap_or_default());
+    let movie = this.movie();
+    let url = movie.url();
+    let file = url
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(url)
+        .split('?')
+        .next()
+        .unwrap_or(url);
+    if class.is_empty() {
+        file.to_owned()
+    } else {
+        format!("{class}@{file}")
+    }
+}
+
+/// Marks the subtree rendered inside `this`'s cache bake, so blends emitted
+/// under it are booked against `this`. Pops on drop, which is what keeps the
+/// stack balanced through the early returns in the render path.
+struct AqwBakeScope(bool);
+
+impl AqwBakeScope {
+    fn enter<'gc>(this: DisplayObject<'gc>) -> Self {
+        if !aqw_diagnostics_enabled() {
+            return Self(false);
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        AQW_BAKES.fetch_add(1, Relaxed);
+        let label = aqw_blend_label(this);
+        let depth = AQW_BAKE_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            stack.push(label.clone());
+            stack.len() as u64
+        });
+        AQW_BAKE_DEPTH_MAX.fetch_max(depth, Relaxed);
+        // Booked at the outermost root, the same place its blends will be, so
+        // the ratio in `bake_top` is blends per bake of that root.
+        if depth == 1
+            && let Ok(mut guard) = AQW_BLEND_BY_BAKE.lock()
+        {
+            let counts = guard.get_or_insert_with(std::collections::HashMap::new);
+            if counts.len() < 512 || counts.contains_key(&label) {
+                counts
+                    .entry(label)
+                    .or_insert(BakeTally {
+                        bakes: 0,
+                        complex: 0,
+                        trivial: 0,
+                    })
+                    .bakes += 1;
+            }
+        }
+        Self(true)
+    }
+}
+
+impl Drop for AqwBakeScope {
+    fn drop(&mut self) {
+        if self.0 {
+            AQW_BAKE_STACK.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+}
+
+/// Books one emitted blend. `owner` is the outermost bake root when this blend
+/// happened inside a bake, and `None` when it was drawn live.
+///
+/// Called where the blend is actually handed to the renderer, not where the
+/// object's blend mode is read: an object whose subtree drew nothing has its
+/// blend thrown away, and counting at the top would book passes that never
+/// exist. That gap is a large part of why `blend_layers` reads high.
+fn note_blend_emitted<'gc>(this: DisplayObject<'gc>, owner: Option<&str>, complex: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    match (owner.is_some(), complex) {
+        (true, true) => AQW_BLEND_COMPLEX_BAKED.fetch_add(1, Relaxed),
+        (true, false) => AQW_BLEND_TRIVIAL_BAKED.fetch_add(1, Relaxed),
+        (false, true) => AQW_BLEND_COMPLEX_LIVE.fetch_add(1, Relaxed),
+        (false, false) => AQW_BLEND_TRIVIAL_LIVE.fetch_add(1, Relaxed),
+    };
+    match owner {
+        Some(owner) => {
+            if let Ok(mut guard) = AQW_BLEND_BY_BAKE.lock() {
+                let counts = guard.get_or_insert_with(std::collections::HashMap::new);
+                if let Some(tally) = counts.get_mut(owner) {
+                    if complex {
+                        tally.complex += 1;
+                    } else {
+                        tally.trivial += 1;
+                    }
+                }
+            }
+        }
+        None => {
+            // Live blends are the population the caching was supposed to
+            // remove, so only the expensive kind is worth a name.
+            if !complex {
+                return;
+            }
+            note_live_blend_ancestry(this);
+            let label = aqw_blend_label(this);
+            if let Ok(mut guard) = AQW_BLEND_BY_LIVE.lock() {
+                let counts = guard.get_or_insert_with(std::collections::HashMap::new);
+                if counts.len() < 512 || counts.contains_key(&label) {
+                    *counts.entry(label).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+}
+
+/// The bake a blend emitted right now belongs to: the outermost one, since
+/// that is the cache whose texture the whole lot ends up inside.
+fn aqw_current_bake() -> Option<String> {
+    if !aqw_diagnostics_enabled() {
+        return None;
+    }
+    AQW_BAKE_STACK.with(|stack| stack.borrow().first().cloned())
+}
+
+/// Every off-screen-cache bypass, and how many of those were on art that was
+/// actually on screen. Before the coordinate fix, `bypass_onscreen` was the
+/// number that showed the mismatch was live rather than latent: it came back
+/// equal to `bypass_all`, every bypass in the session landing on visible art.
+///
+/// With the fix in place the bypass makes the same comparison this probe does,
+/// so `bypass_onscreen` is now a regression guard and belongs at zero. If it
+/// climbs again, the two have drifted back apart.
+static AQW_CACHE_BYPASS_ALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static AQW_CACHE_BYPASS_ONSCREEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Caches the fix kept alive: off-screen by the old comparison, on-screen by
+/// the corrected one.
+static AQW_CACHE_BYPASS_SAVED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static AQW_BYPASS_BY_OBJECT: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+    std::sync::Mutex::new(None);
+
+/// Books one bypass, and decides whether it was justified.
+///
+/// The bypass compares `bounds` -- which carries the whole render transform
+/// stack, viewport matrix included -- against `stage.view_bounds()`, which is
+/// set in `stage.rs::build_matrices` as `stage_tx * view_bounds` and so is in
+/// stage pixels with no viewport applied. Every other consumer of
+/// `view_bounds` in the tree (`graphic.rs`, `bitmap.rs`, `edit_text.rs`,
+/// `video.rs`, and our own sweep) compares it against engine-space world
+/// bounds. Putting the view rect through `view_matrix()` lands it in the same
+/// space `bounds` is already in, which is the cheaper of the two corrections
+/// because the bounds traversal has been done by this point.
+fn note_cache_bypass<'gc>(
+    this: DisplayObject<'gc>,
+    context: &RenderContext<'_, 'gc>,
+    bounds: &Rectangle<Twips>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    AQW_CACHE_BYPASS_ALL.fetch_add(1, Relaxed);
+    let corrected = context.stage.view_matrix() * context.stage.view_bounds();
+    let on_screen = bounds.is_valid() && bounds.intersects(&corrected);
+    if !on_screen {
+        return;
+    }
+    AQW_CACHE_BYPASS_ONSCREEN.fetch_add(1, Relaxed);
+    let label = aqw_blend_label(this);
+    if let Ok(mut guard) = AQW_BYPASS_BY_OBJECT.lock() {
+        let counts = guard.get_or_insert_with(std::collections::HashMap::new);
+        if counts.len() < 512 || counts.contains_key(&label) {
+            *counts.entry(label).or_insert(0) += 1;
+        }
+    }
+}
+
+/// Drains the wrongly-bypassed tally as `Class@file:count`, busiest first.
+fn take_bypassed_objects(limit: usize) -> Vec<String> {
+    let Ok(mut guard) = AQW_BYPASS_BY_OBJECT.lock() else {
+        return Vec::new();
+    };
+    let Some(counts) = guard.take() else {
+        return Vec::new();
+    };
+    let mut counts: Vec<(String, u64)> = counts.into_iter().collect();
+    counts.sort_unstable_by_key(|(_, count)| std::cmp::Reverse(*count));
+    counts.truncate(limit);
+    counts
+        .into_iter()
+        .map(|(name, count)| format!("{name}:{count}"))
+        .collect()
+}
+
+/// Whether any ancestor of a live blend carries a bitmap cache.
+///
+/// This is the other half of the same question, and it needs no probe on the
+/// cache side to interpret: if an ancestor had a cache that was engaged this
+/// frame, we would either not be rendering at all (clean cache, parent draws
+/// its texture) or be inside its bake and booked against it. So a blend
+/// arriving here live means no ancestor cache took effect -- and the split is
+/// between "no ancestor ever wanted one" and "an ancestor wanted one and it
+/// was suppressed", which are different bugs with different fixes.
+static AQW_BLEND_LIVE_NO_CACHE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static AQW_BLEND_LIVE_HAD_CACHE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn note_live_blend_ancestry<'gc>(this: DisplayObject<'gc>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut node = this.parent();
+    while let Some(parent) = node {
+        if parent.is_bitmap_cached() {
+            AQW_BLEND_LIVE_HAD_CACHE.fetch_add(1, Relaxed);
+            return;
+        }
+        node = parent.parent();
+    }
+    AQW_BLEND_LIVE_NO_CACHE.fetch_add(1, Relaxed);
+}
+
+/// Drains the per-bake tally as `Class@file:bakes/complex`, busiest first.
+fn take_bake_blends(limit: usize) -> Vec<String> {
+    let Ok(mut guard) = AQW_BLEND_BY_BAKE.lock() else {
+        return Vec::new();
+    };
+    let Some(counts) = guard.take() else {
+        return Vec::new();
+    };
+    let mut counts: Vec<(String, BakeTally)> = counts.into_iter().collect();
+    counts.sort_unstable_by_key(|(_, tally)| std::cmp::Reverse(tally.complex));
+    counts.truncate(limit);
+    counts
+        .into_iter()
+        .map(|(name, tally)| format!("{name}:{}/{}", tally.bakes, tally.complex))
+        .collect()
+}
+
+/// Drains the live-blend tally as `Class@file:complex`, busiest first.
+fn take_live_blends(limit: usize) -> Vec<String> {
+    let Ok(mut guard) = AQW_BLEND_BY_LIVE.lock() else {
+        return Vec::new();
+    };
+    let Some(counts) = guard.take() else {
+        return Vec::new();
+    };
+    let mut counts: Vec<(String, u64)> = counts.into_iter().collect();
+    counts.sort_unstable_by_key(|(_, count)| std::cmp::Reverse(*count));
+    counts.truncate(limit);
+    counts
+        .into_iter()
+        .map(|(name, count)| format!("{name}:{count}"))
+        .collect()
 }
 /// Frame-tick phase accounting (nanoseconds per sweep window) filled in by
 /// `run_all_phases_avm2`, plus how many orphan subtrees the orphan freeze
@@ -2486,7 +2827,6 @@ fn should_bypass_offscreen_bitmap_cache<'gc>(
         || this.blend_mode() != ExtendedBlendMode::Normal
         || !filters.is_empty()
         || !bounds.is_valid()
-        || bounds.intersects(&context.stage.view_bounds())
     {
         return false;
     }
@@ -2494,9 +2834,65 @@ fn should_bypass_offscreen_bitmap_cache<'gc>(
     let width = bounds.width().to_pixels().ceil().max(0.0);
     let height = bounds.height().to_pixels().ceil().max(0.0);
 
-    width * height >= AQW_OFFSCREEN_CACHE_LIMIT_PIXELS
-        || width >= AQW_OFFSCREEN_CACHE_LIMIT_SIDE
-        || height >= AQW_OFFSCREEN_CACHE_LIMIT_SIDE
+    // Ordered ahead of the on-screen test only so the cheap arithmetic settles
+    // first and the two comparisons below are done once; both are pure
+    // predicates and this object is bypassed exactly when both agree.
+    if width * height < AQW_OFFSCREEN_CACHE_LIMIT_PIXELS
+        && width < AQW_OFFSCREEN_CACHE_LIMIT_SIDE
+        && height < AQW_OFFSCREEN_CACHE_LIMIT_SIDE
+    {
+        return false;
+    }
+
+    // The two sides of this comparison were in different coordinate spaces.
+    // `bounds` comes from `render_bounds_with_transform` over the render
+    // transform stack, so it carries the viewport matrix -- supersampling times
+    // window scale, measured at 2.29 in a large window. `stage.view_bounds()`
+    // is set in `stage.rs::build_matrices` as `stage_tx * view_bounds`, from
+    // `movie_width`/`movie_height` in stage pixels, with no viewport in it.
+    //
+    // The effect was not a wash: at view scale 2.29 the rectangle art had to
+    // reach to be considered visible shrank to ~44% of the stage per axis, so
+    // art plainly on screen to the right or below was judged off-screen and had
+    // its cache thrown away. It costs no correctness -- the bypass only falls
+    // back to vector rendering, which draws the same picture -- but a subtree
+    // that loses its cache re-emits every blend mode inside it, every frame.
+    // Measured in the field: one wrong bypass per frame on a weapon released 36
+    // complex blend passes per frame, 19% of the passes in the heaviest window.
+    //
+    // Putting the view rect through `view_matrix()` lands it in the space
+    // `bounds` is already expressed in. The other direction -- comparing
+    // `world_bounds(BoundsMode::Engine)` against `view_bounds` untouched -- is
+    // what the five other consumers of `view_bounds` do (`graphic.rs`,
+    // `bitmap.rs`, `edit_text.rs`, `video.rs`, and our own sweep) and is equally
+    // correct, but it costs a second bounds traversal where this costs a matrix
+    // multiply on a rectangle already to hand.
+    //
+    // Kill-switch: `RUFFLE_AQW_NO_BYPASS_VIEW_FIX=1` restores the mismatched
+    // comparison, for field A/B without a rebuild.
+    let stage_view_bounds = context.stage.view_bounds();
+    let on_screen = if aqw_bypass_view_fix_disabled() {
+        bounds.intersects(&stage_view_bounds)
+    } else {
+        bounds.intersects(&(context.stage.view_matrix() * stage_view_bounds))
+    };
+
+    // How often the fix is the deciding vote: the old comparison called this
+    // off-screen and the corrected one does not, so a cache that used to be
+    // discarded now survives. This is the number that says whether a field A/B
+    // is measuring anything.
+    if aqw_diagnostics_enabled() && on_screen && !bounds.intersects(&stage_view_bounds) {
+        AQW_CACHE_BYPASS_SAVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    !on_screen
+}
+
+/// Kill-switch: `RUFFLE_AQW_NO_BYPASS_VIEW_FIX` restores the stage-space vs
+/// render-space comparison the off-screen cache bypass used to make.
+fn aqw_bypass_view_fix_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_BYPASS_VIEW_FIX", false))
 }
 
 /// Total bitmap-cache memory budget in MB before off-screen caches are evicted.
@@ -2754,6 +3150,43 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
             .map(|(name, count)| format!("{name}:{count}"))
             .collect::<Vec<_>>()
             .join(",");
+        // Where the expensive blends come from. `blend_bake`+`blend_live` is the
+        // control against `blend_modes`, whose sum is the renderer's own count of
+        // the same passes; if they disagree, this attribution is missing a path.
+        // Two known reasons for a small shortfall the other way, where the
+        // renderer counts fewer: it drops an Alpha/Erase with no Layer above it
+        // and one whose scissor came out empty. One reason it counts more:
+        // `BitmapData.draw` blends without going through here, which is AQW's
+        // own rasteriser (Static Player Art, the map raster) rather than the
+        // scene, and is worth knowing about separately if the gap is large.
+        //
+        // The split is the question: a cached subtree is meant to collapse its
+        // blends into one texture draw, so `blend_live` is art no cache covers,
+        // and `blend_bake` is art whose cache is being rebuilt often enough that
+        // the cache buys nothing. `bake_top` reads `Class@file:bakes/complex` --
+        // dividing the two says whether one bake is expensive or there are simply
+        // a lot of them, which is the fork the whole investigation turns on.
+        let blend_bake = AQW_BLEND_COMPLEX_BAKED.swap(0, Ordering::Relaxed);
+        let blend_live = AQW_BLEND_COMPLEX_LIVE.swap(0, Ordering::Relaxed);
+        let blend_bake_triv = AQW_BLEND_TRIVIAL_BAKED.swap(0, Ordering::Relaxed);
+        let blend_live_triv = AQW_BLEND_TRIVIAL_LIVE.swap(0, Ordering::Relaxed);
+        let bakes = AQW_BAKES.swap(0, Ordering::Relaxed);
+        let bake_depth = AQW_BAKE_DEPTH_MAX.swap(0, Ordering::Relaxed);
+        let bake_top = take_bake_blends(6).join(",");
+        let blend_live_top = take_live_blends(6).join(",");
+        // The two halves of "why is this blend not inside a cache".
+        // `bypass_all` against `bypass_cleared` is the correction to how that
+        // counter reads; `bypass_onscreen` is the defect firing on art the
+        // player can see, and `bypass_top` names it.
+        // `live_nocache`/`live_hadcache` splits the live blends themselves:
+        // no ancestor ever asked for a cache, against an ancestor asked and
+        // did not get one.
+        let bypass_all = AQW_CACHE_BYPASS_ALL.swap(0, Ordering::Relaxed);
+        let bypass_onscreen = AQW_CACHE_BYPASS_ONSCREEN.swap(0, Ordering::Relaxed);
+        let bypass_saved = AQW_CACHE_BYPASS_SAVED.swap(0, Ordering::Relaxed);
+        let bypass_top = take_bypassed_objects(6).join(",");
+        let live_nocache = AQW_BLEND_LIVE_NO_CACHE.swap(0, Ordering::Relaxed);
+        let live_hadcache = AQW_BLEND_LIVE_HAD_CACHE.swap(0, Ordering::Relaxed);
         // `Dictionary` retention. The class takes a `weakKeys` flag and drops
         // it, so object-space entries are pinned for the dictionary's whole
         // life; content that expects the player to drop unreachable keys gets
@@ -2848,7 +3281,15 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
              inner_cleanup_ms={inner_cleanup_ms} \
              inner_orphan_visits={inner_orphan_visits} \
              inner_orphan_work={inner_orphan_work} gate_open={gate_open} \
-             orphan_adds={orphan_adds} mark_bumps={mark_bumps}"
+             orphan_adds={orphan_adds} mark_bumps={mark_bumps} \
+             blend_bake={blend_bake} blend_live={blend_live} \
+             blend_bake_triv={blend_bake_triv} blend_live_triv={blend_live_triv} \
+             bakes={bakes} bake_depth={bake_depth} \
+             bake_top={bake_top} blend_live_top={blend_live_top} \
+             bypass_all={bypass_all} bypass_onscreen={bypass_onscreen} \
+             bypass_saved={bypass_saved} \
+             live_nocache={live_nocache} live_hadcache={live_hadcache} \
+             bypass_top={bypass_top}"
         );
 
         tracing::info!(target: "aqw_diag", "AQW sweep: {line}");
@@ -3619,6 +4060,15 @@ pub fn render_base<'gc>(
     }
 
     let blend_mode = this.blend_mode();
+    // Captured here rather than at the emit site below, because by then this
+    // object's *own* bake has been pushed and popped again. What decides the
+    // booking is whether an *ancestor* was baking when this object was reached,
+    // which is exactly the stack as it stands on the way in.
+    let blend_bake_owner = if blend_mode != ExtendedBlendMode::Normal {
+        aqw_current_bake()
+    } else {
+        None
+    };
     let original_commands = if blend_mode != ExtendedBlendMode::Normal {
         AQW_BLEND_LAYERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if aqw_diagnostics_enabled() {
@@ -3706,6 +4156,17 @@ pub fn render_base<'gc>(
                 // already-empty cache costs nothing and would drown the signal.
                 if aqw_diagnostics_enabled() && cache.bitmap.is_some() {
                     AQW_CACHE_BYPASS_CLEARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                // `bypass_cleared` above answers a narrower question than it
+                // looks like it does, and the difference matters: a cache that
+                // is bypassed on *every* frame never accumulates a texture, so
+                // it has none to throw away and is counted nowhere -- which is
+                // exactly the steady state a suppressed cache sits in. Reading
+                // zero from it was taken as "the bypass never fires" once
+                // already. This counts every bypass, and separately the ones
+                // where the object was really on screen.
+                if aqw_diagnostics_enabled() {
+                    note_cache_bypass(this, context, &bounds);
                 }
                 cache.clear();
             } else {
@@ -4068,6 +4529,7 @@ pub fn render_base<'gc>(
                 aged_cache_redraws_remaining: u32::MAX,
                 stage: context.stage,
             };
+            let _bake_scope = AqwBakeScope::enter(this);
             this.render_self(&mut offscreen_context);
             offscreen_context.cache_draws.push(BitmapCacheEntry {
                 handle: cache_info.handle.clone(),
@@ -4131,6 +4593,13 @@ pub fn render_base<'gc>(
         let sub_commands = std::mem::replace(&mut context.commands, original_commands);
         // If there's nothing to draw, throw away the blend entirely.
         if !sub_commands.is_empty() {
+            if aqw_diagnostics_enabled() {
+                note_blend_emitted(
+                    this,
+                    blend_bake_owner.as_deref(),
+                    is_complex_blend(blend_mode),
+                );
+            }
             let render_blend_mode = if let ExtendedBlendMode::Shader = blend_mode {
                 // Note - Flash appears to let you set blend mode to shader
                 // without having blend shader set.  In this case, Flash seems
