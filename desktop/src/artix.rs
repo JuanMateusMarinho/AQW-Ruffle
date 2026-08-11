@@ -132,8 +132,8 @@ pub struct CursorSet {
     pub hand: CursorArt,
 }
 
-/// Baked from the source artwork by `.agents-local/make_cursor_rgba.py`, which
-/// also prints these sizes and hotspots (the arrow's tip and the gauntlet's
+/// Baked from the source artwork by the cursor generator script, which also
+/// prints these sizes and hotspots (the arrow's tip and the gauntlet's
 /// fingertip). The OS draws cursors at their bitmap size, so the sizes here are
 /// the whole scale range on offer rather than a DPI ladder.
 const CURSOR_SETS: &[CursorSet] = &[
