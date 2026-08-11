@@ -1374,6 +1374,14 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         crate::blend::take_blend_alloc()
     }
 
+    fn take_trivial_blend_counts(&mut self) -> Vec<(&'static str, u64)> {
+        crate::blend::take_trivial_blend_counts()
+    }
+
+    fn take_trivial_blend_target(&mut self) -> (u64, u64, u64, [u64; 4]) {
+        crate::blend::take_trivial_blend_target()
+    }
+
     fn take_render_timings(&mut self) -> (u64, u64, u64, u64) {
         use std::sync::atomic::Ordering;
         (

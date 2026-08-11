@@ -93,6 +93,115 @@ static BLEND_COVER_HIST: [AtomicU64; 4] = [
 static BLEND_ALLOC_PX: AtomicU64 = AtomicU64::new(0);
 static BLEND_ALLOC_FULL_PX: AtomicU64 = AtomicU64::new(0);
 
+/// Per-mode tally of the blends that fold into GPU blend state, since the last
+/// [`take_trivial_blend_counts`].
+///
+/// These were the population nothing was measuring. Being expressible as blend
+/// state only saves them the compositing *pass* -- everything before it is
+/// identical to the complex case: a render target, a clear of it, the subtree
+/// rendered into it, and a quad to draw it back. Until this was measured that
+/// target was always the size of the whole surface, since both the shrink and
+/// the scissor were gated on `is_complex`, and a 30x30 glow with `Add` cost the
+/// same as one covering the screen. Counted at the point of emission, where a
+/// subtree that drew nothing has already been dropped.
+///
+/// `Add` dominates, and it is worth knowing why the obvious guess is wrong:
+/// this looks like it should be `Layer`, but the core only emits a blend when
+/// the mode is not Normal, and AQW's trivial blends are glow -- FX from the
+/// shared asset file and the map's own NPCs. Measured over a session: 66551
+/// `Add`, 1692 `Screen`, 23 `Layer`. A plain `Normal` can only come from the
+/// shader-in-mask fallback or from `RUFFLE_AQW_BLEND_AS_NORMAL`, so reading
+/// non-zero on it outside those two means something else demoted a blend.
+static TRIVIAL_BLEND_COUNTS: [AtomicU64; 5] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// How much of the trivial blend targets is live content, what they were
+/// allocated at, and what full-surface ones would have cost, since the last
+/// [`take_trivial_blend_target`].
+///
+/// Coverage answers the same question `blend_cover` does for complex blends,
+/// with the difference that a trivial target pays for its size three times
+/// over -- alloc, clear, composite draw -- rather than in the pass alone. It
+/// read 0-1% for the whole of the measurement that motivated bounding these,
+/// so it should now read high: the target is the content. The allocation
+/// percentage is the mirror of `blend_alloc`, and the pixel total is the
+/// absolute scale, without which a small percentage over a large population
+/// reads as harmless.
+static TRIVIAL_LIVE_PX: AtomicU64 = AtomicU64::new(0);
+static TRIVIAL_TARGET_PX: AtomicU64 = AtomicU64::new(0);
+static TRIVIAL_FULL_PX: AtomicU64 = AtomicU64::new(0);
+static TRIVIAL_COVER_HIST: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Records a trivial blend under the mode the content asked for, which
+/// [`TrivialBlend`] cannot answer: `Normal` and `Layer` share a variant there
+/// and only one of them is a real population.
+pub fn note_trivial_blend(mode: Option<BlendMode>) {
+    let index = match mode {
+        Some(BlendMode::Layer) => 0,
+        Some(BlendMode::Screen) => 1,
+        Some(BlendMode::Add) => 2,
+        Some(BlendMode::Subtract) => 3,
+        _ => 4,
+    };
+    TRIVIAL_BLEND_COUNTS[index].fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn note_trivial_blend_target(live_px: u64, target_px: u64, full_px: u64) {
+    TRIVIAL_LIVE_PX.fetch_add(live_px, Ordering::Relaxed);
+    TRIVIAL_TARGET_PX.fetch_add(target_px, Ordering::Relaxed);
+    TRIVIAL_FULL_PX.fetch_add(full_px, Ordering::Relaxed);
+
+    let permille = live_px
+        .saturating_mul(1000)
+        .checked_div(target_px)
+        .unwrap_or(0);
+    let bucket = match permille {
+        0..=10 => 0,
+        11..=50 => 1,
+        51..=250 => 2,
+        _ => 3,
+    };
+    TRIVIAL_COVER_HIST[bucket].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Drains the trivial target tally as
+/// `(live_percent, megapixels, alloc_percent, [hist; 4])`.
+pub fn take_trivial_blend_target() -> (u64, u64, u64, [u64; 4]) {
+    let live = TRIVIAL_LIVE_PX.swap(0, Ordering::Relaxed);
+    let target = TRIVIAL_TARGET_PX.swap(0, Ordering::Relaxed);
+    let full = TRIVIAL_FULL_PX.swap(0, Ordering::Relaxed);
+    let cover = live.saturating_mul(100).checked_div(target).unwrap_or(0);
+    let alloc = target.saturating_mul(100).checked_div(full).unwrap_or(0);
+    let hist = std::array::from_fn(|i| TRIVIAL_COVER_HIST[i].swap(0, Ordering::Relaxed));
+    (cover, target / (1024 * 1024), alloc, hist)
+}
+
+/// Drains the trivial tally into `mode=count` pairs, busiest first, omitting
+/// zeros.
+pub fn take_trivial_blend_counts() -> Vec<(&'static str, u64)> {
+    const NAMES: [&str; 5] = ["layer", "screen", "add", "subtract", "normal"];
+    let mut counts: Vec<(&'static str, u64)> = NAMES
+        .iter()
+        .zip(TRIVIAL_BLEND_COUNTS.iter())
+        .filter_map(|(name, slot)| {
+            let count = slot.swap(0, Ordering::Relaxed);
+            (count > 0).then_some((*name, count))
+        })
+        .collect();
+    counts.sort_unstable_by_key(|(_, count)| std::cmp::Reverse(*count));
+    counts
+}
+
 pub fn note_blend_alloc(alloc_px: u64, surface_px: u64) {
     BLEND_ALLOC_PX.fetch_add(alloc_px, Ordering::Relaxed);
     BLEND_ALLOC_FULL_PX.fetch_add(surface_px, Ordering::Relaxed);

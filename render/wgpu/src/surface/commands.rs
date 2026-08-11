@@ -59,6 +59,33 @@ fn blend_measured_skipped() -> bool {
     })
 }
 
+/// MEASUREMENT ONLY -- `RUFFLE_AQW_TRIVIAL_BLEND_DIRECT` renders a trivial
+/// blend straight into the surface it sits in, instead of into a target of its
+/// own.
+///
+/// A trivial blend keeps every part of the complex machinery except the
+/// compositing pass: full-surface target, clear, sub-render, full-surface quad
+/// to draw it back. Nothing priced that, because `blend_alloc`/`blend_cover`
+/// were both gated on complex. Toggling this removes the whole apparatus, so
+/// the frame-time difference is what the apparatus costs.
+///
+/// Never a fix: the group is no longer flattened before the blend state
+/// applies, so `Add`/`Screen`/`Subtract` accumulate per child instead of once
+/// over the composited group, and a `Layer` loses both group alpha and the
+/// layer an `Alpha`/`Erase` child resolves against. Wrong image on purpose,
+/// same as `RUFFLE_AQW_BLEND_AS_NORMAL` -- and, like it, the art stays on
+/// screen, which is what makes the scene comparable at all.
+///
+/// It covers every trivial mode deliberately. Restricting it to `Layer` looked
+/// safer and measured nothing: `Layer` is 23 of 68266 trivial blends in a
+/// session, against 66551 `Add`.
+fn trivial_blend_measured_direct() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        ruffle_render::backend::aqw_env_flag("RUFFLE_AQW_TRIVIAL_BLEND_DIRECT", false)
+    })
+}
+
 use super::target::PoolOrArcTexture;
 
 pub struct CommandRenderer<'pass, 'frame: 'pass, 'global: 'frame> {
@@ -823,6 +850,12 @@ impl CommandHandler for WgpuCommandHandler<'_> {
         } else {
             self.nearest_layer
         };
+        // The mode the content asked for, kept before `BlendType` folds Normal
+        // and Layer together, so the trivial tally can tell the two apart.
+        let builtin_mode = match &blend_mode {
+            RenderBlendMode::Builtin(mode) => Some(*mode),
+            RenderBlendMode::Shader(_) => None,
+        };
         let blend_type = BlendType::from(blend_mode);
 
         // We currently do not support shader blends in masks. In order not to
@@ -846,18 +879,39 @@ impl CommandHandler for WgpuCommandHandler<'_> {
             blend_type
         };
 
-        // A complex blend composites through its own render target. Sized to
-        // the whole surface that is by far the biggest thing this renderer
-        // holds -- a crowded room keeps hundreds alive at once, measured at
+        if matches!(blend_type, BlendType::Trivial(_)) && trivial_blend_measured_direct() {
+            crate::blend::note_trivial_blend(builtin_mode);
+            commands.execute(self);
+            return;
+        }
+
+        // Every blend composites through its own render target. Sized to the
+        // whole surface that is by far the biggest thing this renderer holds --
+        // a crowded room keeps hundreds alive at once, measured at
         // 843 x 1600x841 = 4.3GB, which is what pushes VRAM past the OS grant
         // and starts the paging that collapses the frame rate. Sizing it to
         // the content instead is the same picture in a fraction of the memory,
         // since everything outside the content is transparent either way.
         //
+        // Trivial blends were left out of this when it was written, on the
+        // assumption that skipping the compositing pass made them the cheap
+        // half. It does not: the target, its clear and the quad that draws it
+        // back are identical either way. Measured alone in an empty room, they
+        // took 38 full-surface targets per frame -- 109.7 Mpx, every one of
+        // them holding under 1% content -- and removing that apparatus was
+        // worth 4.0ms of a 41.7ms frame, 687MB of pool retention and 1.2GB of
+        // process commit, with both arms matched on the scene.
+        //
+        // Sound for the same reason as the complex case, and for all four
+        // modes: outside the content the source is transparent, and Normal,
+        // Add, Subtract and Screen all leave the destination untouched where
+        // the source is zero. This drops fill, not result.
+        //
         // Measured ahead of drawing, because the target has to exist first.
-        // Trivial blends feed a plain bitmap draw and shader blends run
-        // arbitrary code, so both keep the full-size target.
-        let bounded = is_complex && !blend_target_shrink_disabled();
+        // PixelBender keeps the full-size target: the shader is arbitrary code,
+        // with no guarantee it reads only where the content is.
+        let bounded =
+            !matches!(blend_type, BlendType::Shader(_)) && !blend_target_shrink_disabled();
         let rect = bounded
             .then(|| {
                 command_list_bounds(&commands)
@@ -885,6 +939,8 @@ impl CommandHandler for WgpuCommandHandler<'_> {
                 self.width as u64 * self.height as u64,
             );
         }
+        let alloc_px = surface_width as u64 * surface_height as u64;
+        let full_px = self.width as u64 * self.height as u64;
 
         let surface = Surface::new(
             self.descriptors,
@@ -914,8 +970,39 @@ impl CommandHandler for WgpuCommandHandler<'_> {
 
         match blend_type {
             BlendType::Trivial(blend_mode) => {
+                // What this cost, at the only point where both halves are
+                // known: the target is sized and the subtree has been drawn, so
+                // its real extent is settled. `blend_bounds` is in the
+                // commands' coordinates, so it is shifted into the target's
+                // before being clipped against it -- the same move the complex
+                // pass makes before scissoring. The complex path reports the
+                // same pair from `note_blend_coverage`/`note_blend_alloc`,
+                // which makes the two directly comparable.
+                crate::blend::note_trivial_blend(builtin_mode);
+                crate::blend::note_trivial_blend_target(
+                    blend_bounds
+                        .translated(-(surface_origin.0 as f32), -(surface_origin.1 as f32))
+                        .clipped_area(target.width(), target.height()),
+                    alloc_px,
+                    full_px,
+                );
                 let transform = Transform {
-                    matrix: Matrix::scale(target.width() as f32, target.height() as f32),
+                    // The target covers `surface_origin` onwards in the
+                    // commands' coordinate space, and `add_to_current`
+                    // subtracts this handler's own origin from whatever it is
+                    // given, so the quad has to be placed in that same space.
+                    // A bare scale put it at the origin of the space instead,
+                    // which was only ever right because a trivial target
+                    // started exactly where its parent did -- true until this
+                    // function started sizing them to their content, and
+                    // already wrong before that for one nested inside a
+                    // content-sized complex target.
+                    matrix: Matrix::create_box(
+                        target.width() as f32,
+                        target.height() as f32,
+                        Twips::from_pixels(surface_origin.0 as f64),
+                        Twips::from_pixels(surface_origin.1 as f64),
+                    ),
                     color_transform: Default::default(),
                     perspective_projection: None,
                 };

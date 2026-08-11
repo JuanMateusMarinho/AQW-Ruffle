@@ -163,6 +163,28 @@ pub trait RenderBackend: Any {
         100
     }
 
+    /// Blend modes cheap enough to fold into GPU blend state since the last
+    /// call, as `(mode, count)` busiest-first, and cleared by reading.
+    ///
+    /// The counterpart to [`Self::take_complex_blend_counts`], and the reason
+    /// it is worth having separately: costing nothing to *composite* does not
+    /// make a blend free, because the intermediate target it renders through
+    /// is the same one either way.
+    fn take_trivial_blend_counts(&mut self) -> Vec<(&'static str, u64)> {
+        Vec::new()
+    }
+
+    /// What those targets cost since the last call, as
+    /// `(live_percent, megapixels, alloc_percent, [<=1%, <=5%, <=25%, >25%])`.
+    ///
+    /// Live percent is how much of each target holds content; alloc percent is
+    /// how big they were against full-surface ones, the mirror of
+    /// [`Self::take_blend_alloc`]; megapixels is the absolute scale, without
+    /// which a small percentage over a large population reads as nothing.
+    fn take_trivial_blend_target(&mut self) -> (u64, u64, u64, [u64; 4]) {
+        (0, 0, 100, [0; 4])
+    }
+
     /// Frame-building cost since the last call, as
     /// `(encode_ms, submit_ms, frames, process_commit_mb)`.
     ///

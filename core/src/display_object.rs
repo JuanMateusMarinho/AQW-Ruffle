@@ -1837,7 +1837,6 @@ static AQW_BLEND_LAYERS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 pub(crate) static AQW_AVATAR_CACHES_ENABLED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-
 /// Kill-switch: `RUFFLE_AQW_NO_AVATAR_CACHE` restores live re-rendering of
 /// avatar art every frame, for field A/B without a rebuild.
 pub(crate) fn aqw_avatar_cache_disabled() -> bool {
@@ -1945,16 +1944,21 @@ static AQW_BLEND_BY_BAKE: std::sync::Mutex<Option<std::collections::HashMap<Stri
     std::sync::Mutex::new(None);
 static AQW_BLEND_BY_LIVE: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
     std::sync::Mutex::new(None);
+/// The same name for the trivial ones. They were left anonymous while they
+/// were assumed to be the cheap half; the renderer-side measurement says they
+/// take a full-surface target each and fill 1% of it, so which art emits them
+/// is the same question naming `ReignoldKnightCC` answered for the complex
+/// ones.
+static AQW_BLEND_BY_LIVE_TRIVIAL: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+    std::sync::Mutex::new(None);
 
 /// Complex blends split by where they were emitted from. Read against
 /// `blend_modes`, whose sum is the renderer's own count of the same passes:
 /// `blend_bake + blend_live` has to land on it, or something is emitting
 /// blends this attribution never sees and the split below describes a fraction.
-static AQW_BLEND_COMPLEX_BAKED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static AQW_BLEND_COMPLEX_BAKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AQW_BLEND_COMPLEX_LIVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static AQW_BLEND_TRIVIAL_BAKED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static AQW_BLEND_TRIVIAL_BAKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AQW_BLEND_TRIVIAL_LIVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Bakes started, and the deepest nesting reached. A cache inside a bake is
 /// possible since the filtered-children exemption (2026-08-06), so depth is
@@ -2078,13 +2082,16 @@ fn note_blend_emitted<'gc>(this: DisplayObject<'gc>, owner: Option<&str>, comple
         }
         None => {
             // Live blends are the population the caching was supposed to
-            // remove, so only the expensive kind is worth a name.
-            if !complex {
-                return;
-            }
-            note_live_blend_ancestry(this);
+            // remove, so both kinds are worth a name -- the trivial ones cost
+            // a target of their own just the same, they only save the pass.
             let label = aqw_blend_label(this);
-            if let Ok(mut guard) = AQW_BLEND_BY_LIVE.lock() {
+            let tally = if complex {
+                note_live_blend_ancestry(this);
+                &AQW_BLEND_BY_LIVE
+            } else {
+                &AQW_BLEND_BY_LIVE_TRIVIAL
+            };
+            if let Ok(mut guard) = tally.lock() {
                 let counts = guard.get_or_insert_with(std::collections::HashMap::new);
                 if counts.len() < 512 || counts.contains_key(&label) {
                     *counts.entry(label).or_insert(0) += 1;
@@ -2116,8 +2123,7 @@ static AQW_CACHE_BYPASS_ONSCREEN: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 /// Caches the fix kept alive: off-screen by the old comparison, on-screen by
 /// the corrected one.
-static AQW_CACHE_BYPASS_SAVED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static AQW_CACHE_BYPASS_SAVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AQW_BYPASS_BY_OBJECT: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
     std::sync::Mutex::new(None);
 
@@ -2180,8 +2186,7 @@ fn take_bypassed_objects(limit: usize) -> Vec<String> {
 /// arriving here live means no ancestor cache took effect -- and the split is
 /// between "no ancestor ever wanted one" and "an ancestor wanted one and it
 /// was suppressed", which are different bugs with different fixes.
-static AQW_BLEND_LIVE_NO_CACHE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static AQW_BLEND_LIVE_NO_CACHE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AQW_BLEND_LIVE_HAD_CACHE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -2217,7 +2222,19 @@ fn take_bake_blends(limit: usize) -> Vec<String> {
 
 /// Drains the live-blend tally as `Class@file:complex`, busiest first.
 fn take_live_blends(limit: usize) -> Vec<String> {
-    let Ok(mut guard) = AQW_BLEND_BY_LIVE.lock() else {
+    take_live_blend_tally(&AQW_BLEND_BY_LIVE, limit)
+}
+
+/// The same, for the blends that fold into blend state.
+fn take_live_trivial_blends(limit: usize) -> Vec<String> {
+    take_live_blend_tally(&AQW_BLEND_BY_LIVE_TRIVIAL, limit)
+}
+
+fn take_live_blend_tally(
+    tally: &std::sync::Mutex<Option<std::collections::HashMap<String, u64>>>,
+    limit: usize,
+) -> Vec<String> {
+    let Ok(mut guard) = tally.lock() else {
         return Vec::new();
     };
     let Some(counts) = guard.take() else {
@@ -3228,6 +3245,38 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
             .collect::<Vec<_>>()
             .join("/");
 
+        // What used to be the blind spot: everything above counts only the
+        // blends that cost a pass of their own, and a trivial blend skips the
+        // pass and nothing else -- it takes the same target, clear, sub-render
+        // and composite quad. Until this was measured, neither the V2.0 scissor
+        // nor the target shrink reached them, because both were gated on the
+        // blend being complex.
+        //
+        // `blend_triv_cover` is the same question `blend_cover` answers for the
+        // complex ones (how much of the target was ever written) and
+        // `blend_triv_alloc` mirrors `blend_alloc` (how big it was against a
+        // full-surface one). They now move in opposite directions, and that is
+        // the check that the sizing is working: alloc should be small and cover
+        // large. Before it, alloc was 100% by construction and cover read 0-1%.
+        // `blend_triv_mpx` is the absolute scale both have to be read against;
+        // divide it by `render_frames` for per frame, where the same empty room
+        // measured 109.7 before and is the number to compare against.
+        let trivial_blend_modes = context
+            .renderer
+            .take_trivial_blend_counts()
+            .iter()
+            .map(|(name, count)| format!("{name}:{count}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let blend_triv_top = take_live_trivial_blends(6).join(",");
+        let (blend_triv_cover, blend_triv_mpx, blend_triv_alloc, blend_triv_buckets) =
+            context.renderer.take_trivial_blend_target();
+        let blend_triv_hist = blend_triv_buckets
+            .iter()
+            .map(|count| count.to_string())
+            .collect::<Vec<_>>()
+            .join("/");
+
         // Built once, emitted twice. The two destinations used to carry their
         // own field lists and had already drifted ~30 columns apart -- the
         // console was missing every `goto_*`, `inner_*` and `stage_*` the file
@@ -3270,6 +3319,10 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
              tex_top={tex_top} blend_modes={blend_modes} \
              blend_cover={blend_cover}% blend_cover_hist={blend_cover_hist} \
              blend_alloc={blend_alloc}% \
+             blend_triv_modes={trivial_blend_modes} \
+             blend_triv_cover={blend_triv_cover}% blend_triv_hist={blend_triv_hist} \
+             blend_triv_alloc={blend_triv_alloc}% \
+             blend_triv_mpx={blend_triv_mpx} blend_triv_top={blend_triv_top} \
              render_encode_ms={render_encode_ms} render_submit_ms={render_submit_ms} \
              render_frames={render_frames} commit_mb={commit_mb} \
              blend_swfs={blend_swfs} avatar_caches={avatar_caches} \
@@ -4967,9 +5020,7 @@ pub trait TDisplayObject<'gc>:
         if changed && aqw_flicker_probe_enabled() {
             note_colour_write(self, &color_transform);
         }
-        if changed
-            && let Some(parent) = self.parent()
-        {
+        if changed && let Some(parent) = self.parent() {
             // Self-transform changes are handled when the cache is drawn, so
             // only ancestors need telling -- matching the sibling setters.
             //
