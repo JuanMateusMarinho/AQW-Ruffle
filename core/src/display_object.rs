@@ -117,6 +117,12 @@ pub struct BitmapCache {
     /// Whether we warned that this bitmap was too large to be cached
     warned_for_oversize: bool,
 
+    /// Whether we reported this cache resolving to a zero-sided rect. Separate
+    /// from the oversize flag because they are opposite ends of the same
+    /// suspicion: a non-finite value crossing into `Twips` collapses one way
+    /// and saturates the other, and both were seen in the same object group.
+    warned_for_zero: bool,
+
     /// Render-back offset, relative to the object's translation, that matches
     /// the texture contents from the last admitted redraw. A deferred (stale)
     /// cache must be drawn at this anchor: the live bounds/draw_offset may have
@@ -129,6 +135,14 @@ pub struct BitmapCache {
     /// keeps losing the budget race (admission is in render order) still
     /// refreshes within about a second instead of staying stale forever.
     deferred_frames: u32,
+
+    /// Consecutive rendered frames this cache was found dirty, whether or not
+    /// its redraw was admitted. Distinct from `deferred_frames`, which counts
+    /// only refusals and resets on every redraw: this keeps counting through
+    /// admitted redraws, so it measures how long the contents have been
+    /// *changing* rather than how long they have been stale. See
+    /// `aqw_defer_eligible_frames`.
+    dirty_streak: u32,
 
     /// Consecutive redraws where the object's transform was unchanged but the
     /// computed cache geometry was not. See `note_static_churn`.
@@ -145,7 +159,63 @@ const STATIC_CHURN_REPORT_FRAMES: u32 = 48;
 
 const MAX_CACHE_BITMAP_DIMENSION: u32 = 4096;
 const MAX_CACHE_BITMAP_PIXELS: u32 = 2_500_000;
-const MAX_AQW_CACHE_BITMAP_PIXELS: u32 = 8_000_000;
+
+/// The ceiling on an AQW cache texture, raised on 2026-08-12 to the one Flash
+/// Player itself used: 8191 a side, 16777215 pixels. `RUFFLE_AQW_CACHE_MAX_SIDE`
+/// and `RUFFLE_AQW_CACHE_MAX_PIXELS` override; 4096 and 8000000 are the values
+/// this fork ran before.
+///
+/// Refusing a cache is not a graceful degradation here, it is the worst case the
+/// renderer has: the subtree renders vector every frame *and* every blend
+/// placement inside it becomes its own live pass. Measured 2026-08-12 in
+/// Battleon, an avatar item that lost its cache this way (`Dmnk26FiendRider`)
+/// emitted ~2490 complex blends per sweep window with the counters repeating to
+/// the digit between windows -- static art recomposed 24 times a second -- and
+/// took the frame from ~35 ms to ~68. `live_hadcache` was 1222-1922 whenever it
+/// was on screen and exactly 0 whenever it was not.
+///
+/// The old limits were stricter than the player being emulated, and the log said
+/// so at every refusal: `flash_acceptable_size=true` beside
+/// `aqw_practical_acceptable_size=false`.
+///
+/// **These are surface pixels, not stage pixels.** The sizes that tripped the
+/// old caps -- 4054x2112, 4503x1618 -- are roughly 1750x920 of content times a
+/// fullscreen view scale of about 2.3 (window scale times the 1.25 supersample).
+/// So the same item kept its cache in a window and lost it in fullscreen, which
+/// is the same coordinate-space confusion as the offscreen-bypass defect. The
+/// clean fix is to judge content size and let the texture scale with the view;
+/// raising the ceiling is the cheap half, and it is the half that can be
+/// measured tonight.
+/// **Raised to Flash's own limits on 2026-08-12 and put back the same night.**
+/// Two sessions with the offending item on screen showed no change at all:
+/// `live_hadcache` stayed at 1262-1924 with the ceiling raised, and again with
+/// redraw deferral switched off entirely. Whatever suppresses that cache is
+/// neither its size nor its admission, so the raise bought nothing and loosened
+/// a memory limit in the one area this fork has a standing problem with. Set
+/// `RUFFLE_AQW_CACHE_MAX_SIDE=8191` and `RUFFLE_AQW_CACHE_MAX_PIXELS=16777215`
+/// to try it again once something says it would help.
+const MAX_AQW_CACHE_BITMAP_SIDE_DEFAULT: u32 = 4096;
+const MAX_AQW_CACHE_BITMAP_PIXELS_DEFAULT: u32 = 8_000_000;
+
+fn aqw_max_cache_side() -> u32 {
+    static SIDE: OnceLock<u32> = OnceLock::new();
+    *SIDE.get_or_init(|| {
+        std::env::var("RUFFLE_AQW_CACHE_MAX_SIDE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(MAX_AQW_CACHE_BITMAP_SIDE_DEFAULT)
+    })
+}
+
+fn aqw_max_cache_pixels() -> u32 {
+    static PIXELS: OnceLock<u32> = OnceLock::new();
+    *PIXELS.get_or_init(|| {
+        std::env::var("RUFFLE_AQW_CACHE_MAX_PIXELS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(MAX_AQW_CACHE_BITMAP_PIXELS_DEFAULT)
+    })
+}
 /// A transform scale component beyond this is degenerate for bitmap caching: even
 /// a 1px object would exceed the cache dimension limit, so the cache would be
 /// rejected anyway. Used to short-circuit such objects (e.g. AQW's occasional
@@ -209,8 +279,17 @@ pub(crate) fn script_requeue_disabled() -> bool {
     *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_SCRIPT_REQUEUE", false))
 }
 /// Let every dirty cache redraw in the frame it goes dirty, instead of letting
-/// the budget defer it and compose the previous texture. **On by default.**
-/// `RUFFLE_AQW_NO_REDRAW_DEFER=0` restores deferral.
+/// the budget defer it and compose the previous texture. **Off by default since
+/// 2026-08-12**, when the grace window below made deferral safe enough to keep;
+/// `RUFFLE_AQW_NO_REDRAW_DEFER=1` brings it back, and is the escape if wrong
+/// colours ever resurface.
+///
+/// It shipped *on* in V2.8, and that cost 2.4x of frame time in a scene with
+/// animated map art (69.9 ms/frame against 29.4 with deferral restored, measured
+/// in Battleon on 2026-08-11 with `blend_bake` at 4052 against 267). The
+/// paragraph below about the cost is what that measurement corrected: it was
+/// taken while standing alone casting one skill, a scene where deferral has
+/// almost nothing to defer, and it is wrong by about 27x for a busy one.
 ///
 /// A deferred cache stands in with its last texture, and that texture carries
 /// the colour its contents had when it was rendered. For a skill FX whose
@@ -230,15 +309,70 @@ pub(crate) fn script_requeue_disabled() -> bool {
 /// 24fps. `redraw_large` rose from ~130-200 to ~190-235 per window, which is
 /// exactly the deferred work now being done on time.
 ///
-/// **Not yet measured in a crowded room**, which is what the deferral budget
-/// was built for in the first place (event FX storms, full towns). If frame
-/// time suffers there, `RUFFLE_AQW_NO_REDRAW_DEFER=0` restores the old
-/// behaviour without a rebuild, and the real answer is likely a budget that
-/// reacts to actual frame cost rather than a fixed per-frame allowance.
+/// What replaced it is not a better budget but a narrower one: deferral is back,
+/// and `aqw_defer_eligible_frames` withholds it from caches that have not been
+/// changing long enough to be safe to stand in for. Turning this on again
+/// disables that too, since there is then no deferral for it to gate.
 pub(crate) fn redraw_defer_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_REDRAW_DEFER", true))
+    *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_REDRAW_DEFER", false))
 }
+
+/// How many frames a cache must have been going dirty in a row before the
+/// redraw budget is allowed to defer it. `RUFFLE_AQW_DEFER_ELIGIBLE_FRAMES=N`
+/// overrides; `0` restores the ungated budget, which is the behaviour that
+/// flickers.
+///
+/// The bet, and what makes this a different axis from the dead one above: art
+/// that changes every frame is *animating*, and one frame of animation lag on
+/// it is invisible -- that is the map content the deferral was built for, and
+/// where the 2.4x of frame time measured on 2026-08-11 lives. Art that goes
+/// dirty after standing still has had something *happen* to it, and a stand-in
+/// there shows the state before it happened, which is the skill FX composing
+/// its pre-cast colour. So the grace window is not a bound on how stale a
+/// texture may get (that was tried, 24 frames to 4, and changed nothing because
+/// a stand-in is wrong on its first frame) but on how settled the object has to
+/// be before a stale texture is allowed to represent it at all.
+///
+/// It works only if the colour write lands inside the window, while the clip is
+/// young, and that was bisected in the field on 2026-08-12 against the Wicked
+/// Purgatory repro in fullscreen: 0 and 4 flicker, 8, 12 and 60 do not. 12 is
+/// the default rather than 8 because Wicked Purgatory is one effect and another
+/// skill may write its colour later, and because the two are indistinguishable
+/// on cost.
+///
+/// It separates the two populations on its own, with no asset names in it. In
+/// Battleon, where the emitters are animated map art, `defer_grace` runs at
+/// 0-2% of admitted redraws -- that art never settles, so it stays deferrable
+/// and the frame time the budget was restored for is kept. In a room dominated
+/// by skill FX, the same counter tracks the effect's blend count roughly 1:1.
+///
+/// Where it does cost is the transient: entering a busy room builds dozens of
+/// caches at once and every one of them is inside its window, which took
+/// `defer_grace` to 42-61% of admitted redraws for a window or two (and, at
+/// N=60, to 76% with deferral entirely neutralised -- the shape of the
+/// 2026-07-30 failure, where an exemption swallowed the budget rather than
+/// carving an exception in it). If that transient ever shows up as a hitch on
+/// room change, cap graced redraws per frame rather than lowering N: the cap
+/// bounds the burst without shortening the window that correctness rests on.
+///
+/// Steady-state cost was not separable from scene: public-room sessions differ
+/// in who is standing in them and what they are wearing, and one heavy item is
+/// worth dozens of blend passes per bake, so frame time across runs moved by
+/// more than the lever ever did. The honest figure is ~1-2 ms/frame, from the
+/// two comparisons that were matched on occupancy and effect load.
+pub(crate) fn aqw_defer_eligible_frames() -> u32 {
+    static FRAMES: OnceLock<u32> = OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("RUFFLE_AQW_DEFER_ELIGIBLE_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(AQW_DEFER_ELIGIBLE_FRAMES_DEFAULT)
+    })
+}
+
+/// See `aqw_defer_eligible_frames`. 12 frames is half a second at AQW's 24fps.
+const AQW_DEFER_ELIGIBLE_FRAMES_DEFAULT: u32 = 12;
 
 /// Kill-switch for letting a filtered child keep its cache inside an AQW bake,
 /// which is the only way its filters get applied at all.
@@ -642,6 +776,14 @@ impl BitmapCache {
         if self.source_width != source_width || self.source_height != source_height {
             return Some(CacheDirtyReason::Size);
         }
+        // `make_dirty` poisons this field, so NaN here means the subtree said it
+        // changed rather than that the object moved. Checked before the matrix
+        // comparison it would otherwise fall into, and after the two above, so
+        // `dirty_notex` and `dirty_size` keep the meaning earlier sessions
+        // measured them with and only the `dirty_matrix` bucket splits.
+        if self.matrix_a.is_nan() {
+            return Some(CacheDirtyReason::Invalidated);
+        }
         if self.matrix_a != other.a
             || self.matrix_b != other.b
             || self.matrix_c != other.c
@@ -705,9 +847,9 @@ impl BitmapCache {
             && actual_height <= MAX_CACHE_BITMAP_DIMENSION
             && total_pixels <= MAX_CACHE_BITMAP_PIXELS;
         let aqw_practical_acceptable_size = allow_aqw_large_cache
-            && actual_width <= MAX_CACHE_BITMAP_DIMENSION
-            && actual_height <= MAX_CACHE_BITMAP_DIMENSION
-            && total_pixels <= MAX_AQW_CACHE_BITMAP_PIXELS;
+            && actual_width <= aqw_max_cache_side()
+            && actual_height <= aqw_max_cache_side()
+            && total_pixels <= aqw_max_cache_pixels();
         let aqw_flash_acceptable_size = allow_aqw_large_cache
             && actual_width < 8191
             && actual_height < 8191
@@ -788,6 +930,9 @@ impl BitmapCache {
     /// temporarily disabled.
     fn clear(&mut self) {
         self.bitmap = None;
+        // Nothing survives to stand in, so the object starts over as far as
+        // deferral eligibility is concerned.
+        self.dirty_streak = 0;
     }
 
     fn handle(&self) -> Option<BitmapHandle> {
@@ -2190,17 +2335,186 @@ static AQW_BLEND_LIVE_NO_CACHE: std::sync::atomic::AtomicU64 = std::sync::atomic
 static AQW_BLEND_LIVE_HAD_CACHE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// What caching a given ancestor would buy, and what it would cost to buy it.
+///
+/// Both halves are needed and the fork has twice been tempted to decide on the
+/// first alone. A blend pass is not priced by how many there are but by the
+/// area each one covers, so two hundred tiny blends can be cheaper left alone
+/// than collapsed into a bake that has to cover the screen. `blends` is the
+/// prize, `area_px` is the price.
+struct LiveAncestorTally {
+    /// Live complex blends emitted anywhere under this ancestor.
+    blends: u64,
+    /// What a bake of this ancestor would have to cover, in stage pixels,
+    /// sampled once per window because it costs a bounds traversal.
+    area_px: u64,
+    /// How far above the emitter this ancestor sits. Shallow and cheap is the
+    /// shape worth having; the deepest ancestors are whole maps.
+    depth: u32,
+}
+
+static AQW_BLEND_LIVE_BY_ANCESTOR: std::sync::Mutex<
+    Option<std::collections::HashMap<String, LiveAncestorTally>>,
+> = std::sync::Mutex::new(None);
+
+/// Drains the per-ancestor tally as `Class@file:blends/areaKpx/depth`, by prize.
+fn take_live_ancestors(limit: usize) -> Vec<String> {
+    let Ok(mut guard) = AQW_BLEND_LIVE_BY_ANCESTOR.lock() else {
+        return Vec::new();
+    };
+    let Some(counts) = guard.take() else {
+        return Vec::new();
+    };
+    let mut counts: Vec<(String, LiveAncestorTally)> = counts.into_iter().collect();
+    counts.sort_unstable_by_key(|(_, tally)| std::cmp::Reverse(tally.blends));
+    counts.truncate(limit);
+    counts
+        .into_iter()
+        .map(|(name, tally)| {
+            format!(
+                "{name}:{}/{}k/{}",
+                tally.blends,
+                tally.area_px / 1000,
+                tally.depth
+            )
+        })
+        .collect()
+}
+
+/// Why an object that asked to be cached ended up drawing itself instead.
+///
+/// `live_hadcache` says this happened; it cannot say which of six unrelated
+/// branches did it, and each one has a different fix. Two hypotheses were spent
+/// guessing between them on 2026-08-12 -- the size ceiling and redraw admission,
+/// both raised/disabled with the counter unmoved -- before it was cheaper to
+/// just record the branch. Same move that split `dirty_matrix`.
+#[derive(Copy, Clone)]
+pub(crate) enum CacheSuppressReason {
+    /// Caching is switched off for this context: the object sits inside an AQW
+    /// bake, which disables descendant caches on purpose, and it is not one of
+    /// the filtered children exempted from that.
+    NotHere,
+    /// The offscreen-cache bypass threw it away.
+    Bypassed,
+    /// Bounds beyond what the cache dimensions can express at all.
+    OversizeU16,
+    /// The redraw was admitted, `update` ran, and no texture came back with a
+    /// non-zero rect to allocate -- so the size gates refused it, or the
+    /// renderer did. The `Skipping bitmap cache allocation` line separates
+    /// those two, and it fires once per cache.
+    AllocRefused,
+    /// `update` ran on a rect with a zero side. `NonZero` then refuses the
+    /// allocation before any size gate is consulted, so the cache never gets a
+    /// texture, the subtree draws itself, and every blend inside it becomes its
+    /// own live pass -- for as long as the object exists, since nothing in that
+    /// state repairs itself. The detail carries the bounds that produced it.
+    AllocZero,
+    /// Deferred, with no texture yet to stand in with.
+    DeferredNoTexture,
+    /// Deferred, holding a texture, but the object has moved too far from where
+    /// that texture was rendered for it to be a plausible stand-in.
+    DriftFallback,
+    /// Not dirty and still no texture, which should not happen.
+    CleanNoTexture,
+}
+
+impl CacheSuppressReason {
+    fn name(self) -> &'static str {
+        match self {
+            Self::NotHere => "not_here",
+            Self::Bypassed => "bypassed",
+            Self::OversizeU16 => "oversize",
+            Self::AllocRefused => "alloc_refused",
+            Self::AllocZero => "alloc_zero",
+            Self::DeferredNoTexture => "defer_notex",
+            Self::DriftFallback => "drift",
+            Self::CleanNoTexture => "clean_notex",
+        }
+    }
+}
+
+static AQW_CACHE_SUPPRESSED: std::sync::Mutex<
+    Option<std::collections::HashMap<String, u64>>,
+> = std::sync::Mutex::new(None);
+
+fn note_cache_suppressed<'gc>(
+    this: DisplayObject<'gc>,
+    reason: CacheSuppressReason,
+    detail: Option<&str>,
+) {
+    let key = match detail {
+        Some(detail) => format!("{}|{}[{detail}]", reason.name(), aqw_blend_label(this)),
+        None => format!("{}|{}", reason.name(), aqw_blend_label(this)),
+    };
+    let Ok(mut guard) = AQW_CACHE_SUPPRESSED.lock() else {
+        return;
+    };
+    let counts = guard.get_or_insert_with(std::collections::HashMap::new);
+    if counts.len() < 512 || counts.contains_key(&key) {
+        *counts.entry(key).or_insert(0) += 1;
+    }
+}
+
+/// Drains the suppression tally as `reason|Class@file:count`, busiest first.
+fn take_cache_suppressed(limit: usize) -> Vec<String> {
+    take_live_blend_tally(&AQW_CACHE_SUPPRESSED, limit)
+}
+
 fn note_live_blend_ancestry<'gc>(this: DisplayObject<'gc>) {
     use std::sync::atomic::Ordering::Relaxed;
     let mut node = this.parent();
+    let mut depth = 0u32;
+    let mut had_cache = false;
     while let Some(parent) = node {
+        depth += 1;
+        // Every ancestor is a candidate: caching any one of them would collapse
+        // every blend below it into a single draw. Which one is worth it is the
+        // question this answers, and it is deliberately answered for all of
+        // them rather than for a hand-picked "root", because every hand-drawn
+        // class this fork has written -- avatar asset roots in V2.0 -- has been
+        // missed by the next heavy thing the game shipped.
+        note_live_blend_candidate(parent, depth);
         if parent.is_bitmap_cached() {
             AQW_BLEND_LIVE_HAD_CACHE.fetch_add(1, Relaxed);
-            return;
+            had_cache = true;
+            break;
         }
         node = parent.parent();
     }
-    AQW_BLEND_LIVE_NO_CACHE.fetch_add(1, Relaxed);
+    if !had_cache {
+        AQW_BLEND_LIVE_NO_CACHE.fetch_add(1, Relaxed);
+    }
+}
+
+fn note_live_blend_candidate<'gc>(ancestor: DisplayObject<'gc>, depth: u32) {
+    let label = aqw_blend_label(ancestor);
+    let Ok(mut guard) = AQW_BLEND_LIVE_BY_ANCESTOR.lock() else {
+        return;
+    };
+    let counts = guard.get_or_insert_with(std::collections::HashMap::new);
+    if let Some(tally) = counts.get_mut(&label) {
+        tally.blends += 1;
+        tally.depth = tally.depth.min(depth);
+        return;
+    }
+    if counts.len() >= 512 {
+        return;
+    }
+    // Only on first sight in this window: a bounds traversal of a whole map
+    // subtree is not something to run per blend. Stage pixels, deliberately --
+    // the surface size follows from the view scale, and pricing a candidate
+    // should not change with the window.
+    let bounds = ancestor.world_bounds(BoundsMode::Engine);
+    let area_px = (bounds.width().to_pixels().max(0.0) * bounds.height().to_pixels().max(0.0))
+        as u64;
+    counts.insert(
+        label,
+        LiveAncestorTally {
+            blends: 1,
+            area_px,
+            depth,
+        },
+    );
 }
 
 /// Drains the per-bake tally as `Class@file:bakes/complex`, busiest first.
@@ -2270,6 +2584,15 @@ pub(crate) enum CacheDirtyReason {
     NoTexture,
     /// The subtree's pixel size changed.
     Size,
+    /// Something inside the subtree announced that it changed, through
+    /// `invalidate_cached_bitmap`. That is the only way a change that leaves
+    /// the box and the transform alone -- a colour write, a child swapped for
+    /// another of the same size -- can reach the cache at all, since `is_dirty`
+    /// compares nothing but geometry. It is recorded by poisoning `matrix_a`
+    /// with NaN, so it arrives here indistinguishable from a real transform
+    /// change unless it is picked out first; separating the two is the point of
+    /// this variant.
+    Invalidated,
     /// The composed transform changed: the object moved or scaled, or the
     /// window resized under it.
     Matrix,
@@ -2290,6 +2613,22 @@ pub(crate) static AQW_CACHE_DIRTY_NOTEX: std::sync::atomic::AtomicU64 =
 pub(crate) static AQW_CACHE_DIRTY_SIZE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static AQW_CACHE_DIRTY_MATRIX: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// The share of what used to be counted as `dirty_matrix` that is really a
+/// content change announced from inside the subtree (`CacheDirtyReason::
+/// Invalidated`). The two were indistinguishable until 2026-08-12, which is why
+/// the plan of "defer geometry, never defer colour" could not be written: the
+/// signal it assumed exists in the sweep did not.
+pub(crate) static AQW_CACHE_DIRTY_INVALID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Redraws that skipped the budget because the cache had not been dirty long
+/// enough to be eligible for deferral (`aqw_defer_eligible_frames`). This is
+/// the *added* work the grace window buys, not deferrals it prevented -- the
+/// budget might well have admitted them anyway. Read it against `redraw_large`
+/// and `redraw_small`: if it approaches their sum, the grace has eaten the
+/// budget instead of carving an exception out of it, which is how the
+/// 2026-07-30 attempt at exempting colour-dirty caches failed.
+pub(crate) static AQW_CACHE_DEFER_GRACE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static AQW_CACHE_BYPASS_CLEARED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -3029,6 +3368,8 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         let dirty_notex = AQW_CACHE_DIRTY_NOTEX.swap(0, Ordering::Relaxed);
         let dirty_size = AQW_CACHE_DIRTY_SIZE.swap(0, Ordering::Relaxed);
         let dirty_matrix = AQW_CACHE_DIRTY_MATRIX.swap(0, Ordering::Relaxed);
+        let dirty_invalid = AQW_CACHE_DIRTY_INVALID.swap(0, Ordering::Relaxed);
+        let defer_grace = AQW_CACHE_DEFER_GRACE.swap(0, Ordering::Relaxed);
         let bypass_cleared = AQW_CACHE_BYPASS_CLEARED.swap(0, Ordering::Relaxed);
         let orph_pop = AQW_ORPHAN_POP.swap(0, Ordering::Relaxed);
         let orph_playing = AQW_ORPHAN_POP_PLAYING.swap(0, Ordering::Relaxed);
@@ -3204,6 +3545,17 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         let bypass_top = take_bypassed_objects(6).join(",");
         let live_nocache = AQW_BLEND_LIVE_NO_CACHE.swap(0, Ordering::Relaxed);
         let live_hadcache = AQW_BLEND_LIVE_HAD_CACHE.swap(0, Ordering::Relaxed);
+        // `Class@file:blends/areaKpx/depth` -- what caching that ancestor would
+        // collapse, against what its bake would have to cover. Divide blends by
+        // `render_frames` for a per-frame prize. A candidate worth having is a
+        // large first number beside a small second one; the map root will show
+        // the largest prize of all and is worthless, because its area is the
+        // whole scene.
+        let live_cand = take_live_ancestors(8).join(",");
+        // `reason|Class@file:count` -- which branch abandoned a cache the
+        // content (or the auto-cache) had asked for. This is the column that
+        // says what to fix when `live_hadcache` is high.
+        let cache_suppress = take_cache_suppressed(8).join(",");
         // `Dictionary` retention. The class takes a `weakKeys` flag and drops
         // it, so object-space entries are pinned for the dictionary's whole
         // life; content that expects the player to drop unreachable keys gets
@@ -3307,7 +3659,8 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
              stage_enter_ms={stage_enter_ms} stage_ctor_ms={stage_ctor_ms} \
              stage_script_ms={stage_script_ms} orphans_frozen={orphans_frozen} \
              dirty_notex={dirty_notex} dirty_size={dirty_size} \
-             dirty_matrix={dirty_matrix} bypass_cleared={bypass_cleared} \
+             dirty_matrix={dirty_matrix} dirty_invalid={dirty_invalid} \
+             defer_grace={defer_grace} bypass_cleared={bypass_cleared} \
              orph_pop={orph_pop} orph_playing={orph_playing} orph_script={orph_script} \
              orph_avatar={orph_avatar} orph_quiet={orph_quiet} \
              orph_clean_visits={orph_clean_visits} orph_dirty_visits={orph_dirty_visits} \
@@ -3342,6 +3695,7 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
              bypass_all={bypass_all} bypass_onscreen={bypass_onscreen} \
              bypass_saved={bypass_saved} \
              live_nocache={live_nocache} live_hadcache={live_hadcache} \
+             live_cand={live_cand} cache_suppress={cache_suppress} \
              bypass_top={bypass_top}"
         );
 
@@ -4151,6 +4505,8 @@ pub fn render_base<'gc>(
         && context.cache_filtered_children
         && !aqw_nested_filter_cache_disabled()
         && !this.filters().is_empty();
+    let mut suppress_reason: Option<CacheSuppressReason> = None;
+    let mut suppress_detail: Option<String> = None;
     let cache_info = if (context.use_bitmap_cache || nested_filter_cache) && this.is_bitmap_cached()
     {
         let mut cache_info: Option<DrawCacheInfo> = None;
@@ -4222,6 +4578,7 @@ pub fn render_base<'gc>(
                     note_cache_bypass(this, context, &bounds);
                 }
                 cache.clear();
+                suppress_reason = Some(CacheSuppressReason::Bypassed);
             } else {
                 let width = bounds.width().to_pixels().ceil().max(0.0);
                 let height = bounds.height().to_pixels().ceil().max(0.0);
@@ -4259,12 +4616,19 @@ pub fn render_base<'gc>(
                                 Some(CacheDirtyReason::Size) => {
                                     AQW_CACHE_DIRTY_SIZE.fetch_add(1, Relaxed)
                                 }
+                                Some(CacheDirtyReason::Invalidated) => {
+                                    AQW_CACHE_DIRTY_INVALID.fetch_add(1, Relaxed)
+                                }
                                 Some(CacheDirtyReason::Matrix) => {
                                     AQW_CACHE_DIRTY_MATRIX.fetch_add(1, Relaxed)
                                 }
                                 None => 0,
                             };
                         }
+                        // Counts through admitted redraws, so it measures how
+                        // long the contents have been moving. Reset only on a
+                        // frame that finds the cache clean, below.
+                        cache.dirty_streak = cache.dirty_streak.saturating_add(1);
                         let redraw_pixels = u64::from(actual_width) * u64::from(actual_height);
                         // The large/small split (and the per-frame pixel budget in
                         // `Player::render`) is calibrated in ~1x windowed pixels.
@@ -4293,12 +4657,19 @@ pub fn render_base<'gc>(
                         // the swarm is what melts FPS. They now draw from their own
                         // per-frame quota instead.
                         let mut admitted_aged = false;
+                        let grace_admitted = cache.dirty_streak <= aqw_defer_eligible_frames();
                         let mut can_redraw_cache = if !allow_aqw_large_cache || aqw_auto_cache {
                             // Deferral trades freshness for frame time, which
                             // only works when the art is standing still. An
                             // avatar cache that misses its redraw during a zoom
                             // composites at the previous scale and visibly
                             // detaches, so these always redraw.
+                            true
+                        } else if grace_admitted {
+                            // Too recently settled to stand in for itself: the
+                            // texture on hand predates whatever just happened to
+                            // this object. See `aqw_defer_eligible_frames`.
+                            AQW_CACHE_DEFER_GRACE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             true
                         } else if is_large {
                             context.try_reserve_dirty_cache_redraw(redraw_pixels)
@@ -4378,6 +4749,8 @@ pub fn render_base<'gc>(
                                     AQW_CACHE_REDRAWS_SMALL.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
+                            // Read before the move into `DrawCacheInfo`.
+                            let probe = (base_transform.matrix, bounds, filters.len());
                             cache_info = cache.handle().map(|handle| DrawCacheInfo {
                                 handle,
                                 dirty: true,
@@ -4388,6 +4761,48 @@ pub fn render_base<'gc>(
                                 offset_override: None,
                                 aqw_auto_cache,
                             });
+                            if cache_info.is_none() {
+                                // A zero side is refused by `NonZero` before any
+                                // size gate is consulted, so it is a different
+                                // failure with a different fix, and the counts
+                                // said the size gate cannot be carrying this:
+                                // it warns once per cache and warned once all
+                                // session against hundreds of refusals here.
+                                suppress_reason = Some(if actual_width == 0 || actual_height == 0 {
+                                    suppress_detail = Some(format!(
+                                        "{width}x{height}->{actual_width}x{actual_height}"
+                                    ));
+                                    // The raw numbers, once per cache. A zero
+                                    // rect and a rect past 65535 are the two
+                                    // ends a non-finite value produces when it
+                                    // crosses into `Twips`, and both turned up
+                                    // in this object group, so print the sides
+                                    // and the matrix rather than the size.
+                                    if aqw_diagnostics_enabled() && !cache.warned_for_zero {
+                                        cache.warned_for_zero = true;
+                                        let (m, b, filter_count) = probe;
+                                        tracing::warn!(
+                                            target: "aqw_diag",
+                                            movie = this.movie().url(),
+                                            x_min = b.x_min.get(),
+                                            x_max = b.x_max.get(),
+                                            y_min = b.y_min.get(),
+                                            y_max = b.y_max.get(),
+                                            m_a = m.a,
+                                            m_b = m.b,
+                                            m_c = m.c,
+                                            m_d = m.d,
+                                            m_tx = m.tx.get(),
+                                            m_ty = m.ty.get(),
+                                            filters = filter_count,
+                                            "AQW cache resolved to a zero-sided rect"
+                                        );
+                                    }
+                                    CacheSuppressReason::AllocZero
+                                } else {
+                                    CacheSuppressReason::AllocRefused
+                                });
+                            }
                         } else {
                             // Prefer an existing cache while the redraw is deferred.
                             // If this is the first draw, normal vector rendering below
@@ -4445,6 +4860,7 @@ pub fn render_base<'gc>(
                             cache_info = if anchor_drifted {
                                 AQW_CACHE_STALE_FALLBACKS
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                suppress_reason = Some(CacheSuppressReason::DriftFallback);
                                 None
                             } else {
                                 cache.handle().map(|handle| DrawCacheInfo {
@@ -4459,6 +4875,9 @@ pub fn render_base<'gc>(
                                 })
                             };
 
+                            if cache_info.is_none() && suppress_reason.is_none() {
+                                suppress_reason = Some(CacheSuppressReason::DeferredNoTexture);
+                            }
                             if aqw_diagnostics_enabled() {
                                 tracing::info!(
                                     target: "aqw_diag",
@@ -4474,6 +4893,12 @@ pub fn render_base<'gc>(
                         }
                     } else {
                         cache.deferred_frames = 0;
+                        // Settled. The next thing to happen to this object gets
+                        // the grace window again.
+                        cache.dirty_streak = 0;
+                        if cache.bitmap.is_none() {
+                            suppress_reason = Some(CacheSuppressReason::CleanNoTexture);
+                        }
                         cache_info = cache.handle().map(|handle| DrawCacheInfo {
                             handle,
                             dirty: false,
@@ -4486,11 +4911,32 @@ pub fn render_base<'gc>(
                         });
                     }
                 } else {
+                    suppress_reason = Some(CacheSuppressReason::OversizeU16);
                     if !cache.warned_for_oversize {
                         tracing::warn!(
                             "Skipping cacheAsBitmap for incredibly large object {:?} ({width} x {height})",
                             name
                         );
+                        // Same raw numbers as the zero case, for the same
+                        // reason: these are the two ends of one suspicion, and
+                        // comparing them needs the sides and the matrix, not
+                        // the size that both of them mangle.
+                        if aqw_diagnostics_enabled() {
+                            let m = &base_transform.matrix;
+                            tracing::warn!(
+                                target: "aqw_diag",
+                                movie = this.movie().url(),
+                                x_min = bounds.x_min.get(),
+                                x_max = bounds.x_max.get(),
+                                y_min = bounds.y_min.get(),
+                                y_max = bounds.y_max.get(),
+                                m_a = m.a,
+                                m_b = m.b,
+                                m_c = m.c,
+                                m_d = m.d,
+                                "AQW cache resolved to an enormous rect"
+                            );
+                        }
                         cache.warned_for_oversize = true;
                     }
                     cache.clear();
@@ -4500,8 +4946,17 @@ pub fn render_base<'gc>(
         }
         cache_info
     } else {
+        if this.is_bitmap_cached() {
+            suppress_reason = Some(CacheSuppressReason::NotHere);
+        }
         None
     };
+
+    if aqw_diagnostics_enabled()
+        && let Some(reason) = suppress_reason
+    {
+        note_cache_suppressed(this, reason, suppress_detail.as_deref());
+    }
 
     // Placed here rather than beside the other probes at the top of the
     // function because this is the first point where the outcome exists: the
@@ -4974,7 +5429,21 @@ pub trait TDisplayObject<'gc>:
             }
         }
 
-        if include_own_filters {
+        // Growing an *empty* rect is meaningless, and doing it is not harmless:
+        // `Rectangle::INVALID` is the sentinel for "no content", `is_valid`
+        // recognises it by `x_min` alone, and a filter moves `x_min` off the
+        // sentinel. The empty rect then passes as a real one whose far corner
+        // sits at the sentinel plus the filter growth, and the first ancestor to
+        // union it inherits a bounding box millions of pixels wide.
+        //
+        // Measured 2026-08-12: an avatar with an empty slot -- `Blank.swf` hair,
+        // `unarmed.swf`, an unused pose -- carrying a glow produced
+        // `x_min=21851 x_max=134218297`, which is the sentinel 134217727 plus
+        // 570 twips of glow. Bounds that size are refused a cache, so the whole
+        // subtree renders vector every frame and every blend placement inside it
+        // becomes its own pass: one such item was emitting ~2490 complex blends
+        // per sweep window and holding the frame at ~68 ms.
+        if include_own_filters && bounds.is_valid() {
             for mut filter in self.filters().iter().cloned() {
                 filter.scale(view_matrix.a, view_matrix.d);
                 bounds = filter.calculate_dest_rect(bounds);

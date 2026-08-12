@@ -746,7 +746,11 @@ impl<'gc> TDisplayObject<'gc> for Avm2Button<'gc> {
             bounds = bounds.union(&child.render_bounds_with_transform(&matrix, true, view_matrix));
         }
 
-        if include_own_filters {
+        // See the note on the same guard in `DisplayObject::
+        // render_bounds_with_transform`: growing `Rectangle::INVALID` moves
+        // `x_min` off the sentinel that marks it empty, and it then reads as a
+        // real rectangle reaching to the far end of the coordinate space.
+        if include_own_filters && bounds.is_valid() {
             for mut filter in self.filters().iter().cloned() {
                 filter.scale(view_matrix.a, view_matrix.d);
                 bounds = filter.calculate_dest_rect(bounds);
