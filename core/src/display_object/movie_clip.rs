@@ -3809,6 +3809,22 @@ impl<'gc> MovieClip<'gc> {
         context: &mut UpdateContext<'gc>,
         can_throttle: bool,
     ) -> bool {
+        // Extending this cache to map and NPC art was probed on 2026-08-12 and
+        // removed the same night, before it was ever a rule. Selecting on named
+        // class plus a 200k-stage-pixel ceiling took 3106 clips where the
+        // measurement had elected four: `aqw_hook_ms` tripled (116-143 to
+        // 322-432 per window) because the qualifying check re-walked bounds for
+        // every clip every tick, frame time got worse at a third of the
+        // occupancy, and the field run came back with visible art bugs -- caching
+        // a subtree makes the blends inside it resolve against its own art
+        // instead of what lies beneath, and that was applied to half the scene.
+        //
+        // What it did *not* do is test the idea. The filter left out the prize
+        // term entirely -- blend density, the whole reason `live_cand` exists --
+        // so the four dense candidates were drowned among three thousand. A
+        // narrow version is still open, and needs two things this did not have:
+        // the density figure carried from render into the tick, and the decision
+        // memoised per clip instead of recomputed. See HISTORY 2026-08-12.
         if !self.is_aqw_avatar_asset_root() {
             return false;
         }

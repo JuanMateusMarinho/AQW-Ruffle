@@ -1617,6 +1617,16 @@ impl<'gc> DisplayObjectBase<'gc> {
         self.set_flag(DisplayObjectFlags::CACHE_INVALIDATED, false);
     }
 
+    /// Whether something inside this subtree announced a change this frame.
+    ///
+    /// Only readable up to `pre_render`, which clears it -- so a descendant that
+    /// walks up to ask this always reads false. That is a dead counter waiting
+    /// to happen, and the reason the sampling for `live_cand` sits in
+    /// `pre_render` itself rather than beside the rest of the blend accounting.
+    fn cache_invalidated(&self) -> bool {
+        self.contains_flag(DisplayObjectFlags::CACHE_INVALIDATED)
+    }
+
     fn recheck_cache_as_bitmap(&self) {
         let mut write = self.cell.borrow_mut();
         let should_cache = self.is_bitmap_cached_preference() || !write.filters.is_empty();
@@ -2357,8 +2367,47 @@ static AQW_BLEND_LIVE_BY_ANCESTOR: std::sync::Mutex<
     Option<std::collections::HashMap<String, LiveAncestorTally>>,
 > = std::sync::Mutex::new(None);
 
-/// Drains the per-ancestor tally as `Class@file:blends/areaKpx/depth`, by prize.
+/// Frames in which an object's subtree announced a change, by the same label
+/// `live_cand` uses, so the two can be read together.
+///
+/// This is the half of the price that count-and-area misses. A bake is not paid
+/// once: it is paid again every time the contents change, and a candidate that
+/// changes every frame charges its whole area every frame. Static art collapses
+/// its blends once and lives on the result; animated map art may cost more
+/// baked than it did live, which is exactly why "cache the map" has stayed open
+/// since 2026-08-08 rather than being tried.
+static AQW_CONTENT_DIRTY_FRAMES: std::sync::Mutex<
+    Option<std::collections::HashMap<String, u64>>,
+> = std::sync::Mutex::new(None);
+
+/// Sampled from `pre_render`, the last point where the invalidation flag is
+/// still set. Cheap by construction: a flag read per object per frame, and a map
+/// touch only for the ones that actually changed.
+fn note_content_dirty_frame<'gc>(this: DisplayObject<'gc>) {
+    let label = aqw_blend_label(this);
+    let Ok(mut guard) = AQW_CONTENT_DIRTY_FRAMES.lock() else {
+        return;
+    };
+    let counts = guard.get_or_insert_with(std::collections::HashMap::new);
+    if counts.len() < 512 || counts.contains_key(&label) {
+        *counts.entry(label).or_insert(0) += 1;
+    }
+}
+
+/// Drains the per-ancestor tally as `Class@file:blends/areaKpx/depth/dirty`,
+/// by prize.
+///
+/// Read `dirty` against `render_frames` on the same line: at `render_frames` the
+/// candidate changes every frame and a bake of it recurs in full every frame;
+/// near zero it collapses its blends once and the texture then costs nothing.
+/// Prize and area alone cannot tell those two apart, and they are the difference
+/// between a cache that pays and one that doubles the bill.
 fn take_live_ancestors(limit: usize) -> Vec<String> {
+    let dirty = AQW_CONTENT_DIRTY_FRAMES
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take())
+        .unwrap_or_default();
     let Ok(mut guard) = AQW_BLEND_LIVE_BY_ANCESTOR.lock() else {
         return Vec::new();
     };
@@ -2372,10 +2421,11 @@ fn take_live_ancestors(limit: usize) -> Vec<String> {
         .into_iter()
         .map(|(name, tally)| {
             format!(
-                "{name}:{}/{}k/{}",
+                "{name}:{}/{}k/{}/{}",
                 tally.blends,
                 tally.area_px / 1000,
-                tally.depth
+                tally.depth,
+                dirty.get(&name).copied().unwrap_or(0)
             )
         })
         .collect()
@@ -6675,6 +6725,13 @@ pub trait TDisplayObject<'gc>:
     #[no_dynamic]
     fn pre_render(self, _context: &mut RenderContext<'_, 'gc>) {
         let this = self.base();
+        // Read before the clear below, which is the only place it survives to.
+        if aqw_diagnostics_enabled()
+            && this.cache_invalidated()
+            && is_aqw_movie_url(self.movie().url())
+        {
+            note_content_dirty_frame(self.into());
+        }
         this.clear_invalidate_flag();
         this.scroll_rect
             .set(this.has_scroll_rect().then(|| this.next_scroll_rect.get()));
