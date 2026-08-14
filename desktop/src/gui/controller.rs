@@ -64,6 +64,8 @@ pub struct GuiController {
 struct ArtixCursors {
     arrow: CustomCursor,
     hand: CustomCursor,
+    text: CustomCursor,
+    attack: CustomCursor,
 }
 
 impl ArtixCursors {
@@ -71,6 +73,8 @@ impl ArtixCursors {
         match kind {
             CursorKind::Arrow => &self.arrow,
             CursorKind::Hand => &self.hand,
+            CursorKind::Text => &self.text,
+            CursorKind::Attack => &self.attack,
         }
     }
 }
@@ -223,8 +227,20 @@ impl GuiController {
                 None
             }
         };
-        if let (Some(arrow), Some(hand)) = (build(&set.arrow), build(&set.hand)) {
-            self.artix_cursors = Some(ArtixCursors { arrow, hand });
+        // All or nothing: a set missing one shape would fall back to a system
+        // cursor for it, and the two styles side by side look like a bug.
+        if let (Some(arrow), Some(hand), Some(text), Some(attack)) = (
+            build(&set.arrow),
+            build(&set.hand),
+            build(&set.text),
+            build(&set.attack),
+        ) {
+            self.artix_cursors = Some(ArtixCursors {
+                arrow,
+                hand,
+                text,
+                attack,
+            });
         }
     }
 

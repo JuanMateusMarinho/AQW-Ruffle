@@ -7,7 +7,7 @@ use crate::avm1::Value;
 use crate::avm1::VariableDumper;
 use crate::avm1::{Activation, ActivationIdentifier};
 use crate::avm2::object::EventObject as Avm2EventObject;
-use crate::avm2::{Activation as Avm2Activation, Avm2, CallStack, SharedObjectObject};
+use crate::avm2::{Activation as Avm2Activation, Avm2, CallStack, SharedObjectObject, TObject as _};
 use crate::backend::navigator::ErrorResponse;
 use crate::backend::navigator::FetchReason;
 use crate::backend::navigator::OwnedFuture;
@@ -51,7 +51,7 @@ use crate::orphan_manager::OrphanManager;
 use crate::prelude::*;
 use crate::socket::Sockets;
 use crate::streams::StreamManager;
-use crate::string::{AvmStringInterner, StringContext};
+use crate::string::{AvmStringInterner, StringContext, WStr};
 use crate::stub::StubCollection;
 use crate::system_properties::SystemProperties;
 use crate::tag_utils::SwfMovie;
@@ -74,7 +74,8 @@ use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::rc::{Rc, Weak as RcWeak};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::Duration;
 use tracing::instrument;
 use web_time::Instant;
@@ -1945,6 +1946,17 @@ impl Player {
                 }
                 refresh
             };
+
+            // Settled on a target for this event, so the AQW cursor can be
+            // decided. Cheap enough to redo every time: mouse moves are already
+            // coalesced to one per tick, and the walk stops at the first
+            // constructed ancestor that names itself a monster.
+            let hovered = context.mouse_data.hovered;
+            AQW_POINTER_ON_ENEMY.store(
+                aqw_enemy_under_pointer(context, hovered),
+                Ordering::Relaxed,
+            );
+
             Self::run_actions(context);
             needs_render
         });
@@ -3325,6 +3337,96 @@ fn run_mouse_pick<'gc>(
             }
         })
     })
+}
+
+/// Whether the pointer is resting on something AQW would have you attack.
+///
+/// This is a flag rather than a `MouseCursor` because the game never asks for
+/// one: it leaves the plain arrow up over a monster, so the shape has to be
+/// decided from what the pick landed on. `MouseCursor` also mirrors the AS3
+/// constants one for one, and those have no attack shape to mirror.
+static AQW_POINTER_ON_ENEMY: AtomicBool = AtomicBool::new(false);
+
+/// Read by the desktop shell, which draws its own cursor art.
+pub fn aqw_pointer_on_enemy() -> bool {
+    AQW_POINTER_ON_ENEMY.load(Ordering::Relaxed)
+}
+
+/// `RUFFLE_AQW_NO_ENEMY_CURSOR=1` stops looking, leaving the pointer at
+/// whatever the content asked for.
+static AQW_ENEMY_CURSOR_OFF: LazyLock<bool> =
+    LazyLock::new(|| crate::display_object::aqw_env_flag("RUFFLE_AQW_NO_ENEMY_CURSOR", false));
+
+/// Name what the pointer is resting on, the first time each chain turns up.
+/// When the sword fails to appear this is the whole story: either `MonsterMC`
+/// never showed up in the chain, or it did and `isMonster` said no.
+fn aqw_log_hover_chain(chain: &str, is_monster: Option<bool>) {
+    thread_local! {
+        static LAST: RefCell<String> = const { RefCell::new(String::new()) };
+    }
+    LAST.with(|last| {
+        let mut last = last.borrow_mut();
+        if *last != chain {
+            last.clear();
+            last.push_str(chain);
+            tracing::info!(
+                target: "aqw_diag",
+                chain,
+                is_monster = ?is_monster,
+                "AQW pointer hover"
+            );
+        }
+    });
+}
+
+/// Is the hovered object part of a monster?
+///
+/// AQW hangs monsters and NPCs off the same `MonsterMC` chassis and tells them
+/// apart with `isMonster`, so matching the class alone would put a sword over
+/// every shopkeeper. The pick lands somewhere inside the loaded avatar art, so
+/// the chassis has to be walked up to.
+fn aqw_enemy_under_pointer<'gc>(
+    context: &mut UpdateContext<'gc>,
+    hovered: Option<InteractiveObject<'gc>>,
+) -> bool {
+    if *AQW_ENEMY_CURSOR_OFF {
+        return false;
+    }
+
+    let diagnostics = crate::display_object::aqw_diagnostics_enabled();
+    let mut chain: Vec<String> = Vec::new();
+    let mut monster = None;
+    let mut node = hovered.map(|hovered| hovered.as_displayobject());
+    while let Some(current) = node {
+        if let Some(object) = current.object2() {
+            let name = object.instance_class().name().local_name();
+            if monster.is_none() && &*name == WStr::from_units(b"MonsterMC") {
+                monster = Some(object);
+                if !diagnostics {
+                    break;
+                }
+            }
+            if diagnostics {
+                chain.push(name.to_string());
+            }
+        }
+        node = current.parent();
+    }
+
+    let is_monster = monster.is_some_and(|object| {
+        let mut activation = Avm2Activation::from_nothing(context);
+        let property = activation
+            .strings()
+            .intern_static(WStr::from_units(b"isMonster"));
+        crate::avm2::Value::from(object)
+            .get_public_property(property, &mut activation)
+            .is_ok_and(|value| value.coerce_to_boolean())
+    });
+
+    if diagnostics {
+        aqw_log_hover_chain(&chain.join(" < "), monster.map(|_| is_monster));
+    }
+    is_monster
 }
 
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]

@@ -116,33 +116,40 @@ pub struct CursorArt {
     pub hotspot_y: u16,
 }
 
-/// The two shapes the player's `MouseCursor` is drawn with.
+/// The shapes the player's cursor is drawn with.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CursorKind {
     Arrow,
     Hand,
+    Text,
+    /// Sword and pointer, for a monster the game would have you attack.
+    Attack,
 }
 
 pub struct CursorSet {
-    /// Nominal size the set is picked by. The arrow's own bitmap is smaller: fit
-    /// to the same height it reads as much bigger than the hand, being a solid
-    /// triangle against a narrow gauntlet.
+    /// Nominal size the set is picked by. Each shape's own bitmap is measured
+    /// against that rather than filling it: the I-beam has to sit inside a chat
+    /// line, and the attack art carries a sword beside its pointer, so fitting
+    /// the whole drawing to one canvas would halve the pointer.
     pub size: u16,
     pub arrow: CursorArt,
     pub hand: CursorArt,
+    pub text: CursorArt,
+    pub attack: CursorArt,
 }
 
 /// Baked from the source artwork by the cursor generator script, which also
-/// prints these sizes and hotspots (the arrow's tip and the gauntlet's
-/// fingertip). The OS draws cursors at their bitmap size, so the sizes here are
-/// the whole scale range on offer rather than a DPI ladder.
+/// prints these sizes and hotspots (the arrow's tip, the gauntlet's fingertip,
+/// the middle of the beam, and the tip of the pointer next to the sword). The
+/// OS draws cursors at their bitmap size, so the sizes here are the whole scale
+/// range on offer rather than a DPI ladder.
 const CURSOR_SETS: &[CursorSet] = &[
     CursorSet {
         size: 32,
         arrow: CursorArt {
             rgba: include_bytes!("../assets/aqw-cursor-arrow-32.rgba"),
-            size: 26,
-            hotspot_x: 3,
+            size: 27,
+            hotspot_x: 2,
             hotspot_y: 0,
         },
         hand: CursorArt {
@@ -151,13 +158,25 @@ const CURSOR_SETS: &[CursorSet] = &[
             hotspot_x: 13,
             hotspot_y: 0,
         },
+        text: CursorArt {
+            rgba: include_bytes!("../assets/aqw-cursor-text-32.rgba"),
+            size: 19,
+            hotspot_x: 9,
+            hotspot_y: 10,
+        },
+        attack: CursorArt {
+            rgba: include_bytes!("../assets/aqw-cursor-attack-32.rgba"),
+            size: 43,
+            hotspot_x: 23,
+            hotspot_y: 16,
+        },
     },
     CursorSet {
         size: 40,
         arrow: CursorArt {
             rgba: include_bytes!("../assets/aqw-cursor-arrow-40.rgba"),
-            size: 32,
-            hotspot_x: 3,
+            size: 34,
+            hotspot_x: 2,
             hotspot_y: 0,
         },
         hand: CursorArt {
@@ -166,40 +185,79 @@ const CURSOR_SETS: &[CursorSet] = &[
             hotspot_x: 16,
             hotspot_y: 0,
         },
+        text: CursorArt {
+            rgba: include_bytes!("../assets/aqw-cursor-text-40.rgba"),
+            size: 24,
+            hotspot_x: 12,
+            hotspot_y: 12,
+        },
+        attack: CursorArt {
+            rgba: include_bytes!("../assets/aqw-cursor-attack-40.rgba"),
+            size: 54,
+            hotspot_x: 29,
+            hotspot_y: 20,
+        },
     },
     CursorSet {
         size: 48,
         arrow: CursorArt {
             rgba: include_bytes!("../assets/aqw-cursor-arrow-48.rgba"),
-            size: 38,
-            hotspot_x: 5,
+            size: 41,
+            hotspot_x: 4,
             hotspot_y: 0,
         },
         hand: CursorArt {
             rgba: include_bytes!("../assets/aqw-cursor-hand-48.rgba"),
             size: 48,
-            hotspot_x: 20,
+            hotspot_x: 19,
             hotspot_y: 0,
+        },
+        text: CursorArt {
+            rgba: include_bytes!("../assets/aqw-cursor-text-48.rgba"),
+            size: 29,
+            hotspot_x: 14,
+            hotspot_y: 14,
+        },
+        attack: CursorArt {
+            rgba: include_bytes!("../assets/aqw-cursor-attack-48.rgba"),
+            size: 65,
+            hotspot_x: 35,
+            hotspot_y: 23,
         },
     },
     CursorSet {
         size: 64,
         arrow: CursorArt {
             rgba: include_bytes!("../assets/aqw-cursor-arrow-64.rgba"),
-            size: 51,
-            hotspot_x: 7,
+            size: 54,
+            hotspot_x: 5,
             hotspot_y: 0,
         },
         hand: CursorArt {
             rgba: include_bytes!("../assets/aqw-cursor-hand-64.rgba"),
             size: 64,
-            hotspot_x: 27,
+            hotspot_x: 25,
             hotspot_y: 0,
+        },
+        text: CursorArt {
+            rgba: include_bytes!("../assets/aqw-cursor-text-64.rgba"),
+            size: 38,
+            hotspot_x: 19,
+            hotspot_y: 19,
+        },
+        attack: CursorArt {
+            rgba: include_bytes!("../assets/aqw-cursor-attack-64.rgba"),
+            size: 86,
+            hotspot_x: 47,
+            hotspot_y: 31,
         },
     },
 ];
 
-const DEFAULT_CURSOR_SIZE: u16 = 48;
+/// Dropped from 48 on 2026-08-13, picked in game against 40 and 48: this
+/// artwork is solid-filled where the set it replaced was outlined, so it
+/// carries more weight at the same measurements.
+const DEFAULT_CURSOR_SIZE: u16 = 32;
 
 /// The cursor artwork for the running game, or `None` to leave the system
 /// cursors alone. `RUFFLE_AQW_NO_CUSTOM_CURSOR` (or a size of `0`) turns it off

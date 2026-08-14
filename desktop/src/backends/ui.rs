@@ -184,16 +184,18 @@ impl DesktopUiBackend {
     }
 
     /// Which piece of custom artwork should stand in for the system cursor, if
-    /// any. Text keeps the system I-beam: it's a precision cursor whose shape
-    /// tells you where the caret lands, and the artwork has no equivalent.
+    /// any. A monster under the pointer beats the arrow and the hand -- that
+    /// shape is the whole point of it -- but not the I-beam, which only comes
+    /// up over a text field, where the click is going to the field either way.
     pub fn artix_cursor(&self) -> Option<CursorKind> {
         if !self.cursor_visible {
             return None;
         }
         match self.preferred_cursor {
+            MouseCursor::IBeam => Some(CursorKind::Text),
+            _ if ruffle_core::aqw_pointer_on_enemy() => Some(CursorKind::Attack),
             MouseCursor::Arrow => Some(CursorKind::Arrow),
             MouseCursor::Hand | MouseCursor::Grab => Some(CursorKind::Hand),
-            MouseCursor::IBeam => None,
         }
     }
 }
