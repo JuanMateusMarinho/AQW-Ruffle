@@ -143,6 +143,12 @@ impl Surface {
         nearest_layer: LayerRef<'frame>,
         texture_pool: &mut TexturePool,
     ) -> CommandTarget {
+        // Read before the mode is handed over, and carried down so a blend can
+        // tell the scene apart from another blend's target. It is the whole
+        // difference between a multiply that fixed-function state could do and
+        // one that cannot.
+        let dest_opaque = render_target_mode.clears_opaque();
+
         let target = CommandTarget::new(
             descriptors,
             texture_pool,
@@ -175,6 +181,7 @@ impl Surface {
             },
             texture_pool,
             self.origin,
+            dest_opaque,
         );
         target.set_content_bounds(content_bounds);
 

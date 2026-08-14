@@ -59,6 +59,35 @@ fn blend_measured_skipped() -> bool {
     })
 }
 
+/// Composites multiply through GPU blend state instead of a pass of its own,
+/// wherever the destination is opaque. On by default;
+/// `RUFFLE_AQW_NO_MULTIPLY_FIXED_FUNCTION=1` restores the shader pass.
+///
+/// Unlike the two levers above this is not a deliberate lie: over an opaque
+/// destination the state is term-for-term the shader's own expression, derived
+/// in [`crate::blend::TrivialBlend::blend_state`]. Any visible difference is a
+/// defect, not a tradeoff.
+///
+/// Measured in a full Yulgar, 2026-08-14, matched on both occupancy and cache
+/// bakes: GPU submit **43.7 -> 25.3 ms/frame** against a 41.7ms budget, and
+/// process commit 4632 -> 3064 MB. Complex passes fell from 2054 to 897 per
+/// window. That is the whole prize available -- demoting *every* complex blend,
+/// art be damned, measured 26.3 -- because the multiply population is the map
+/// art, whose targets are large, while the overlay and hardlight left behind
+/// are avatar items with small ones. Counting passes underestimates this
+/// badly; the first estimate from pass share alone said 59% of the prize.
+///
+/// The soundness condition is that nothing takes the destination's opacity back
+/// after a multiply has composited onto it, which only Alpha and Erase can do.
+/// Both measured zero across the session, and `blend_modes` reports them, so a
+/// run where they appear is a run to look at this again.
+fn multiply_fixed_function() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !ruffle_render::backend::aqw_env_flag("RUFFLE_AQW_NO_MULTIPLY_FIXED_FUNCTION", false)
+    })
+}
+
 /// MEASUREMENT ONLY -- `RUFFLE_AQW_TRIVIAL_BLEND_DIRECT` renders a trivial
 /// blend straight into the surface it sits in, instead of into a target of its
 /// own.
@@ -600,6 +629,7 @@ pub fn chunk_blends<'a>(
     nearest_layer: LayerRef,
     texture_pool: &mut TexturePool,
     origin: (u32, u32),
+    dest_opaque: bool,
 ) -> (Vec<Chunk>, ContentBounds) {
     WgpuCommandHandler::new(
         descriptors,
@@ -613,6 +643,7 @@ pub fn chunk_blends<'a>(
         nearest_layer,
         texture_pool,
         origin,
+        dest_opaque,
     )
     .chunk_blends(commands)
 }
@@ -703,6 +734,11 @@ struct WgpuCommandHandler<'a> {
     /// Subtracted from every draw's translation, placing surface coordinates
     /// inside a target that covers only part of the surface.
     origin: (f32, f32),
+    /// Whether the target these commands land in was cleared opaque. Purely
+    /// measurement: it says which multiply passes fixed-function blend state
+    /// could have handled. Nested naturally, since a blend renders its subtree
+    /// through a fresh handler over its own (transparent) target.
+    dest_opaque: bool,
 }
 
 impl<'a> WgpuCommandHandler<'a> {
@@ -719,6 +755,7 @@ impl<'a> WgpuCommandHandler<'a> {
         nearest_layer: LayerRef<'a>,
         texture_pool: &'a mut TexturePool,
         origin: (u32, u32),
+        dest_opaque: bool,
     ) -> Self {
         let transforms = Self::new_transforms(descriptors, dynamic_transforms);
 
@@ -747,6 +784,7 @@ impl<'a> WgpuCommandHandler<'a> {
             num_masks: 0,
             content_bounds: ContentBounds::EMPTY,
             origin: (origin.0 as f32, origin.1 as f32),
+            dest_opaque,
         }
     }
 
@@ -868,6 +906,10 @@ impl CommandHandler for WgpuCommandHandler<'_> {
         // before any measurement demotion below so that toggling the
         // measurement changes one thing and not two.
         let is_complex = matches!(blend_type, BlendType::Complex(_));
+        // Captured for the same reason as `is_complex`: the fold below moves
+        // this out of the complex path, and the tally has to keep reading the
+        // same population either way or the A/B has nothing to compare.
+        let is_multiply = matches!(blend_type, BlendType::Complex(ComplexBlend::Multiply));
 
         if is_complex && blend_measured_skipped() {
             return;
@@ -875,6 +917,14 @@ impl CommandHandler for WgpuCommandHandler<'_> {
 
         let blend_type = if is_shader_blend_in_mask || (blend_measured_as_normal() && is_complex) {
             BlendType::Trivial(TrivialBlend::Normal)
+        } else if is_multiply && self.dest_opaque && multiply_fixed_function() {
+            // Exact here and only here; the derivation is in `blend_state`.
+            //
+            // Verified against the reference images rather than by algebra
+            // alone: `visual/blend_modes/multiply` and both `acid-blend` tests
+            // exercise this path (proven by folding to the wrong state, which
+            // fails exactly those three) and pass unchanged with it.
+            BlendType::Trivial(TrivialBlend::Multiply)
         } else {
             blend_type
         };
@@ -941,6 +991,9 @@ impl CommandHandler for WgpuCommandHandler<'_> {
         }
         let alloc_px = surface_width as u64 * surface_height as u64;
         let full_px = self.width as u64 * self.height as u64;
+        // Outside the complex arm on purpose: once the fold claims a multiply
+        // it never reaches there, and this is the count the fold is judged by.
+        crate::blend::note_multiply_dest(is_multiply, self.dest_opaque, alloc_px);
 
         let surface = Surface::new(
             self.descriptors,

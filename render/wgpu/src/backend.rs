@@ -1374,6 +1374,10 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         crate::blend::take_blend_alloc()
     }
 
+    fn take_blend_dest_opacity(&mut self) -> (u64, u64, u64) {
+        crate::blend::take_blend_dest_opacity()
+    }
+
     fn take_trivial_blend_counts(&mut self) -> Vec<(&'static str, u64)> {
         crate::blend::take_trivial_blend_counts()
     }
@@ -1837,6 +1841,20 @@ impl RenderTargetMode {
             RenderTargetMode::FreshWithTexture(_) => None,
             RenderTargetMode::ExistingWithColor(_, color) => Some(*color),
         }
+    }
+
+    /// Whether everything drawn here composites onto an opaque destination.
+    ///
+    /// True by construction rather than by inspection: the clear runs before
+    /// any draw, and drawing over an opaque destination leaves it opaque
+    /// (`src.a + 1*(1-src.a)` is 1). Only Alpha and Erase can take that back,
+    /// and the counter that reads this says so.
+    ///
+    /// An existing texture is assumed transparent: `render_offscreen` blends
+    /// into whatever `BitmapData` already held, and nothing here knows what
+    /// that was.
+    pub fn clears_opaque(&self) -> bool {
+        self.color().is_some_and(|color| color.a >= 1.0)
     }
 }
 

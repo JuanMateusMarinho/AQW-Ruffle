@@ -163,6 +163,26 @@ pub trait RenderBackend: Any {
         100
     }
 
+    /// Multiply passes since the last call, as `(onto_opaque, total,
+    /// opaque_megapixels)`, cleared by reading.
+    ///
+    /// Multiply is the one complex mode that fixed-function blend state can
+    /// express exactly -- but only against an opaque destination. `DST_COLOR` /
+    /// `ONE_MINUS_SRC_ALPHA` gives `src*dst + dst*(1-src.a)`, and the term that
+    /// is missing from it, `src*(1-dst.a)`, is zero exactly when the
+    /// destination is opaque; over a transparent one the art vanishes, which is
+    /// why this was written off wholesale.
+    ///
+    /// The destination is only transparent inside another blend or filter
+    /// target, which are cleared that way on purpose. Against the scene it is
+    /// the stage colour. So this counts how much of the multiply population
+    /// could fold into the batched draw the way a trivial blend does, dropping
+    /// the destination copy and the pass of its own -- and, being a count, says
+    /// whether that is worth building before anything is built.
+    fn take_blend_dest_opacity(&mut self) -> (u64, u64, u64) {
+        (0, 0, 0)
+    }
+
     /// Blend modes cheap enough to fold into GPU blend state since the last
     /// call, as `(mode, count)` busiest-first, and cleared by reading.
     ///

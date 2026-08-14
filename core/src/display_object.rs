@@ -3543,6 +3543,18 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         // full-surface ones. Hundreds are alive at once in a crowded room, so
         // this is what decides whether VRAM clears the OS grant.
         let blend_alloc = context.renderer.take_blend_alloc();
+        // How much of the multiply population -- 55% of complex blends in a
+        // crowded room -- composites onto an opaque destination, where
+        // fixed-function blend state is exactly equivalent and the pass of its
+        // own could collapse into the batched draw. Reads as
+        // `onto_opaque/total (Npx)`; the megapixels are the scale, since the
+        // same ratio over tiny targets is not the same prize. A low ratio
+        // closes the question, and closing it is the point.
+        let (blend_mul_opaque, blend_mul_total, blend_mul_opaque_mpx) =
+            context.renderer.take_blend_dest_opacity();
+        let blend_mul_opaque = format!(
+            "{blend_mul_opaque}/{blend_mul_total} ({blend_mul_opaque_mpx}Mpx)"
+        );
         // Where the frame actually goes. `render_frames` is how many frames the
         // other two cover, so they read as ms/frame against the 41.7ms budget
         // at 24fps. `commit_mb` is system memory, which hit 98% of the machine
@@ -3722,6 +3734,7 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
              tex_top={tex_top} blend_modes={blend_modes} \
              blend_cover={blend_cover}% blend_cover_hist={blend_cover_hist} \
              blend_alloc={blend_alloc}% \
+             blend_mul_opaque={blend_mul_opaque} \
              blend_triv_modes={trivial_blend_modes} \
              blend_triv_cover={blend_triv_cover}% blend_triv_hist={blend_triv_hist} \
              blend_triv_alloc={blend_triv_alloc}% \
