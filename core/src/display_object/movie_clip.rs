@@ -180,7 +180,54 @@ fn aqw_inert_orphan_freeze_disabled() -> bool {
 /// Nodes the inert probe may visit before it gives up. Inventory rows and item
 /// icons -- what the census found the list is actually made of -- are a handful
 /// of nodes each, so this is generous for the case it exists to catch.
-const AQW_ORPHAN_INERT_PROBE_BUDGET: u32 = 128;
+///
+/// That premise covers the *rows* and misses what actually costs. Measured
+/// 2026-08-14: the orphans still unfrozen after a shop opens are the panels
+/// above them -- `LPFPanelListShopInvA`, `LPFLayoutInvShopEnh`,
+/// `LPFFrameListViewTabbed` -- whose subtree is the entire list. Well past 128,
+/// so the probe runs out, returns `None`, and the verdict is never reached no
+/// matter how inert the list is. The measurement has that exact shape: after a
+/// shop opens the orphan count returns to normal and the visit count with it,
+/// while the cost per visit rises 78x. Same roots, far bigger subtrees, none of
+/// them freezable.
+///
+/// `RUFFLE_AQW_INERT_PROBE_BUDGET=N` retunes it without a rebuild. The
+/// arithmetic favours a large value heavily: a subtree that fails the probe is
+/// re-probed once every 64 ticks, and pays three full passes over itself on
+/// every tick in between.
+///
+/// Raised 128 -> 1000000 on 2026-08-14, and **what it buys is recovery, not a
+/// lower peak** -- which took a field report to notice, because peak and median
+/// are exactly the statistics that hide it.
+///
+/// The peak barely moves, and should not: at the moment a shop opens its
+/// subtree genuinely has something advancing, so no freeze is available and no
+/// budget changes that. What a budget decides is whether the verdict is ever
+/// *reachable* afterwards. Bounded, a subtree past the bound can never be
+/// judged, so when it finally settles nothing notices and it is walked in full
+/// for the rest of the session. Unbounded, the next re-probe returns
+/// `Some(false)` and it freezes.
+///
+/// Measured over four arms in one session, orphan-phase time per window:
+///
+/// - 128: one episode above 1000ms, **never recovered**, 38% of windows elevated
+/// - 8192: same shape, never recovered, 27% elevated
+/// - 1000000: three episodes, **every one back under 400ms within two windows**,
+///   21% elevated, and the clean half's median down 92 -> 18ms
+///
+/// The cost of a deeper probe stays small for a structural reason: the walk
+/// returns on the first descendant that will advance, so the full traversal
+/// only happens when the answer is "inert" -- the case that pays for it. And it
+/// is paid once per re-probe against three passes per tick in between.
+fn aqw_orphan_inert_probe_budget() -> u32 {
+    static BUDGET: OnceLock<u32> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("RUFFLE_AQW_INERT_PROBE_BUDGET")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .unwrap_or(1_000_000)
+    })
+}
 
 /// Ticks an orphan must survive before the *inert* freeze may engage (~1s).
 ///
@@ -4019,8 +4066,13 @@ impl<'gc> MovieClip<'gc> {
                 // art came from is what covers them, and it survives an AQW
                 // update in a way matching those class names would not.
                 let inert = !aqw_inert_orphan_freeze_disabled() && {
-                    let mut budget = AQW_ORPHAN_INERT_PROBE_BUDGET;
-                    aqw_subtree_will_advance(self.into(), &mut budget) == Some(false)
+                    let mut budget = aqw_orphan_inert_probe_budget();
+                    let verdict = aqw_subtree_will_advance(self.into(), &mut budget);
+                    if verdict.is_none() {
+                        super::AQW_ORPHAN_PROBE_EXHAUSTED
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    verdict == Some(false)
                 };
                 self.0.aqw_orphan_freeze.set(if inert { 3 } else { 2 });
                 inert

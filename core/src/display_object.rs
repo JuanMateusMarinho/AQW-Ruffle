@@ -144,6 +144,16 @@ pub struct BitmapCache {
     /// `aqw_defer_eligible_frames`.
     dirty_streak: u32,
 
+    /// How many times this cache has been baked since the object was created.
+    ///
+    /// Deliberately survives `clear()`, unlike `dirty_streak`: four paths clear
+    /// a cache and every one of them resets that streak, so a cache rebaked
+    /// through a clear every frame would read as brand new. This is what
+    /// separates the two readings the per-class attribution cannot tell apart --
+    /// one object rebaking N times a window, or N objects baking once each --
+    /// and those call for opposite fixes.
+    bake_count: u32,
+
     /// Consecutive redraws where the object's transform was unchanged but the
     /// computed cache geometry was not. See `note_static_churn`.
     static_churn: u32,
@@ -2658,6 +2668,47 @@ pub(crate) enum CacheDirtyReason {
 /// `stage.view_bounds()`, which does not). At the view scale this fork runs, the
 /// rectangle it calls "on screen" is a fraction of the stage, so art in plain
 /// view is judged off it.
+/// Bakes bucketed by how many times that same cache had already been baked:
+/// first ever, 2-4, 5-24, 25-120, and beyond.
+///
+/// This is the fork the bake investigation turns on, and `bake_top` cannot
+/// answer it because it attributes by class. A class showing 37 bakes a window
+/// is either one object rebaking almost every frame -- a cache that buys
+/// nothing and charges for the privilege, fixable by refusing to cache art that
+/// keeps dirtying -- or 37 short-lived objects baking once each, which is
+/// honest work and needs a different fix entirely. Mass in the first bucket
+/// means the second reading; mass in the last two means the first.
+static AQW_BAKE_REPEAT_HIST: [std::sync::atomic::AtomicU64; 5] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+static AQW_BAKE_REPEAT_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn aqw_note_bake_repeat(bake_count: u32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let bucket = match bake_count {
+        0..=1 => 0,
+        2..=4 => 1,
+        5..=24 => 2,
+        25..=120 => 3,
+        _ => 4,
+    };
+    AQW_BAKE_REPEAT_HIST[bucket].fetch_add(1, Relaxed);
+    AQW_BAKE_REPEAT_MAX.fetch_max(u64::from(bake_count), Relaxed);
+}
+
+/// Drains the repeat tally as `(hist, max)`. The max is a lifetime figure for
+/// whichever cache has baked most, so it does not reset with the window --
+/// which is what makes a single long-lived offender visible at all.
+fn take_bake_repeats() -> ([u64; 5], u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let hist = std::array::from_fn(|i| AQW_BAKE_REPEAT_HIST[i].swap(0, Relaxed));
+    (hist, AQW_BAKE_REPEAT_MAX.load(Relaxed))
+}
+
 pub(crate) static AQW_CACHE_DIRTY_NOTEX: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static AQW_CACHE_DIRTY_SIZE: std::sync::atomic::AtomicU64 =
@@ -2704,6 +2755,17 @@ pub(crate) static AQW_CACHE_BYPASS_CLEARED: std::sync::atomic::AtomicU64 =
 ///
 /// Population counters are per tick, from the Enter pass; the `_ns` pair covers
 /// all three passes. Diagnostics-only: one timer pair per orphan visit.
+/// Inert probes that ran out of budget before reaching a verdict, and so left
+/// their subtree unfrozen however inert it was.
+///
+/// The direct reading of whether the budget is the binding constraint: it is
+/// non-zero exactly when a subtree is too big to judge, and those are the same
+/// subtrees whose walk costs the most. Raising `RUFFLE_AQW_INERT_PROBE_BUDGET`
+/// should drive this to zero and `orph_clean_ms` down with it; if this stays
+/// high after raising it, the budget was not what was stopping the freeze.
+pub(crate) static AQW_ORPHAN_PROBE_EXHAUSTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) static AQW_ORPHAN_POP: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static AQW_ORPHAN_POP_PLAYING: std::sync::atomic::AtomicU64 =
@@ -3426,6 +3488,7 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         let orph_script = AQW_ORPHAN_POP_SCRIPT.swap(0, Ordering::Relaxed);
         let orph_avatar = AQW_ORPHAN_POP_AVATAR.swap(0, Ordering::Relaxed);
         let orph_quiet = AQW_ORPHAN_POP_QUIET.swap(0, Ordering::Relaxed);
+        let orph_probe_out = AQW_ORPHAN_PROBE_EXHAUSTED.swap(0, Ordering::Relaxed);
         let orph_clean_visits = AQW_ORPHAN_CLEAN_VISITS.swap(0, Ordering::Relaxed);
         let orph_dirty_visits = AQW_ORPHAN_DIRTY_VISITS.swap(0, Ordering::Relaxed);
         let orph_clean_ms = AQW_ORPHAN_CLEAN_NS.swap(0, Ordering::Relaxed) / 1_000_000;
@@ -3591,6 +3654,15 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         let blend_bake_triv = AQW_BLEND_TRIVIAL_BAKED.swap(0, Ordering::Relaxed);
         let blend_live_triv = AQW_BLEND_TRIVIAL_LIVE.swap(0, Ordering::Relaxed);
         let bakes = AQW_BAKES.swap(0, Ordering::Relaxed);
+        // Reads as `first/2-4/5-24/25-120/more`. Against `bake_top`, which is
+        // per class, this says whether that class is one object rebaking or a
+        // stream of new ones.
+        let (bake_reps, bake_reps_max) = take_bake_repeats();
+        let bake_reps = bake_reps
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join("/");
         let bake_depth = AQW_BAKE_DEPTH_MAX.swap(0, Ordering::Relaxed);
         let bake_top = take_bake_blends(6).join(",");
         let blend_live_top = take_live_blends(6).join(",");
@@ -3725,6 +3797,7 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
              defer_grace={defer_grace} bypass_cleared={bypass_cleared} \
              orph_pop={orph_pop} orph_playing={orph_playing} orph_script={orph_script} \
              orph_avatar={orph_avatar} orph_quiet={orph_quiet} \
+             orph_probe_out={orph_probe_out} \
              orph_clean_visits={orph_clean_visits} orph_dirty_visits={orph_dirty_visits} \
              orph_clean_ms={orph_clean_ms} orph_dirty_ms={orph_dirty_ms} \
              vram_mb={vram_mb} vram_budget_mb={vram_budget_mb} \
@@ -3754,6 +3827,7 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
              blend_bake={blend_bake} blend_live={blend_live} \
              blend_bake_triv={blend_bake_triv} blend_live_triv={blend_live_triv} \
              bakes={bakes} bake_depth={bake_depth} \
+             bake_reps={bake_reps} bake_reps_max={bake_reps_max} \
              bake_top={bake_top} blend_live_top={blend_live_top} \
              bypass_all={bypass_all} bypass_onscreen={bypass_onscreen} \
              bypass_saved={bypass_saved} \
@@ -4751,6 +4825,13 @@ pub fn render_base<'gc>(
                         }
 
                         if can_redraw_cache {
+                            // Counted where the bake is actually admitted, not
+                            // where dirtiness is detected: a refused redraw
+                            // costs nothing and must not read as one.
+                            cache.bake_count = cache.bake_count.saturating_add(1);
+                            if aqw_diagnostics_enabled() {
+                                aqw_note_bake_repeat(cache.bake_count);
+                            }
                             if aqw_diagnostics_enabled()
                                 && let Some(streak) = cache.note_static_churn(
                                     &base_transform.matrix,
