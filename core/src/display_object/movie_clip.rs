@@ -3897,6 +3897,29 @@ impl<'gc> MovieClip<'gc> {
         // against a 41.7ms budget -- so the whole approach is closed. (The real
         // cause was descendants losing their *filters* inside the bake; see
         // `render_base`.) Do not reopen without a new mechanism.
+        // The root is also the only place this pays, which was measured rather
+        // than assumed. 2026-08-14: `invalidate_depth` showed **93% of cache
+        // invalidations arriving from a descendant, 44% of them four or more
+        // levels down**, and `dirty_origin` named them -- small animated leaves
+        // buried in the art (`BurningloveCCr3`, `BurningChaosEye`,
+        // `SwordhavenPrestigiousAura2`, `PollyRogerPet`, `BloodOrb`). One such
+        // leaf re-dirties the whole item every frame, so this cache is rebaked
+        // forever: 75% of bakes come from caches that had already baked 120+
+        // times, one of them 3122 times.
+        //
+        // That reads as a cache in the wrong place, and it is not. Pushing it
+        // down onto the highest subtrees holding nothing that advances was built
+        // behind a lever and measured twice, and it fails because AQW avatar art
+        // has no still ground: with a 24-node floor the walk descended 117862
+        // times to place 47 caches, and with a 4-node floor it placed 3826 of
+        // 12 nodes each. Both roughly doubled the cost -- live blend passes
+        // 64/frame -> 148 and 176, submit 23.9ms -> 45.3 and 42.9 -- because the
+        // value was never in caching *something*, it is in flattening the whole
+        // item into one draw. Sliced up, the blends between the slices go live
+        // again. The lever and its counters were removed with this note in their
+        // place; do not rebuild it. What remains untried is making the rebake
+        // itself cheaper -- redrawing only the dirty region, which Flash did and
+        // this renderer has no notion of.
         if !crate::display_object::aqw_avatar_cache_disabled()
             && !self.is_bitmap_cached_preference()
         {

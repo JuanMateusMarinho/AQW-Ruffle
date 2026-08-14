@@ -2755,6 +2755,83 @@ pub(crate) static AQW_CACHE_BYPASS_CLEARED: std::sync::atomic::AtomicU64 =
 ///
 /// Population counters are per tick, from the Enter pass; the `_ns` pair covers
 /// all three passes. Diagnostics-only: one timer pair per orphan visit.
+/// How far a cache invalidation travelled to reach the cache it dirtied.
+///
+/// `invalidate_cached_bitmap` walks up from whatever changed, so a cache is
+/// dirtied either by its own geometry or by a descendant some levels down. The
+/// two call for opposite fixes and the bake counters cannot tell them apart: a
+/// cache that keeps dirtying *itself* is one that should not exist, and the
+/// question is whether it pays for its bakes. A cache dirtied from *below* sits
+/// above the animation, and no threshold fixes that -- it is placed wrong, and
+/// tearing it down only chooses which half of the loss to keep paying.
+///
+/// Bucketed by distance from the origin: itself, one level, two or three,
+/// deeper.
+static AQW_INVALIDATE_DEPTH: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Which objects set off invalidations that reached an *ancestor's* cache --
+/// "what is animating in there", answered by name rather than by guess.
+static AQW_INVALIDATE_ORIGIN: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+    std::sync::Mutex::new(None);
+
+thread_local! {
+    /// Zero only for the object the invalidation started at, which is the one
+    /// worth attributing. Without it the walk below would run again at every
+    /// level the recursion climbs.
+    static AQW_INVALIDATE_ORIGIN_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Diagnostics-only: walk what the invalidation is about to walk, recording
+/// every cache it will dirty and how far up it is.
+fn aqw_note_invalidation(origin: DisplayObject<'_>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut node = Some(origin);
+    let mut depth = 0u32;
+    let mut reached_ancestor = false;
+    while let Some(current) = node {
+        if current.is_bitmap_cached() {
+            let bucket = match depth {
+                0 => 0,
+                1 => 1,
+                2..=3 => 2,
+                _ => 3,
+            };
+            AQW_INVALIDATE_DEPTH[bucket].fetch_add(1, Relaxed);
+            if depth > 0 {
+                reached_ancestor = true;
+            }
+        }
+        depth += 1;
+        node = current.parent();
+    }
+    if !reached_ancestor {
+        return;
+    }
+    let label = aqw_blend_label(origin);
+    if let Ok(mut guard) = AQW_INVALIDATE_ORIGIN.lock() {
+        let counts = guard.get_or_insert_with(std::collections::HashMap::new);
+        if counts.len() < 512 || counts.contains_key(&label) {
+            *counts.entry(label).or_insert(0) += 1;
+        }
+    }
+}
+
+/// Drains the depth histogram as `self/d1/d2-3/d4+`.
+fn take_invalidate_depth() -> [u64; 4] {
+    use std::sync::atomic::Ordering::Relaxed;
+    std::array::from_fn(|i| AQW_INVALIDATE_DEPTH[i].swap(0, Relaxed))
+}
+
+/// Drains the origin tally as `Class@file:count`, busiest first.
+fn take_invalidate_origins(limit: usize) -> Vec<String> {
+    take_live_blend_tally(&AQW_INVALIDATE_ORIGIN, limit)
+}
+
 /// Inert probes that ran out of budget before reaching a verdict, and so left
 /// their subtree unfrozen however inert it was.
 ///
@@ -3488,6 +3565,16 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         let orph_script = AQW_ORPHAN_POP_SCRIPT.swap(0, Ordering::Relaxed);
         let orph_avatar = AQW_ORPHAN_POP_AVATAR.swap(0, Ordering::Relaxed);
         let orph_quiet = AQW_ORPHAN_POP_QUIET.swap(0, Ordering::Relaxed);
+        // `self` against the rest is the fork: a cache dirtying itself is a
+        // cache that may not pay for its bakes; a cache dirtied from below is a
+        // cache sitting above the animation. `dirty_origin` names what does the
+        // dirtying when it comes from below.
+        let invalidate_depth = take_invalidate_depth()
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join("/");
+        let dirty_origin = take_invalidate_origins(8).join(",");
         let orph_probe_out = AQW_ORPHAN_PROBE_EXHAUSTED.swap(0, Ordering::Relaxed);
         let orph_clean_visits = AQW_ORPHAN_CLEAN_VISITS.swap(0, Ordering::Relaxed);
         let orph_dirty_visits = AQW_ORPHAN_DIRTY_VISITS.swap(0, Ordering::Relaxed);
@@ -3797,6 +3884,7 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
              defer_grace={defer_grace} bypass_cleared={bypass_cleared} \
              orph_pop={orph_pop} orph_playing={orph_playing} orph_script={orph_script} \
              orph_avatar={orph_avatar} orph_quiet={orph_quiet} \
+             invalidate_depth={invalidate_depth} dirty_origin={dirty_origin} \
              orph_probe_out={orph_probe_out} \
              orph_clean_visits={orph_clean_visits} orph_dirty_visits={orph_dirty_visits} \
              orph_clean_ms={orph_clean_ms} orph_dirty_ms={orph_dirty_ms} \
@@ -7206,9 +7294,16 @@ pub trait TDisplayObject<'gc>:
     #[no_dynamic]
     fn invalidate_cached_bitmap(self) {
         if self.base().invalidate_cached_bitmap() {
+            if aqw_diagnostics_enabled()
+                && AQW_INVALIDATE_ORIGIN_DEPTH.with(std::cell::Cell::get) == 0
+            {
+                aqw_note_invalidation(self.into());
+            }
             // Don't inform ancestors if we've already done so this frame
             if let Some(parent) = self.parent() {
+                AQW_INVALIDATE_ORIGIN_DEPTH.with(|depth| depth.set(depth.get() + 1));
                 parent.invalidate_cached_bitmap();
+                AQW_INVALIDATE_ORIGIN_DEPTH.with(|depth| depth.set(depth.get() - 1));
             }
         }
     }
