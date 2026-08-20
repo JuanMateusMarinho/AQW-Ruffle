@@ -62,32 +62,12 @@ use super::interactive::Avm2MousePick;
 
 type FrameNumber = u16;
 
-/// Crowd thresholds for the avatar timeline throttle, counted in *topmost
-/// avatar-asset clips* (see `is_aqw_avatar_asset_root`): one avatar
-/// contributes roughly 8-14 (armor pieces + helm + cape + weapon + hair).
-/// ~8 players' worth engages the half-rate throttle; ~16 players' worth the
-/// third-rate one. Solo play (~10-14) never reaches either.
 const AQW_AVATAR_THROTTLE_ROOTS: u32 = 96;
 const AQW_AVATAR_HEAVY_THROTTLE_ROOTS: u32 = 192;
 
 use crate::display_object::aqw_diagnostics_enabled;
 use crate::display_object::script_requeue_disabled;
 
-/// Releasing a frozen avatar subtree's cache texture, opt-in via
-/// `RUFFLE_AQW_AVATAR_CACHE_RELEASE=1`.
-///
-/// OFF by default after field testing. It cuts peak memory by about a quarter,
-/// but the saving is paid back every time a hidden avatar is shown again: the
-/// texture is reallocated and the whole subtree recomposed, which for a heavy
-/// item is over a hundred blended layers. AQW moves avatars in and out of its
-/// hidden parking area constantly, so in a long session — exactly the case the
-/// change was meant to help — that costs more than the memory it saves, in
-/// both frame time and stability.
-///
-/// The measurement behind it stands and the code is kept for that reason. What
-/// it needs before being turned back on is hysteresis: release only after a
-/// subtree has stayed hidden for a while, so the avatars that genuinely pile up
-/// are reclaimed while the ones cycling in and out keep their texture.
 fn aqw_avatar_cache_release_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -101,8 +81,6 @@ fn aqw_full_timeline_throttle_enabled() -> bool {
         .get_or_init(|| crate::display_object::aqw_env_flag("RUFFLE_AQW_TIMELINE_THROTTLE", false))
 }
 
-/// Kill-switch for the hidden-subtree (TRASH) freeze, so it can be turned off
-/// in the field without a rebuild if it ever misbehaves.
 fn aqw_hidden_freeze_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED
@@ -110,10 +88,6 @@ fn aqw_hidden_freeze_disabled() -> bool {
 }
 
 pub(super) fn is_aqw_avatar_asset_movie_url(url: &str) -> bool {
-    // Single pass over the path segments. Testing each folder name separately
-    // re-split the whole URL once per name (up to four scans of the same
-    // string); this is called for every node of the orphan subtree probe, so
-    // the repeats multiplied by the orphan count.
     let path = url.split(['?', '#']).next().unwrap_or(url);
     let (mut under_gamefiles, mut avatar_folder) = (false, false);
     for segment in path.split('/') {
@@ -132,21 +106,14 @@ pub(super) fn is_aqw_avatar_asset_movie_url(url: &str) -> bool {
     false
 }
 
-/// Kill-switch for the orphan (off-display-list) avatar freeze, so it can be
-/// turned off in the field without a rebuild if it ever misbehaves.
 fn aqw_orphan_freeze_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED
         .get_or_init(|| crate::display_object::aqw_env_flag("RUFFLE_AQW_NO_ORPHAN_FREEZE", false))
 }
 
-/// Ticks a clip must stay on the orphan list before the orphan freeze may
-/// engage (~5s at AQW's 24fps): long enough for any load/init flow that
-/// briefly runs content detached to finish undisturbed.
 const AQW_ORPHAN_FREEZE_GRACE_TICKS: u16 = 120;
 
-/// Depth-first probe (capped at `budget` nodes) for any clip instantiated
-/// from an avatar-asset SWF (item/class/hair) inside `obj`'s subtree.
 fn aqw_subtree_has_avatar_asset<'gc>(obj: DisplayObject<'gc>, budget: &mut u32) -> bool {
     if *budget == 0 {
         return false;
@@ -167,9 +134,6 @@ fn aqw_subtree_has_avatar_asset<'gc>(obj: DisplayObject<'gc>, budget: &mut u32) 
     false
 }
 
-/// Kill-switch for the *inert* half of the orphan freeze, so the widened
-/// predicate can be A/B'd in the field against the avatar-art one it was added
-/// beside. `RUFFLE_AQW_NO_INERT_ORPHAN_FREEZE=1` leaves only the art freeze.
 fn aqw_inert_orphan_freeze_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| {
@@ -177,48 +141,6 @@ fn aqw_inert_orphan_freeze_disabled() -> bool {
     })
 }
 
-/// Nodes the inert probe may visit before it gives up. Inventory rows and item
-/// icons -- what the census found the list is actually made of -- are a handful
-/// of nodes each, so this is generous for the case it exists to catch.
-///
-/// That premise covers the *rows* and misses what actually costs. Measured
-/// 2026-08-14: the orphans still unfrozen after a shop opens are the panels
-/// above them -- `LPFPanelListShopInvA`, `LPFLayoutInvShopEnh`,
-/// `LPFFrameListViewTabbed` -- whose subtree is the entire list. Well past 128,
-/// so the probe runs out, returns `None`, and the verdict is never reached no
-/// matter how inert the list is. The measurement has that exact shape: after a
-/// shop opens the orphan count returns to normal and the visit count with it,
-/// while the cost per visit rises 78x. Same roots, far bigger subtrees, none of
-/// them freezable.
-///
-/// `RUFFLE_AQW_INERT_PROBE_BUDGET=N` retunes it without a rebuild. The
-/// arithmetic favours a large value heavily: a subtree that fails the probe is
-/// re-probed once every 64 ticks, and pays three full passes over itself on
-/// every tick in between.
-///
-/// Raised 128 -> 1000000 on 2026-08-14, and **what it buys is recovery, not a
-/// lower peak** -- which took a field report to notice, because peak and median
-/// are exactly the statistics that hide it.
-///
-/// The peak barely moves, and should not: at the moment a shop opens its
-/// subtree genuinely has something advancing, so no freeze is available and no
-/// budget changes that. What a budget decides is whether the verdict is ever
-/// *reachable* afterwards. Bounded, a subtree past the bound can never be
-/// judged, so when it finally settles nothing notices and it is walked in full
-/// for the rest of the session. Unbounded, the next re-probe returns
-/// `Some(false)` and it freezes.
-///
-/// Measured over four arms in one session, orphan-phase time per window:
-///
-/// - 128: one episode above 1000ms, **never recovered**, 38% of windows elevated
-/// - 8192: same shape, never recovered, 27% elevated
-/// - 1000000: three episodes, **every one back under 400ms within two windows**,
-///   21% elevated, and the clean half's median down 92 -> 18ms
-///
-/// The cost of a deeper probe stays small for a structural reason: the walk
-/// returns on the first descendant that will advance, so the full traversal
-/// only happens when the answer is "inert" -- the case that pays for it. And it
-/// is paid once per re-probe against three passes per tick in between.
 fn aqw_orphan_inert_probe_budget() -> u32 {
     static BUDGET: OnceLock<u32> = OnceLock::new();
     *BUDGET.get_or_init(|| {
@@ -229,48 +151,15 @@ fn aqw_orphan_inert_probe_budget() -> u32 {
     })
 }
 
-/// Ticks an orphan must survive before the *inert* freeze may engage (~1s).
-///
-/// The art freeze waits 5s because it cannot tell a subtree that is mid-init
-/// from one that is finished -- the grace is standing in for a guarantee it
-/// does not have. The inert probe *is* that guarantee: nothing under here is
-/// playing, holds a queued script, or still needs constructing. Measured
-/// 2026-08-07: with the 5s grace, scrolling the inventory replenishes the list
-/// faster than it drains, so ~1400 orphans are always inside the grace and the
-/// phase stayed at 1666ms even with 1592 subtrees frozen.
 const AQW_ORPHAN_INERT_GRACE_TICKS: u16 = 24;
 
-/// Ticks between re-probes of a subtree already frozen as inert (~0.7s).
-///
-/// The avatar-art verdict is cached forever because it only ever becomes more
-/// true: art parents into the chassis asynchronously, it does not leave.
-/// Inertness is not like that -- AS3 can call `play()` on a detached clip -- and
-/// a frozen clip is not visited, so nothing else would ever notice. Re-probing
-/// while the freeze *holds* is what bounds that, and it is affordable: the
-/// probe is a fraction of one pass, amortised over 16 ticks, against the three
-/// full passes it replaces.
 const AQW_ORPHAN_INERT_REPROBE_TICKS: u16 = 16;
 
-/// Bounded depth-first answer to "will anything in this subtree advance?".
-///
-/// `None` means the walk hit its budget before it could be sure, and the caller
-/// must read that as "maybe". This is the opposite of
-/// `aqw_subtree_has_avatar_asset` above, where exhausting the budget yields
-/// `false` and the safe thing follows from it -- no art found, no freeze. Here
-/// a truncated walk returning `false` would freeze a subtree that is still
-/// animating, so truncation has to refuse instead.
 fn aqw_subtree_will_advance<'gc>(obj: DisplayObject<'gc>, budget: &mut u32) -> Option<bool> {
     if *budget == 0 {
         return None;
     }
     *budget -= 1;
-    // One test per pass the freeze skips, which is the whole point: `playing`
-    // for `enter_frame`, `has_pending_script` for `run_frame_scripts`, and
-    // `needs_frame_construction` for `construct_frame`. Leaving the last one
-    // out is what would let a child added to a frozen subtree -- a Loader
-    // completing into it, say -- sit there with no AVM2 object forever, since
-    // a stopped new child is not playing and has no script queued either, so
-    // nothing would ever unfreeze it.
     if let Some(clip) = obj.as_movie_clip()
         && (clip.playing() || clip.has_pending_script())
     {
@@ -290,25 +179,17 @@ fn aqw_subtree_will_advance<'gc>(obj: DisplayObject<'gc>, budget: &mut u32) -> O
     Some(false)
 }
 
-/// Kill-switch for the injected "CRT Filter" Options-menu row, so it can be
-/// turned off in the field without a rebuild if it ever misbehaves.
 fn aqw_crt_menu_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| crate::display_object::aqw_env_flag("RUFFLE_AQW_NO_CRT_MENU", false))
 }
 
-/// Which Artix game the CRT-filter option row is being managed for. Each
-/// game runs as its own process, so one global flag/config per process.
 #[derive(Copy, Clone)]
 enum AqwCrtGame {
     Aqw,
     DragonFable,
 }
 
-/// Which game this process is running, decided by host rather than by path.
-/// `/game/gamefiles/` is also MechQuest's layout, so keying on it handed
-/// MechQuest AQW's persisted filter state with no row to turn it back off. The
-/// host is also what survives the game moving its files around.
 fn aqw_crt_game(url: &str) -> Option<AqwCrtGame> {
     let host = super::url_host(url)?;
     if host == "aq.com" || host.ends_with(".aq.com") {
@@ -320,10 +201,6 @@ fn aqw_crt_game(url: &str) -> Option<AqwCrtGame> {
     }
 }
 
-/// Diagnostics for the injected row, which is the most game-shaped thing here:
-/// it is found by the panel's own instance names, so a rebuilt options menu
-/// would silently stop producing it. Seeing "panel" without "row" in the gate
-/// report is the signal that the panel's insides changed.
 static AQW_CRT_PANEL_SEEN: AtomicBool = AtomicBool::new(false);
 static AQW_CRT_ROW_INJECTED: AtomicBool = AtomicBool::new(false);
 
@@ -356,11 +233,6 @@ fn aqw_crt_note_row_injected() {
     }
 }
 
-/// Toggle the filter from outside the game's own UI.
-///
-/// The injected row is the normal way in, but it hangs off the game's panel
-/// structure; this keeps a way in that doesn't. `None` outside the games that
-/// have the filter, whose state is the only state that gets armed.
 pub fn aqw_crt_toggle_external() -> Option<bool> {
     AQW_CRT_CONFIG.get()?;
     let on = !ruffle_render::backend::aqw_crt_filter_enabled();
@@ -376,9 +248,6 @@ pub fn aqw_crt_toggle_external() -> Option<bool> {
     Some(on)
 }
 
-/// Where the CRT toggle persists between sessions (the injected row has no
-/// server-side preference to piggyback on, unlike the game's own options).
-/// Resolved once at init; the click hook reuses it.
 static AQW_CRT_CONFIG: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
 
 fn aqw_crt_config_path(game: AqwCrtGame) -> Option<std::path::PathBuf> {
@@ -392,8 +261,6 @@ fn aqw_crt_config_path(game: AqwCrtGame) -> Option<std::path::PathBuf> {
     Some(path)
 }
 
-/// One-time init of the CRT flag: `RUFFLE_AQW_CRT=1/0` overrides, otherwise
-/// the persisted choice from the last session, otherwise off.
 fn aqw_crt_init_state(game: AqwCrtGame) {
     AQW_CRT_CONFIG.get_or_init(|| {
         let path = aqw_crt_config_path(game);
@@ -423,8 +290,6 @@ fn aqw_crt_persist(on: bool) {
     }
 }
 
-/// Injected-child depths on the options panels. Far above anything the
-/// panels' own timelines place, so no authored frame ever collides.
 const AQW_CRT_DEPTH_LABEL: Depth = 16200;
 const AQW_CRT_DEPTH_VALUE: Depth = 16202;
 const AQW_CRT_DEPTH_LEFT: Depth = 16204;
@@ -432,8 +297,6 @@ const AQW_CRT_DEPTH_RIGHT: Depth = 16206;
 const AQW_CRT_DEPTH_DF_CHECK: Depth = 16390;
 const AQW_CRT_DEPTH_DF_LABEL: Depth = 16392;
 
-/// Find a game's options panel: the only container whose children include
-/// both `marker_a` and `marker_b` (instance names unique to that panel).
 fn aqw_find_options_panel<'gc>(
     stage: crate::display_object::Stage<'gc>,
     marker_a: &WStr,
@@ -465,9 +328,6 @@ fn aqw_find_options_panel<'gc>(
     None
 }
 
-/// Instantiate one library symbol as a named child of the Options panel,
-/// mirroring `instantiate_child`'s timeline placement path (so the clone gets
-/// the full AVM2 construction and renders like an authored child).
 fn aqw_crt_spawn_child<'gc>(
     context: &mut UpdateContext<'gc>,
     panel: MovieClip<'gc>,
@@ -490,16 +350,10 @@ fn aqw_crt_spawn_child<'gc>(
     child.set_matrix(matrix);
     let name = AvmString::new_utf8(context.gc(), name);
     child.set_name(context.gc(), name);
-    // Deliberately NOT `set_has_explicit_name(true)`: that flag makes AVM2
-    // construction try to bind the child as a property on the (sealed)
-    // panel class, which fails with a logged #1056. `child_by_name` (all we
-    // need) matches on the display name alone.
     child.post_instantiation(context, None, Instantiator::Movie, false);
     if movie.is_action_script_3() {
         crate::frame_lifecycle::catchup_display_object_to_frame(context, child);
     } else {
-        // AVM1 path (DragonFable): mirror `instantiate_child`'s tail so the
-        // clone's first frame (and any frame-1 DoAction) runs this tick.
         child.enter_frame(context);
         if let Some(clip) = child.as_movie_clip() {
             clip.run_frame_avm1(context);
@@ -514,8 +368,6 @@ fn aqw_crt_set_row_text<'gc>(
     text: &WStr,
 ) {
     if let Some(edit) = child.as_edit_text() {
-        // Recenter around the authored bounds so longer strings ("CRT
-        // Filter") don't clip in the narrow quality-value field we cloned.
         edit.set_autosize(super::edit_text::AutoSizeMode::Center, context);
         if edit.text() != text {
             edit.set_text(text, context);
@@ -523,20 +375,10 @@ fn aqw_crt_set_row_text<'gc>(
     }
 }
 
-/// Periodic hook (from `run_all_phases_avm2`): keeps a "CRT Filter  < ON >"
-/// row injected into AQW's Options panel, built from the panel's own assets
-/// (the Visuals row's value TextField and arrow symbols - same art, same
-/// embedded font) so it reads as native UI. The row sits on the panel's
-/// bottom strip (next to the latency/version readouts), the one spot with
-/// free space that persists across all four tabs. Symbol ids and geometry
-/// are derived from the live `mcVis` row, never hardcoded, so game updates
-/// that renumber characters don't break it - the row simply requires one
-/// visit to the General tab (where `mcVis` lives) to appear.
 pub fn aqw_crt_menu_tick(context: &mut UpdateContext<'_>) {
     let Some(game) = aqw_crt_game(context.stage.movie().url()) else {
         return;
     };
-    // Cheap cadence: a full scan four times a second is plenty for UI.
     static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if !TICK
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -544,8 +386,6 @@ pub fn aqw_crt_menu_tick(context: &mut UpdateContext<'_>) {
     {
         return;
     }
-    // Ahead of the row's kill-switch: it also arms the persisted state and the
-    // hotkey that writes it, neither of which is about the row.
     aqw_crt_init_state(game);
     if aqw_crt_menu_disabled() {
         return;
@@ -574,13 +414,10 @@ fn aqw_crt_aqw_tick(context: &mut UpdateContext<'_>) {
     };
 
     if let Some(value) = panel.child_by_name(WStr::from_units(b"aqwCrtValue"), false) {
-        // Already injected: just keep the value label in sync.
         aqw_crt_set_row_text(context, value, value_text);
         return;
     }
 
-    // Not injected yet: needs the General tab's Visuals row on screen to
-    // clone from. All geometry below is in twips, panel-local.
     let Some(vis_obj) = panel.child_by_name(WStr::from_units(b"mcVis"), false) else {
         return;
     };
@@ -605,17 +442,9 @@ fn aqw_crt_aqw_tick(context: &mut UpdateContext<'_>) {
     let left_matrix = left.base().matrix();
     let right_matrix = right.base().matrix();
     let quality_matrix = quality.base().matrix();
-    // The value field is placed by its bounds origin; its visual center sits
-    // this far right of the placement point (authored bounds are stable
-    // under the autosize-center we apply to the clones).
     let text_bounds = quality.self_bounds(BoundsMode::Engine);
     let text_center_off = (text_bounds.x_min.get() + text_bounds.x_max.get()) / 2;
 
-    // Anchor the row's right edge to the panel's shared arrow column and its
-    // baseline to the bottom strip's latency text; keep the arrows' offset
-    // below their value text exactly as authored in the Visuals row. The
-    // arrow gap must clear the value text plus the arrow art itself (the
-    // arrows' registration point is their center, art ~400 twips wide).
     let right_tx = vis_matrix.tx.get() + right_matrix.tx.get();
     let left_tx = right_tx - 1120;
     let row_ty = latency.base().matrix().ty.get();
@@ -623,10 +452,6 @@ fn aqw_crt_aqw_tick(context: &mut UpdateContext<'_>) {
     let value_tx = right_tx - 560 - text_center_off;
     let label_tx = right_tx - 2100 - text_center_off;
 
-    // The strip's version readout ("3.11") is a wide centered field whose
-    // text lands exactly where the row's label needs to go; nudge it left
-    // beside the latency readout. Absolute-from-latency (not relative to its
-    // own position) so re-running after a tab switch can't drift it.
     if let Some(version) = panel.child_by_name(WStr::from_units(b"txtCVersion"), false) {
         let version_matrix = version.base().matrix();
         version.set_matrix(Matrix {
@@ -685,14 +510,6 @@ fn aqw_crt_aqw_tick(context: &mut UpdateContext<'_>) {
     aqw_crt_note_row_injected();
 }
 
-/// DragonFable: inject a "CRT Filter" checkbox row into the Options book's
-/// GRAPHICS column, just below the last authored row. The checkbox
-/// symbol is cloned from a live row (same art), and it is self-contained in
-/// AVM1: its internal button toggles `bitChecked` and the checkmark on its
-/// own (the `onReleaseEvent` callback stays undefined and is skipped), so
-/// the native click hook only has to flip the filter flag. The label is a
-/// Noto-Serif EditText from the game's library, matching the authored
-/// static labels.
 fn aqw_crt_df_tick(context: &mut UpdateContext<'_>) {
     let Some(panel) = aqw_find_options_panel(
         context.stage,
@@ -708,9 +525,6 @@ fn aqw_crt_df_tick(context: &mut UpdateContext<'_>) {
     let on = ruffle_render::backend::aqw_crt_filter_enabled();
 
     if let Some(check) = panel.child_by_name(WStr::from_units(b"aqwCrtCheck"), false) {
-        // Already injected: keep the checkmark in sync (the checkbox's own
-        // button script and our click hook flip together, so this only
-        // corrects drift, e.g. right after injection).
         if let Some(mark) = check
             .as_container()
             .and_then(|c| c.child_by_name(WStr::from_units(b"checkmark"), false))
@@ -728,13 +542,6 @@ fn aqw_crt_df_tick(context: &mut UpdateContext<'_>) {
     ) else {
         return;
     };
-    // chkUIToggle is the last authored GRAPHICS checkbox ("Seasonal Borders"
-    // in the live build, confirmed by the AQW_CRT_DF dump); chkWeather/chkFPS
-    // give the checkbox symbol and the authored row pitch. Walking the column
-    // by symbol id is NOT reliable: the GRAPHICS and SOUND checkboxes share
-    // this symbol with the left options page too, and there is a wide gap down
-    // to SOUND - so the fixed instance name is the stable anchor, and the gate
-    // diagnostics flag it if a game update ever renames it.
     let checkbox_id = chk_last.id();
     if checkbox_id == 0 {
         return;
@@ -745,11 +552,6 @@ fn aqw_crt_df_tick(context: &mut UpdateContext<'_>) {
         return;
     }
     let row_x = ui_matrix.tx.get();
-    // One full row-pitch below the last graphics checkbox: the next slot in
-    // the GRAPHICS grid, full-size and grouped with the other graphics
-    // options. The DF GRAPHICS->SOUND gap is only about a pitch and the big
-    // SOUND heading fills part of it, so the row sits a touch over the heading
-    // - accepted on purpose, chosen over shrinking or relocating the row.
     let row_y = ui_matrix.ty.get() + pitch;
 
     let Some(label_id) = aqw_crt_df_label_id(context, panel) else {
@@ -768,8 +570,6 @@ fn aqw_crt_df_tick(context: &mut UpdateContext<'_>) {
         },
         "aqwCrtCheck",
     ) {
-        // Initialize the checkbox's own AVM1 state so its internal button
-        // stays in parity with the filter flag from the first click on.
         if let Some(obj) = check.object1() {
             let name = AvmString::new_utf8(context.gc(), "bitChecked");
             obj.define_value(
@@ -804,19 +604,11 @@ fn aqw_crt_df_tick(context: &mut UpdateContext<'_>) {
     aqw_crt_note_row_injected();
 }
 
-/// One-shot recursive dump of the DF options panel (name / id / tx / ty in
-/// panel-space twips, plus scale and any EditText content) so the injected row
-/// can be re-tuned against real geometry after a game update reshuffles the
-/// GRAPHICS column. Gated by the caller on diagnostics; fires once per process.
 fn aqw_crt_df_dump_layout(panel: MovieClip<'_>) {
     static DUMPED: AtomicBool = AtomicBool::new(false);
     if DUMPED.swap(true, Ordering::Relaxed) {
         return;
     }
-    // Recursive so nested labels/headings show up (the SOUND heading is not a
-    // direct child); positions accumulate through parent matrices into panel
-    // space, and the scale (sx/sy) exposes size mismatches like the injected
-    // label rendering at the wrong scale.
     fn walk<'gc>(obj: DisplayObject<'gc>, parent: Matrix, depth: u32, budget: &mut u32) {
         if *budget == 0 || depth > 4 {
             return;
@@ -828,8 +620,6 @@ fn aqw_crt_df_dump_layout(panel: MovieClip<'_>) {
             .as_edit_text()
             .map(|edit| edit.text().to_string())
             .unwrap_or_default();
-        // Only rows carrying a name or visible text: enough to place SOUND and
-        // the labels without drowning the log in decorative shapes.
         if !name.is_empty() || !text.is_empty() {
             tracing::info!(
                 target: "aqw_diag",
@@ -853,11 +643,6 @@ fn aqw_crt_df_dump_layout(panel: MovieClip<'_>) {
     }
 }
 
-/// Library id of a Noto-Serif EditText to clone for the DF row label.
-/// Prefers the known id from the current DF build (type-checked before
-/// use, since game updates renumber characters); falls back to any
-/// EditText inside the panel's live VolumeControl (Noto Serif Bold - the
-/// volume number), which survives renumbering.
 fn aqw_crt_df_label_id<'gc>(
     context: &mut UpdateContext<'gc>,
     panel: MovieClip<'gc>,
@@ -894,9 +679,6 @@ fn aqw_crt_df_label_id<'gc>(
     find_edit_text(volume, &mut budget)
 }
 
-/// Click hook (from the player's left-release dispatch): if the released
-/// object is part of the injected CRT row, toggle the filter, persist the
-/// choice and refresh the row's ON/OFF label.
 pub fn aqw_crt_maybe_toggle<'gc>(context: &mut UpdateContext<'gc>, target: DisplayObject<'gc>) {
     if aqw_crt_menu_disabled() {
         return;
@@ -1080,8 +862,6 @@ pub struct MovieClipData<'gc> {
     drawing: OnceCell<Box<RefCell<Drawing>>>,
 
     last_queued_script_frame: Cell<Option<FrameNumber>>,
-    /// The frame whose script was last handed back after throwing out of turn,
-    /// so it is handed back at most once.
     requeued_script_frame: Cell<Option<FrameNumber>>,
     queued_script_frame: Cell<FrameNumber>,
     queued_goto_frame: Cell<Option<FrameNumber>>,
@@ -1095,9 +875,6 @@ pub struct MovieClipData<'gc> {
     aqw_timeline_counter: Cell<u8>,
     aqw_timeline_divisor: Cell<u8>,
     aqw_skip_timeline_frame: Cell<bool>,
-    /// Consecutive orphan-list ticks this clip has been processed for, and the
-    /// cached freeze verdict (0 = unknown, 1 = freeze, 2 = no avatar art).
-    /// See `update_aqw_orphan_freeze`.
     aqw_orphan_ticks: Cell<u16>,
     aqw_orphan_freeze: Cell<u8>,
 
@@ -1118,19 +895,6 @@ struct MovieClipDataMut<'gc> {
     frame_scripts: Vec<Option<Avm2Object<'gc>>>,
     avm1_text_field_bindings: Vec<Avm1TextFieldBinding<'gc>>,
 
-    /// Memoized `currentLabels`, as `(scene start, scene length, the labels)`.
-    ///
-    /// `currentLabels` rebuilds everything on every read: it clones and sorts
-    /// every label name, allocates an `AvmString` per label, and constructs a
-    /// `FrameLabel` per label -- which, since `FrameLabel extends
-    /// EventDispatcher`, runs two AS3 constructors each. Content that reads it
-    /// inside a loop pays all of that per iteration, and AQW does exactly that
-    /// (`currentLabels` in the loop condition and twice in the body). Measured
-    /// 2026-08-01: ~3900 reads per 48 frames at ~83us each, building ~370k
-    /// `FrameLabel` objects a second.
-    ///
-    /// Frame labels come from immutable tag data, so the only thing that can
-    /// invalidate this is landing in a different scene.
     current_labels: Option<(FrameNumber, FrameNumber, Vec<Avm2Value<'gc>>)>,
 }
 
@@ -1735,11 +1499,6 @@ impl<'gc> MovieClip<'gc> {
         self.0.has_pending_script.get()
     }
 
-    /// Whether `run_local_frame_scripts` would actually run something: a script
-    /// is queued *and* it is not the one already run for this frame. The raw
-    /// `has_pending_script` stays true indefinitely once a scripted frame has
-    /// been played, so it is not usable as "there is work here".
-    /// The memoized `currentLabels` for this scene, if it is the one we built.
     pub fn cached_scene_labels(
         self,
         scene_start: FrameNumber,
@@ -1773,7 +1532,6 @@ impl<'gc> MovieClip<'gc> {
     pub fn set_has_pending_script(self, context: &mut UpdateContext<'gc>, value: bool) {
         self.0.has_pending_script.set(value);
         if value {
-            // `run_frame_scripts` has something to do here now.
             self.mark_subtree_needs_frame(context);
         }
     }
@@ -1887,8 +1645,6 @@ impl<'gc> MovieClip<'gc> {
     }
 
     fn goto_frame_now(self, context: &mut UpdateContext<'gc>, frame: FrameNumber) {
-        // Guard against infinite recursion: goto_frame_now -> run_goto ->
-        // run_inner_goto_frame -> run_frame_scripts -> frame script -> gotoAndPlay -> goto_frame_now
         use std::cell::Cell;
         thread_local! {
             static GOTO_NOW_DEPTH: Cell<u32> = const { Cell::new(0) };
@@ -1938,8 +1694,6 @@ impl<'gc> MovieClip<'gc> {
                 return;
             }
 
-            // A no-op goto is still observable: it re-runs this subtree's frame
-            // scripts like a real one, so it has to be marked like one.
             self.mark_subtree_needs_frame_deep(context);
 
             // Pretend we actually did a goto, but don't do anything.
@@ -2137,8 +1891,6 @@ impl<'gc> MovieClip<'gc> {
     /// This sets the current frame of this MovieClip to a given number.
     pub fn set_current_frame(self, context: &mut UpdateContext<'gc>, current_frame: FrameNumber) {
         self.0.current_frame.set(current_frame);
-        // A different frame can mean different children and a different frame
-        // script, which is exactly what the frame passes look for.
         self.mark_subtree_needs_frame(context);
     }
 
@@ -2361,14 +2113,6 @@ impl<'gc> MovieClip<'gc> {
         }
     }
 
-    /// Record cutscene frame transitions that are not consecutive.
-    ///
-    /// A per-throw log only fires on frames that fail, so it cannot show a
-    /// frame that never ran at all -- and a frame script configures children
-    /// its own frame places, so a frame passed over leaves the next one
-    /// reaching for something that was never created. Only the gaps are
-    /// logged: `+2` is a frame silently missed, while a large jump is the
-    /// content's own `gotoAndPlay` and expected.
     fn note_cutscene_frame_gap(self) {
         if !aqw_diagnostics_enabled() || !self.movie().url().contains("Cutscene") {
             return;
@@ -2405,9 +2149,6 @@ impl<'gc> MovieClip<'gc> {
         self.note_cutscene_frame_gap();
         let shared = Gc::as_ref(self.0.shared.get());
 
-        // Advancing the timeline runs tags, which place and remove children and
-        // can queue a frame script. Mark before doing any of it, so the marking
-        // is not conditional on which branch below is taken.
         self.mark_subtree_needs_frame(context);
 
         let next_frame = self.determine_next_frame();
@@ -2688,9 +2429,6 @@ impl<'gc> MovieClip<'gc> {
         let goto_probe =
             crate::display_object::aqw_diagnostics_enabled().then(std::time::Instant::now);
 
-        // A goto rewrites this clip's children and frame, and re-runs the frame
-        // scripts below it. The recursive frame it runs afterwards has to be
-        // able to reach all of that.
         self.mark_subtree_needs_frame_deep(context);
 
         let frame_before_rewind = self.current_frame();
@@ -2733,8 +2471,6 @@ impl<'gc> MovieClip<'gc> {
             if is_rewind {
                 crate::display_object::AQW_GOTO_REWINDS.fetch_add(1, Ordering::Relaxed);
             }
-            // How many frames this seek has to step through, which is the cost
-            // a rewind pays that a forward seek does not.
             crate::display_object::AQW_GOTO_FRAMES.fetch_add(
                 frame.saturating_sub(self.current_frame()) as u64,
                 Ordering::Relaxed,
@@ -2855,8 +2591,6 @@ impl<'gc> MovieClip<'gc> {
             }
         }
 
-        // Whether this goto created or swapped a child. Purely updating an
-        // existing one's properties needs no construction pass.
         let structural_change = std::cell::Cell::new(false);
 
         // Run the list of goto commands to actually create and update the display objects.
@@ -2977,21 +2711,6 @@ impl<'gc> MovieClip<'gc> {
             );
         }
 
-        // An explicit AVM2 goto runs a whole recursive frame: construct the
-        // entire stage, broadcast frameConstructed, run every frame script,
-        // broadcast exitFrame. Its cost therefore scales with the room, not
-        // with what the goto touched -- measured 2026-08-01 at 1128ms of a
-        // 1143ms goto, against 1ms to actually place the children.
-        //
-        // AQW's aura cooldown drives a mask with `gotoAndStop` four times per
-        // aura per frame, and each of those only nudges an existing shape's
-        // properties. There is nothing to construct and no script to run, so
-        // the recursive frame has no work to find; content compiled for SWF 9
-        // already skips it via the branch at the top of
-        // `run_inner_goto_frame_impl`, and the same goto costs 26us there
-        // against 6600us here. Skip it when the goto changed nothing that a
-        // construction pass could act on. `RUFFLE_AQW_NO_GOTO_FASTPATH`
-        // restores the unconditional call.
         let needs_recursive_frame = !crate::display_object::aqw_goto_fastpath_enabled()
             || structural_change.get()
             || self.has_pending_script()
@@ -3628,15 +3347,6 @@ impl<'gc> MovieClip<'gc> {
 
                     let mut activation = Avm2Activation::from_domain(context, domain);
 
-                    // Set when a script the button's whole-stage pass pulled
-                    // forward throws. A clip that pass reaches has a half-built
-                    // frame: the child being constructed is placed, but the
-                    // field the script reads it through is written by
-                    // `on_construction_complete`, after the constructor we are
-                    // inside. The slot is marked consumed above, before the
-                    // call, so the throw also costs the script its turn in the
-                    // frame-script phase -- the one where the frame is finished
-                    // and the field is bound. Hand that turn back.
                     let mut requeue_after_throw = false;
 
                     if let Err(e) = callable.call(
@@ -3644,52 +3354,11 @@ impl<'gc> MovieClip<'gc> {
                         avm2_object.into(),
                         Avm2FunctionArgs::empty(),
                     ) {
-                        // Narrow to the shape this exists for: a script the
-                        // button's out-of-turn pass pulled forward. Gating on
-                        // the construct phase instead is far too broad --
-                        // `run_inner_goto_frame` enters that phase on every
-                        // explicit goto, of which AQW issues roughly 1300 per
-                        // 48-frame window, so a script that throws for any
-                        // unrelated reason would buy a second attempt thousands
-                        // of times a second, each paying another AVM2 error
-                        // construction. Capping at one requeue per frame is the
-                        // other half: without it the script becomes eligible
-                        // again inside the same pass.
                         requeue_after_throw = !script_requeue_disabled()
                             && super::avm2_button::in_framescript_pass()
                             && self.0.requeued_script_frame.get() != Some(frame_id);
-                        // A throwing frame script abandons everything after the
-                        // throw, and authored frames overwhelmingly end with
-                        // `stop()`. The clip is then left running by an error
-                        // whose message says nothing about that -- a cutscene
-                        // advancing on its own, with no input, looks exactly
-                        // like this. `playing` is the field that matters: still
-                        // true means the stop never happened.
                         if aqw_diagnostics_enabled() {
-                            // Is a button's out-of-turn pass on the stack? That
-                            // is the claim under test: the script runs inside
-                            // construction, so the siblings it is written to
-                            // configure may not be bound yet, and the first one
-                            // it touches is null.
-                            //
-                            // This used to walk up from here looking for an
-                            // ancestor inside `Sprite.constructChildren`, which
-                            // is the wrong direction and read `false` on every
-                            // throw ever recorded: the clip being constructed
-                            // is this clip's *child*. `children` is
-                            // the corroborating count -- a frame script that
-                            // configures components on a clip reporting very
-                            // few children is looking at an unfinished list.
                             let in_button_pass = super::avm2_button::in_framescript_pass();
-                            // Name and class of every child present at the
-                            // moment of the throw. The script died reaching a
-                            // null child while the clip already had dozens, so
-                            // the two readings left are distinguishable here:
-                            // a component child present in this list means the
-                            // instance exists and only the slot the script
-                            // reads it through is empty; no such child means it
-                            // was never instantiated at all. Those want
-                            // opposite fixes.
                             let children_list = self
                                 .iter_render_list()
                                 .take(24)
@@ -3741,12 +3410,6 @@ impl<'gc> MovieClip<'gc> {
                         self.set_has_pending_script(context, true);
 
                         if aqw_diagnostics_enabled() {
-                            // Pairs with the throw line above, which reports
-                            // `playing=true`. Seeing this one for the same clip
-                            // and frame means the script gets a second attempt
-                            // in the frame-script phase; whether that attempt
-                            // reaches the `stop()` shows up as the clip no
-                            // longer playing.
                             tracing::warn!(
                                 target: "aqw_diag",
                                 name = self.name().map(|n| n.to_string()).unwrap_or_default(),
@@ -3777,14 +3440,6 @@ impl<'gc> MovieClip<'gc> {
         self.set_has_pending_script(context, has_pending_script);
     }
 
-    /// Whether this clip is the topmost clip of an AQW avatar-asset (item/
-    /// class/hair SWF) subtree. `is_root()` alone misses most of the real
-    /// load: AQW instantiates armor pieces via `getDefinition(...) as Class`
-    /// from the item SWF's ApplicationDomain and parents them into the avatar
-    /// chassis (`AvatarMC.loadArmorPiecesFromDomain`), so the displayed clips
-    /// are class instances, not loaded roots. "Topmost" = my movie is an
-    /// avatar-asset SWF and my parent isn't a clip from an avatar-asset SWF
-    /// (clips further down are covered by the topmost node's early return).
     pub(super) fn is_aqw_avatar_asset_root(self) -> bool {
         let movie = self.movie();
         match self.parent() {
@@ -3793,8 +3448,6 @@ impl<'gc> MovieClip<'gc> {
                 if let Some(parent_clip) = parent.as_movie_clip() {
                     let parent_movie = parent_clip.movie();
                     if Arc::ptr_eq(&movie, &parent_movie) {
-                        // Fast path: internal clip of the same SWF as its
-                        // parent (the overwhelming majority) — never topmost.
                         return false;
                     }
                     if is_aqw_avatar_asset_movie_url(parent_movie.url()) {
@@ -3806,11 +3459,6 @@ impl<'gc> MovieClip<'gc> {
         }
     }
 
-    /// Whether this clip or any display-list ancestor is invisible. AQW parks
-    /// leavers'/off-cell avatars inside `world.TRASH` — an invisible, unnamed
-    /// `MovieClip` at y=-1000 (`World.as`) — instead of unloading them, and
-    /// they accumulate there for the whole session. Anything under a hidden
-    /// ancestor can't be seen, so freezing its art timelines is visually free.
     fn is_in_aqw_hidden_subtree(self) -> bool {
         let mut node: DisplayObject<'gc> = self.into();
         loop {
@@ -3824,12 +3472,6 @@ impl<'gc> MovieClip<'gc> {
         }
     }
 
-    /// Measurement wrapper around the per-clip hook below.
-    ///
-    /// `enter_frame` runs this on every clip in the tree, so it is the one
-    /// piece of the stage phases whose cost tracks display-list size rather
-    /// than the game's own scripts. `tick_stage_ms` cannot tell those apart;
-    /// `aqw_hook_ms`/`aqw_clips` can.
     fn update_aqw_timeline_throttle(
         self,
         context: &mut UpdateContext<'gc>,
@@ -3856,70 +3498,13 @@ impl<'gc> MovieClip<'gc> {
         context: &mut UpdateContext<'gc>,
         can_throttle: bool,
     ) -> bool {
-        // Extending this cache to map and NPC art was probed on 2026-08-12 and
-        // removed the same night, before it was ever a rule. Selecting on named
-        // class plus a 200k-stage-pixel ceiling took 3106 clips where the
-        // measurement had elected four: `aqw_hook_ms` tripled (116-143 to
-        // 322-432 per window) because the qualifying check re-walked bounds for
-        // every clip every tick, frame time got worse at a third of the
-        // occupancy, and the field run came back with visible art bugs -- caching
-        // a subtree makes the blends inside it resolve against its own art
-        // instead of what lies beneath, and that was applied to half the scene.
-        //
-        // What it did *not* do is test the idea. The filter left out the prize
-        // term entirely -- blend density, the whole reason `live_cand` exists --
-        // so the four dense candidates were drowned among three thousand. A
-        // narrow version is still open, and needs two things this did not have:
-        // the density figure carried from render into the tick, and the decision
-        // memoised per clip instead of recomputed. See HISTORY 2026-08-12.
         if !self.is_aqw_avatar_asset_root() {
             return false;
         }
 
-        // AQW item and class SWFs shade their art with dozens to hundreds of
-        // separately blended pieces, and none of them asks for a bitmap cache:
-        // a measured class file carries 139 blend placements against about 13
-        // in an ordinary helm, and declares `cacheAsBitmap` zero times. Every
-        // one of those becomes its own render target and pair of render passes,
-        // rebuilt each frame for art that did not change -- the per-file blend
-        // tally repeats to the unit between sweeps.
-        //
-        // Flash never paid that, because it only re-rasterized regions that
-        // actually changed. A cache is the equivalent: the blends resolve once
-        // into a texture and are reused until the art really moves. Set here,
-        // in the tick, rather than mid-render, because enabling it takes a
-        // mutable borrow of the object. Kill-switch `RUFFLE_AQW_NO_AVATAR_CACHE`.
-        // Withholding this cache from subtrees that contain a blend was tried
-        // on 2026-08-06 and measured, not guessed: it was a suspect for an item
-        // whose colour came out wrong while cached, because caching does change
-        // what inner blends composite against. A crowded room put 28% of avatar
-        // roots in that category and doubled the frame time -- 41.9ms to 88.3ms
-        // against a 41.7ms budget -- so the whole approach is closed. (The real
-        // cause was descendants losing their *filters* inside the bake; see
-        // `render_base`.) Do not reopen without a new mechanism.
-        // The root is also the only place this pays, which was measured rather
-        // than assumed. 2026-08-14: `invalidate_depth` showed **93% of cache
-        // invalidations arriving from a descendant, 44% of them four or more
-        // levels down**, and `dirty_origin` named them -- small animated leaves
-        // buried in the art (`BurningloveCCr3`, `BurningChaosEye`,
-        // `SwordhavenPrestigiousAura2`, `PollyRogerPet`, `BloodOrb`). One such
-        // leaf re-dirties the whole item every frame, so this cache is rebaked
-        // forever: 75% of bakes come from caches that had already baked 120+
-        // times, one of them 3122 times.
-        //
-        // That reads as a cache in the wrong place, and it is not. Pushing it
-        // down onto the highest subtrees holding nothing that advances was built
-        // behind a lever and measured twice, and it fails because AQW avatar art
-        // has no still ground: with a 24-node floor the walk descended 117862
-        // times to place 47 caches, and with a 4-node floor it placed 3826 of
-        // 12 nodes each. Both roughly doubled the cost -- live blend passes
-        // 64/frame -> 148 and 176, submit 23.9ms -> 45.3 and 42.9 -- because the
-        // value was never in caching *something*, it is in flattening the whole
-        // item into one draw. Sliced up, the blends between the slices go live
-        // again. The lever and its counters were removed with this note in their
-        // place; do not rebuild it. What remains untried is making the rebake
-        // itself cheaper -- redrawing only the dirty region, which Flash did and
-        // this renderer has no notion of.
+        // Flash never paid that, because it only re-rasterized regions that actually changed.
+        // What remains untried is making the rebake itself cheaper -- redrawing only the dirty
+        // region, which Flash did and this renderer has no notion of.
         if !crate::display_object::aqw_avatar_cache_disabled()
             && !self.is_bitmap_cached_preference()
         {
@@ -3930,28 +3515,11 @@ impl<'gc> MovieClip<'gc> {
 
         self.0.aqw_skip_timeline_frame.set(false);
 
-        // TRASH freeze: fully stop timeline advancement for avatar-asset art
-        // that sits under a hidden ancestor (AQW's invisible `world.TRASH`
-        // parking lot, hidden UI panels, etc.). This kills the per-frame cost
-        // of the avatars that pile up there across map changes WITHOUT freeing
-        // or unloading anything: every AS3 reference stays valid, ENTER_FRAME
-        // broadcasts still fire (combat queues etc. keep running — that's what
-        // broke every destroy-style fix), and the moment AQW re-parents the
-        // avatar back under CHARS it resumes on the very next frame. Clips
-        // that haven't run their first frame yet are exempt so construction
-        // always completes. `RUFFLE_AQW_NO_HIDDEN_FREEZE` disables this.
         if can_throttle
             && !aqw_hidden_freeze_disabled()
             && self.current_frame() != 0
             && self.is_in_aqw_hidden_subtree()
         {
-            // Drop the cache texture along with the timeline. Freezing already
-            // says this art cannot be seen; holding a texture for it buys
-            // nothing, and AQW never releases avatars mid-session, so every one
-            // that ever walked past keeps its own. Measured at ~1.5GB of live
-            // bitmap textures in one session, in tight bands of the 32px cache
-            // grid. Re-enabling is free: the preference stays set, so the next
-            // render after it becomes visible regenerates the texture.
             if aqw_avatar_cache_release_enabled() {
                 let base = self.base();
                 if let Some(cache) = &mut *base.bitmap_cache_mut() {
@@ -3967,16 +3535,6 @@ impl<'gc> MovieClip<'gc> {
         *context.aqw_avatar_asset_roots = context.aqw_avatar_asset_roots.saturating_add(1);
 
         let full_timeline_throttle = aqw_full_timeline_throttle_enabled();
-        // Keep attached avatar assets at the SWF frame rate. On-stage crowd
-        // throttling was re-tried on 2026-07-02 (with the corrected topmost-clip
-        // counting below) and REJECTED by field testing: with 8+ players the
-        // item art dropping to 12fps reads as constant stutter even while the
-        // FPS counter says 22-24, and it bought no measurable frame rate
-        // (crowded rooms are GPU-bound on filtered cache redraws — CPU sits at
-        // ~2% while FPS is 5 — which timeline throttling doesn't move). Only
-        // detached (off-stage, non-hidden) assets may be crowd-throttled, and
-        // on-stage throttling stays explicit opt-in via
-        // `RUFFLE_AQW_TIMELINE_THROTTLE`. Do not re-enable it by default.
         if self.is_on_stage(context) && !full_timeline_throttle {
             self.0.aqw_timeline_counter.set(0);
             self.0.aqw_timeline_divisor.set(0);
@@ -4025,53 +3583,22 @@ impl<'gc> MovieClip<'gc> {
         skip
     }
 
-    /// Orphan freeze: skip the frame phases of detached avatar subtrees.
-    ///
-    /// AQW never releases avatars — leavers' `AvatarMC`s stay referenced by
-    /// `world.avatars` for the whole session, and the ones that get
-    /// `removeChild`'d become AVM2 orphans that `run_all_phases_avm2` walks
-    /// (enter/construct/frame scripts, recursing the whole subtree) every
-    /// tick. A long session piles up hundreds of them and the tick alone
-    /// outgrows the frame budget (measured 2026-07-12: 898 orphans, one core
-    /// pegged, 3.6 fps in a 20-player room). Orphans are off the display list,
-    /// so they can never render: skipping their timeline phases is visually
-    /// free, and — like the hidden-subtree freeze above — nothing is freed
-    /// (every AS3 reference stays valid, broadcast events keep firing,
-    /// explicit gotos still run their own construction via
-    /// `run_inner_goto_frame`, which is left untouched). The moment AQW
-    /// re-parents one, it leaves the orphan list and resumes normally.
-    ///
-    /// Engages only after `AQW_ORPHAN_FREEZE_GRACE_TICKS` of continuous
-    /// orphan processing, only for constructed clips, and only when the
-    /// subtree actually contains avatar-asset art — loaders and game-logic
-    /// helpers that legitimately run detached are never touched.
-    /// `RUFFLE_AQW_NO_ORPHAN_FREEZE` disables it in the field.
     pub(crate) fn update_aqw_orphan_freeze(self) -> bool {
         if aqw_orphan_freeze_disabled() || !super::is_aqw_movie_url(self.movie().url()) {
             return false;
         }
-        // Exempt clips that haven't run their first frame, so initial
-        // construction always completes (same rule as the hidden freeze).
         if self.current_frame() == 0 {
             self.0.aqw_orphan_ticks.set(0);
             return false;
         }
         let ticks = self.0.aqw_orphan_ticks.get().saturating_add(1);
         self.0.aqw_orphan_ticks.set(ticks);
-        // The shorter of the two graces gates getting here at all; the art
-        // probe below still waits for its own.
         if ticks < AQW_ORPHAN_INERT_GRACE_TICKS {
             return false;
         }
         match self.0.aqw_orphan_freeze.get() {
             1 => true,
-            // Armor pieces parent into the chassis asynchronously after the
-            // item SWFs load, so a "no avatar art" verdict is re-probed
-            // periodically instead of cached forever.
             2 if !ticks.is_multiple_of(64) => false,
-            // Frozen as inert. Unlike the art verdict this one can stop being
-            // true, so it is re-probed while it holds rather than only while it
-            // fails; see `AQW_ORPHAN_INERT_REPROBE_TICKS`.
             3 if !ticks.is_multiple_of(AQW_ORPHAN_INERT_REPROBE_TICKS) => true,
             _ => {
                 let mut budget = 128u32;
@@ -4081,13 +3608,6 @@ impl<'gc> MovieClip<'gc> {
                     self.0.aqw_orphan_freeze.set(1);
                     return true;
                 }
-                // Measured 2026-08-07: 84% of a post-inventory orphan list is
-                // `LPFElementListItemItem` rows and `ii*`/`iw*` item icons, all
-                // from `Game3098*.swf` and `Assets_*.swf` -- so the art
-                // predicate above matched 11 of 3110 and the phase cost 86% of
-                // a core. Freezing on *structure* rather than on which file the
-                // art came from is what covers them, and it survives an AQW
-                // update in a way matching those class names would not.
                 let inert = !aqw_inert_orphan_freeze_disabled() && {
                     let mut budget = aqw_orphan_inert_probe_budget();
                     let verdict = aqw_subtree_will_advance(self.into(), &mut budget);
@@ -4103,33 +3623,14 @@ impl<'gc> MovieClip<'gc> {
         }
     }
 
-    /// Consecutive ticks this clip has been processed as an orphan, for the
-    /// census's age buckets. Read against the freeze's own grace period: an
-    /// orphan older than that is one the freeze looked at and declined.
     pub(crate) fn aqw_orphan_age_ticks(self) -> u16 {
         self.0.aqw_orphan_ticks.get()
     }
 
-    /// Whether this clip is frozen as *inert* rather than as avatar art, so the
-    /// census can show the widened predicate's share of the freezes.
     pub(crate) fn aqw_orphan_frozen_inert(self) -> bool {
         self.0.aqw_orphan_freeze.get() == 3 && self.aqw_orphan_frozen()
     }
 
-    /// Classify one orphan for the sweep's population columns.
-    ///
-    /// Called once per tick per orphan, from the Enter pass, and only under
-    /// diagnostics. Answers the question the 2026-08-07 measurement left open:
-    /// 3010 orphans cost 1720ms per window and only ~200 of them freeze, so
-    /// either the other 2800 are doing real work -- and no skip is available --
-    /// or they are inert in a way the avatar-art predicate simply does not
-    /// describe, and the freeze can be widened to cover them.
-    ///
-    /// `quiet` is the freeze-shaped test: a clip that is not advancing and has
-    /// no frame script queued has nothing for the three passes to find. It is
-    /// deliberately about this clip only, not its subtree -- the subtree
-    /// question is the *other* candidate, and the sweep's `orph_clean_*` pair
-    /// answers that one separately.
     pub(crate) fn aqw_note_orphan_shape(self) {
         use std::sync::atomic::Ordering::Relaxed;
         let playing = self.playing();
@@ -4149,22 +3650,8 @@ impl<'gc> MovieClip<'gc> {
         }
     }
 
-    /// Read-only companion to `update_aqw_orphan_freeze` for the construct
-    /// and frame-script orphan passes, so every phase of one tick agrees.
-    ///
-    /// Both freeze verdicts count. Reading only the avatar-art one (`1`) is
-    /// what the widened freeze shipped with on its first build: the Enter pass
-    /// froze 1604 of 1801 orphans and skipped them, and then these two passes
-    /// walked every one of them anyway, because they asked a question that
-    /// still meant "is this avatar art". Two thirds of the work survived a
-    /// freeze that looked, in the counters, like it was working -- the phase
-    /// only halved. This is the same trap the V2.5 notes name: the signal has
-    /// to mirror exactly the condition the consumer acts on.
     pub(crate) fn aqw_orphan_frozen(self) -> bool {
         let ticks = self.0.aqw_orphan_ticks.get();
-        // Each verdict against its own grace. Sharing one here while the
-        // decider used two is the same disagreement that let the construct and
-        // frame-script passes walk everything the Enter pass had frozen.
         let held = match self.0.aqw_orphan_freeze.get() {
             1 => ticks >= AQW_ORPHAN_FREEZE_GRACE_TICKS,
             3 => ticks >= AQW_ORPHAN_INERT_GRACE_TICKS,
@@ -4383,12 +3870,6 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
             child.run_frame_scripts(context);
             children_need |= child.base().subtree_needs_frame();
         }
-        // A script that is still queued has to be reachable next pass -- but
-        // `has_pending_script` alone does not mean that. `run_local_frame_scripts`
-        // only clears it on a *fresh* frame, so a clip parked on a frame that
-        // has a script keeps it set forever, and using it raw pinned the mark on
-        // roughly half of all orphans permanently. Mirror the condition that
-        // actually runs a script instead.
         self.settle_subtree_needs_frame(children_need || self.has_fresh_frame_script());
     }
 
@@ -6786,16 +6267,13 @@ mod avatar_asset_url_tests {
         assert!(is_aqw_avatar_asset_movie_url(
             "https://game.aq.com/game/gamefiles/hair/Spiky.swf"
         ));
-        // Order of the two segments is not significant.
         assert!(is_aqw_avatar_asset_movie_url(
             "https://a/items/gamefiles/x.swf"
         ));
 
-        // The root movie is under gamefiles but is not avatar art.
         assert!(!is_aqw_avatar_asset_movie_url(
             "https://game.aq.com/game/gamefiles/Loader3.swf"
         ));
-        // An avatar folder outside gamefiles is some other game.
         assert!(!is_aqw_avatar_asset_movie_url(
             "https://other.com/game/items/Sword.swf"
         ));
@@ -6806,14 +6284,12 @@ mod avatar_asset_url_tests {
         assert!(is_aqw_avatar_asset_movie_url(
             "https://game.aq.com/GAMEFILES/Items/Sword.swf?v=2"
         ));
-        // Partial names are not segments.
         assert!(!is_aqw_avatar_asset_movie_url(
             "https://a/gamefiles2/items/x.swf"
         ));
         assert!(!is_aqw_avatar_asset_movie_url(
             "https://a/gamefiles/items2/x.swf"
         ));
-        // Query values are not path segments.
         assert!(!is_aqw_avatar_asset_movie_url(
             "https://a/gamefiles/x.swf?dir=items"
         ));

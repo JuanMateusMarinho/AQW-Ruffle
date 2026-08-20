@@ -7,8 +7,8 @@ rustflags = [
 ]
 
 [target.x86_64-pc-windows-msvc]
-# Aumenta a stack para 64MB para evitar stack overflow durante recursão profunda do AVM2 (ex: AQW map changes)
-# O rust-lld foi removido pois ignorava a flag /STACK
+# Raise the stack to 128MB so deep AVM2 recursion does not overflow it (AQW map changes reach that far).
+# rust-lld was dropped here because it ignored /STACK.
 rustflags = ["-C", "link-arg=/STACK:134217728"]
 
 [env]

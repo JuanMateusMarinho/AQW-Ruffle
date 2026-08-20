@@ -296,7 +296,6 @@ impl<'gc> DispatchList<'gc> {
             .collect()
     }
 
-    /// Remove weak listeners whose callbacks have been collected.
     fn prune_dead_handlers(&mut self, event: AvmString<'gc>, mc: &Mutation<'gc>) {
         let remove_event = if let Some(event_sheaf) = self.0.get_mut(&event) {
             for set in event_sheaf.values_mut() {
@@ -346,8 +345,6 @@ impl<'gc> EventHandler<'gc> {
     }
 }
 
-/// A callback retained according to the `useWeakReference` argument supplied
-/// to `EventDispatcher.addEventListener`.
 #[derive(Clone, Collect, Copy)]
 #[collect(no_drop)]
 enum EventHandlerFunction<'gc> {

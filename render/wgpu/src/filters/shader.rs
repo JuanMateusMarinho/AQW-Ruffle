@@ -45,8 +45,6 @@ impl ShaderFilter {
             sample_count,
             RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
             draw_encoder,
-            // PixelBender writes with its own coordinate conventions; keep
-            // this target exact-sized.
             false,
         );
 

@@ -142,7 +142,6 @@ pub struct LoaderInfoObjectData<'gc> {
 
     errored: Cell<bool>,
 
-    /// True while a SWF is loading. Prevents concurrent loads.
     is_loading: Cell<bool>,
 }
 
@@ -277,7 +276,6 @@ impl<'gc> LoaderInfoObject<'gc> {
                 }
 
                 self.0.complete_event_fired.set(true);
-                // Load finished -- accept new ones again
                 self.0.is_loading.set(false);
                 let complete_evt = EventObject::bare_default_event(context, "complete");
                 Avm2::dispatch_event(context, complete_evt, self.into());
@@ -304,12 +302,10 @@ impl<'gc> LoaderInfoObject<'gc> {
         self.0.expose_content.set(true);
     }
 
-    /// Whether a SWF is currently loading.
     pub fn is_loading(self) -> bool {
         self.0.is_loading.get()
     }
 
-    /// Define o estado de carregamento.
     pub fn set_is_loading(self, value: bool) {
         self.0.is_loading.set(value);
     }
@@ -338,7 +334,6 @@ impl<'gc> LoaderInfoObject<'gc> {
         self.set_loader_stream(loader_stream, context.gc());
         self.set_errored(false);
         self.reset_init_and_complete_events();
-        // Unloading ends any load in progress
         self.0.is_loading.set(false);
 
         let loader_display_object = self
@@ -348,17 +343,11 @@ impl<'gc> LoaderInfoObject<'gc> {
             .display_object();
         let mut loader = loader_display_object.as_container().unwrap();
 
-        // A load that is still in flight has to be cancelled here too, and it
-        // has no parent yet: its content is only inserted into the Loader once
-        // it completes. Calling `load` again while one is in progress aborts
-        // the first, so only the second may deliver `init`/`complete`; letting
-        // the first survive means whichever response arrives first wins the
-        // shared LoaderInfo, and the handler runs against the wrong movie.
         if let Some(content) = previous_content {
             context.load_manager.cancel_load_for_target(content);
 
-            // Remove only the content tracked by LoaderInfo. User code can add
-            // auxiliary children to Loader, and Flash does not purge those here.
+            // User code can add auxiliary children to Loader, and Flash does not purge those
+            // here.
             if content
                 .parent()
                 .is_some_and(|parent| DisplayObject::ptr_eq(parent, loader_display_object))
@@ -377,15 +366,12 @@ impl<'gc> TObject<'gc> for LoaderInfoObject<'gc> {
 }
 
 impl<'gc> LoaderInfoObject<'gc> {
-    /// Reset this LoaderInfo to its "not loaded" state and fire "unload".
-    /// Called by `Loader._unload()` after the content leaves the display list.
     pub fn reset_and_dispatch_unload(
         self,
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<(), Error<'gc>> {
         let context = &mut activation.context;
 
-        // Put the stream back to "not loaded"
         let movie = &context.root_swf;
         let empty_swf = Arc::new(crate::tag_utils::SwfMovie::empty(
             movie.version(),
@@ -396,7 +382,6 @@ impl<'gc> LoaderInfoObject<'gc> {
         self.set_errored(false);
         self.reset_init_and_complete_events();
 
-        // Fire "unload" on the LoaderInfo (Adobe spec 4.8.3)
         let unload_event = EventObject::bare_default_event(context, "unload");
         Avm2::dispatch_event(context, unload_event, self.into());
 

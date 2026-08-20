@@ -22,7 +22,6 @@ pub fn preprocess_peephole(ops: &[Cell<Op<'_>>]) {
 /// A peephole optimizer to run after type-aware optimizations. This should be
 /// called once on the entire code slice.
 pub fn postprocess_peephole<'a>(ops: &'a [Cell<Op<'_>>], jump_targets: &HashSet<usize>) {
-    // Determine if this method ever depends on the state of the scope stack.
     let mut uses_scope_ops = false;
 
     for op in ops {
@@ -42,9 +41,6 @@ pub fn postprocess_peephole<'a>(ops: &'a [Cell<Op<'_>>], jump_targets: &HashSet<
         }
     }
 
-    // If the scope stack is never read from, only written to, we can replace
-    // `PushScope` ops with `Pop`. This allows the peephole optimizer to emit
-    // slightly better code.
     for current_op in ops {
         match current_op.get() {
             Op::PushScope {
@@ -56,7 +52,6 @@ pub fn postprocess_peephole<'a>(ops: &'a [Cell<Op<'_>>], jump_targets: &HashSet<
         }
     }
 
-    // Now actually run the main peephole optimizer.
     let mut last_op: Option<&'a Cell<Op<'_>>> = None;
 
     for (i, current_op) in ops.iter().enumerate() {

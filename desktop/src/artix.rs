@@ -107,8 +107,6 @@ pub fn window_title() -> String {
         .unwrap_or_else(|| ArtixGame::Aqw.title().to_string())
 }
 
-/// A pre-baked mouse cursor bitmap: `size` x `size` straight (non-premultiplied)
-/// RGBA with a top-left origin, and the hotspot in that same pixel space.
 pub struct CursorArt {
     pub rgba: &'static [u8],
     pub size: u16,
@@ -116,21 +114,15 @@ pub struct CursorArt {
     pub hotspot_y: u16,
 }
 
-/// The shapes the player's cursor is drawn with.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CursorKind {
     Arrow,
     Hand,
     Text,
-    /// Sword and pointer, for a monster the game would have you attack.
     Attack,
 }
 
 pub struct CursorSet {
-    /// Nominal size the set is picked by. Each shape's own bitmap is measured
-    /// against that rather than filling it: the I-beam has to sit inside a chat
-    /// line, and the attack art carries a sword beside its pointer, so fitting
-    /// the whole drawing to one canvas would halve the pointer.
     pub size: u16,
     pub arrow: CursorArt,
     pub hand: CursorArt,
@@ -138,11 +130,6 @@ pub struct CursorSet {
     pub attack: CursorArt,
 }
 
-/// Baked from the source artwork by the cursor generator script, which also
-/// prints these sizes and hotspots (the arrow's tip, the gauntlet's fingertip,
-/// the middle of the beam, and the tip of the pointer next to the sword). The
-/// OS draws cursors at their bitmap size, so the sizes here are the whole scale
-/// range on offer rather than a DPI ladder.
 const CURSOR_SETS: &[CursorSet] = &[
     CursorSet {
         size: 32,
@@ -254,16 +241,9 @@ const CURSOR_SETS: &[CursorSet] = &[
     },
 ];
 
-/// Dropped from 48 on 2026-08-13, picked in game against 40 and 48: this
-/// artwork is solid-filled where the set it replaced was outlined, so it
-/// carries more weight at the same measurements.
 const DEFAULT_CURSOR_SIZE: u16 = 32;
 
-/// The cursor artwork for the running game, or `None` to leave the system
-/// cursors alone. `RUFFLE_AQW_NO_CUSTOM_CURSOR` (or a size of `0`) turns it off
-/// without a rebuild; `RUFFLE_AQW_CURSOR_SIZE` picks the closest baked size.
 pub fn custom_cursors() -> Option<&'static CursorSet> {
-    // Unknown means the test build, which stands in for AQW like the title does.
     if !matches!(current_game().unwrap_or(ArtixGame::Aqw), ArtixGame::Aqw) {
         return None;
     }

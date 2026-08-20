@@ -84,8 +84,6 @@ impl Descriptors {
         )
     }
 
-    /// Variant of [`Self::copy_pipeline`] built on the Catmull-Rom resampling
-    /// shader (`copy_sharp.wgsl`); used for scaled AQW presents.
     pub fn copy_sharp_pipeline(
         &self,
         format: wgpu::TextureFormat,
@@ -101,9 +99,6 @@ impl Descriptors {
         )
     }
 
-    /// Variant of [`Self::copy_pipeline`] built on the CRT shader
-    /// (`copy_crt.wgsl`); used for AQW presents with the in-game
-    /// "CRT Filter" option ON.
     pub fn copy_crt_pipeline(
         &self,
         format: wgpu::TextureFormat,
@@ -157,8 +152,6 @@ impl Descriptors {
                         entry_point: Some("main_fragment"),
                         targets: &[Some(wgpu::ColorTargetState {
                             format,
-                            // All of our blending has been done by now, so we want
-                            // to overwrite the target pixels without any blending
                             blend: Some(wgpu::BlendState::REPLACE),
                             write_mask: Default::default(),
                         })],

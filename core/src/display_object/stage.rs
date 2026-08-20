@@ -497,9 +497,6 @@ impl<'gc> Stage<'gc> {
         self.0.stage_size.set(new_stage_size);
         let stage_size_changed = prev_stage_size != new_stage_size;
         if stage_size_changed {
-            // Briefly fall back from the AQW 9-slice path to normal rendering so
-            // a resize can't freeze a HUD panel black in a crowded room. See
-            // `note_aqw_stage_resize`.
             crate::display_object::note_aqw_stage_resize();
         }
 

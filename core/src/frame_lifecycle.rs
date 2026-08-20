@@ -19,14 +19,6 @@ use crate::orphan_manager::OrphanManager;
 use tracing::instrument;
 use web_time::Instant;
 
-/// Run one orphan's pass, billing its cost to the probe's clean/dirty split.
-///
-/// The split is by the V2.5 subtree mark, which the ordinary tick deliberately
-/// does not honour (see `can_skip_frame_pass`). Timing it here is how the value
-/// of honouring it gets measured before the safety net is given up: whatever
-/// lands in `orph_clean_ms` is what such a skip would not have spent.
-///
-/// `probe` off is the shipping path and must stay free of the timer.
 fn billed_orphan_visit<'gc>(
     probe: bool,
     orphan: DisplayObject<'gc>,
@@ -37,8 +29,6 @@ fn billed_orphan_visit<'gc>(
         run(orphan, context);
         return;
     }
-    // Read before the pass: it is the pass that settles the mark, so reading
-    // after would classify every orphan by the state it was left in.
     let clean = orphan.aqw_subtree_clean();
     let started = Instant::now();
     run(orphan, context);
@@ -106,11 +96,6 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
 
     *context.aqw_avatar_asset_roots = 0;
 
-    // Tick-phase accounting for the diagnostics sweep (`tick_*_ms` columns),
-    // plus the orphan freeze: long-detached avatar subtrees skip their frame
-    // phases entirely (see `MovieClip::update_aqw_orphan_freeze`). The freeze
-    // decision is made once per tick in the Enter pass; the later passes use
-    // the read-only check so all phases of one tick agree.
     use crate::display_object::{
         AQW_ORPHANS_FROZEN, AQW_STAGE_CTOR_NS, AQW_STAGE_ENTER_NS, AQW_STAGE_SCRIPT_NS,
         AQW_TICK_BCAST_NS, AQW_TICK_ORPHAN_NS, AQW_TICK_STAGE_NS,
@@ -120,17 +105,9 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
     let mut stage_ns = 0u64;
     let mut bcast_ns = 0u64;
 
-    // Probe for the sweep's `orph_*` columns: what this list is made of, and
-    // how much of its cost lands on orphans the V2.5 subtree mark already calls
-    // clean. Off outside diagnostics -- it adds a timer pair per orphan visit,
-    // and the list runs to thousands after an inventory open.
     let orphan_probe = crate::display_object::aqw_diagnostics_enabled();
 
     *context.frame_phase = FramePhase::Enter;
-    // Every orphan is about to be visited three times over, so whatever was
-    // queued for a nested goto is about to be done anyway. Dropped *before* the
-    // loops, not after: they run frame scripts too, and a mark one of them makes
-    // still has to reach the nested gotos later in this same tick.
     context.orphan_manager.clear_pending();
     let started = Instant::now();
     OrphanManager::each_orphan_obj(context, |orphan, context| {
@@ -139,8 +116,6 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
                 AQW_ORPHANS_FROZEN.fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            // After the freeze check, so the population columns describe the
-            // orphans that actually cost something.
             if orphan_probe {
                 clip.aqw_note_orphan_shape();
             }
@@ -213,8 +188,6 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
     // a result of a RemoveObject tag - see `cleanup_dead_orphans` for details.
     context.orphan_manager.cleanup_dead_orphans(context.gc());
 
-    // AQW memory diagnostics + bitmap-cache budget (no-op unless enabled via
-    // RUFFLE_AQW_DIAGNOSTICS / RUFFLE_AQW_CACHE_BUDGET_MB).
     crate::display_object::aqw_cache_sweep(context);
 
     *context.aqw_avatar_asset_roots_previous = *context.aqw_avatar_asset_roots;
@@ -277,8 +250,6 @@ fn run_inner_goto_frame_impl<'gc>(
 
     // Note - we do *not* call `enter_frame` or dispatch an `enterFrame` event
 
-    // Step timers for the nested frame. See AQW_INNER_* -- the subtree skip only
-    // covers the two stage walks, so this says what the rest costs.
     let probe = crate::display_object::aqw_diagnostics_enabled();
     let mark = || probe.then(Instant::now);
     let bill = |started: Option<Instant>, counter: &std::sync::atomic::AtomicU64| {
@@ -293,11 +264,6 @@ fn run_inner_goto_frame_impl<'gc>(
         crate::display_object::AQW_INNER_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    // Both orphan loops walk the same batch: they are the pair that reads the
-    // orphan list, and running one without the other would settle marks the
-    // other still needs. Taking the batch once, up front, is also what lets a
-    // frame script run by these loops re-dirty an orphan -- that mark lands in
-    // the now-empty pending list and is honoured by the next nested frame.
     let dirty_orphans = if crate::display_object::orphan_pending_disabled() {
         context.orphan_manager.all_orphans(context.gc())
     } else {
@@ -352,8 +318,6 @@ fn run_inner_goto_frame_impl<'gc>(
         orphan.run_frame_scripts(context);
     }
 
-    // Not in the batch: these are named explicitly by the goto that removed
-    // them, and are not reached through the orphan list.
     for child in removed_frame_scripts {
         child.run_frame_scripts(context);
     }
@@ -379,9 +343,6 @@ fn run_inner_goto_frame_impl<'gc>(
 
 /// Broadcast a `enterFrame` event to all `DisplayObject`s.
 pub fn broadcast_frame_entered<'gc>(context: &mut UpdateContext<'gc>) {
-    // Timed apart from the stage walk it is nested inside: this dispatches to
-    // every `enterFrame` listener, which is where AQW runs its combat and FX
-    // logic, and it is not proportional to the display tree at all.
     let started = crate::display_object::aqw_diagnostics_enabled().then(std::time::Instant::now);
 
     let enter_frame_evt = EventObject::bare_default_event(context, "enterFrame");

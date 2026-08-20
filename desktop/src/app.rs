@@ -29,11 +29,6 @@ struct MainWindow {
     player: PlayerController,
     minimized: bool,
     mouse_pos: PhysicalPosition<f64>,
-    /// Whether the cursor moved since the last tick. winit can deliver
-    /// `CursorMoved` at the mouse polling rate (hundreds of Hz), and each move
-    /// runs a full display-list hit-test (`run_mouse_pick`). We coalesce them so
-    /// at most one hit-test runs per tick, matching Flash's once-per-frame
-    /// mouse sampling and avoiding stutter in crowded scenes.
     mouse_move_pending: bool,
     modifiers: Modifiers,
     min_window_size: LogicalSize<u32>,
@@ -111,9 +106,6 @@ impl MainWindow {
                 }
 
                 self.mouse_pos = position;
-                // Defer the actual hit-test to the next tick via `flush_mouse_move`.
-                // A burst of high-frequency cursor moves collapses into a single
-                // `run_mouse_pick` instead of one per OS event.
                 self.mouse_move_pending = true;
             }
             WindowEvent::DroppedFile(file) => {
@@ -136,8 +128,6 @@ impl MainWindow {
                     return;
                 }
 
-                // Apply any pending cursor move first so the press/release uses an
-                // up-to-date hover target and preserves MouseMove -> MouseDown order.
                 self.flush_mouse_move();
 
                 use ruffle_core::events::MouseButton as RuffleMouseButton;
@@ -203,7 +193,6 @@ impl MainWindow {
                 }
             }
             WindowEvent::CursorLeft { .. } => {
-                // Drop any coalesced move; the cursor is no longer in the stage.
                 self.mouse_move_pending = false;
                 if let Some(mut player) = self.player.get() {
                     player.set_mouse_in_stage(false);
@@ -219,17 +208,9 @@ impl MainWindow {
                     return;
                 }
 
-                // Escape deliberately does NOT exit fullscreen here: AQW uses
-                // Escape to clear the combat target, so only F11 (menu_bar
-                // shortcut) toggles fullscreen.
                 let key = winit_input_to_ruffle_key_descriptor(&event);
                 match event.state {
                     ElementState::Pressed => {
-                        // F9 toggles the CRT filter. The row injected into the
-                        // game's own options menu is the normal way in, but it
-                        // is found by that menu's instance names, so keep a way
-                        // in that doesn't depend on the game's UI at all. No-op
-                        // in the games without the filter.
                         if event.physical_key == PhysicalKey::Code(KeyCode::F9) {
                             ruffle_core::aqw_crt_toggle_external();
                         }
@@ -385,8 +366,6 @@ impl MainWindow {
             }
         }
 
-        // Apply at most one coalesced cursor move per tick, before advancing the
-        // movie, so a burst of high-frequency cursor moves runs a single hit-test.
         self.flush_mouse_move();
 
         // Core loop
@@ -406,8 +385,6 @@ impl MainWindow {
         }
     }
 
-    /// Flush a coalesced cursor move, if any, running a single hit-test for the
-    /// latest cursor position. Called once per tick and before mouse clicks.
     fn flush_mouse_move(&mut self) {
         if !self.mouse_move_pending {
             return;

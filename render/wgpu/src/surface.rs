@@ -20,8 +20,6 @@ use std::sync::{Arc, OnceLock};
 use target::CommandTarget;
 use tracing::instrument;
 
-/// Kill-switch: `RUFFLE_AQW_NO_BLEND_SCISSOR` restores full-surface complex
-/// blend passes, for field A/B without a rebuild.
 fn blend_scissor_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED
@@ -41,9 +39,6 @@ pub struct Surface {
     sample_count: u32,
     pipelines: Arc<Pipelines>,
     format: wgpu::TextureFormat,
-    /// Where this surface sits inside the coordinate space its commands are
-    /// expressed in. Non-zero for a blend target sized to its content instead
-    /// of the whole screen, so that drawing subtracts it to land in range.
     origin: (u32, u32),
 }
 
@@ -77,7 +72,6 @@ impl Surface {
         }
     }
 
-    /// Places this surface at `origin` in its commands' coordinate space.
     pub fn with_origin(mut self, origin: (u32, u32)) -> Self {
         self.origin = origin;
         self
@@ -143,10 +137,6 @@ impl Surface {
         nearest_layer: LayerRef<'frame>,
         texture_pool: &mut TexturePool,
     ) -> CommandTarget {
-        // Read before the mode is handed over, and carried down so a blend can
-        // tell the scene apart from another blend's target. It is the whole
-        // difference between a multiply that fixed-function state could do and
-        // one that cannot.
         let dest_opaque = render_target_mode.clears_opaque();
 
         let target = CommandTarget::new(
@@ -157,9 +147,6 @@ impl Surface {
             self.sample_count,
             render_target_mode,
             draw_encoder,
-            // Never pad command-list targets: blend and alpha-mask shaders
-            // derive UVs from NDC position, which is only correct when every
-            // texture in the pass has exactly the attachment's dimensions.
             false,
         );
 
@@ -243,9 +230,6 @@ impl Surface {
                     rect: _,
                 } => {
                     assert!(!needs_stencil, "Shader blend mode not implemented in masks");
-                    // Not bounded: a PixelBender blend is arbitrary user code,
-                    // with no guarantee it leaves transparent source alone the
-                    // way the built-in blends do.
                     let parent_blend_buffer =
                         target.update_blend_buffer(descriptors, texture_pool, draw_encoder, None);
                     run_pixelbender_shader_impl(
@@ -297,33 +281,12 @@ impl Surface {
                         _ => &target,
                     };
 
-                    // How much of the surface this pass is really about, logged
-                    // whether or not it gets bounded so the two can be compared
-                    // in the field.
                     crate::blend::note_blend_coverage(
                         bounds.clipped_area(target.width(), target.height()),
                         target.width() as u64 * target.height() as u64,
                     );
 
-                    // Confine the pass to the blended object instead of the
-                    // whole surface. Every complex blend shader discards where
-                    // `src.a <= 0`, and the source target was cleared to
-                    // transparent, so nothing outside `bounds` could ever have
-                    // been written -- this drops the fill, not the result. A
-                    // crowded room runs hundreds of these per frame, each
-                    // otherwise costing a full screen of blending.
-                    //
-                    // A pixel of slack absorbs rounding in the NDC-to-UV round
-                    // trip the blend shaders do.
-                    //
-                    // A content-sized target already covers only `rect`, so the
-                    // scissor is then just a clamp; it still matters for a
-                    // full-size one, and for narrowing the parent snapshot.
-                    //
-                    // `bounds` is in the commands' own coordinates, so it is
-                    // shifted into this target's space before clamping.
                     let scissor = if blend_scissor_disabled() {
-                        // Kill-switch: the whole target, as before.
                         Some((0, 0, target.width(), target.height()))
                     } else {
                         bounds
@@ -331,12 +294,9 @@ impl Surface {
                             .to_scissor(target.width(), target.height(), 1)
                     };
                     let Some(scissor) = scissor else {
-                        // Nothing covered: every fragment would have discarded.
                         continue;
                     };
 
-                    // Only the scissored region is read back, so only it needs
-                    // snapshotting for the shader's `dst`.
                     let parent_blend_buffer = parent.update_blend_buffer(
                         descriptors,
                         texture_pool,
@@ -381,9 +341,6 @@ impl Surface {
                                 ],
                             });
 
-                    // The quad covers exactly the source's footprint, which is
-                    // what makes the unit-quad coordinate usable as its texture
-                    // coordinate however the target was sized.
                     let mut blend_transforms = BufferBuilder::new_for_uniform(&descriptors.limits);
                     blend_transforms.set_buffer_limit(dynamic_transforms.buffer.size());
                     let blend_transform_offset = blend_transforms

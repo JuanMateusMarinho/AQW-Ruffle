@@ -67,7 +67,6 @@ mod windows_launcher {
     const MIN_WINDOW_WIDTH: i32 = 960;
     const MIN_WINDOW_HEIGHT: i32 = 620;
     const WM_MOUSELEAVE: u32 = 0x02A3;
-    // Loader3 fetches the current game version and initializes Game.params before startup.
     const AQW_SWF_URL: &str = "https://game.aq.com/game/gamefiles/Loader3.swf";
     const AQW_BASE_URL: &str = "https://game.aq.com/game/gamefiles/";
     const AQW_WINDOW_TITLE: &str = "Artix Entertainment - AdventureQuest Worlds V3.0";
@@ -2603,9 +2602,6 @@ mod windows_launcher {
                     "warn"
                 },
             )
-            // SSAA: render AQW at 1.25× and downsample, to sharpen its fine vector
-            // lineart (Ruffle renders it softer than Flash at 1×). AQW-only launcher,
-            // so always on; set to "1" to disable. See RUFFLE_AQW_SUPERSAMPLE.
             .env("RUFFLE_AQW_SUPERSAMPLE", "1.25")
             .arg(swf_url)
             .arg("--spoof-url")
@@ -2639,7 +2635,6 @@ mod windows_launcher {
         if diagnostics {
             command.env("RUFFLE_AQW_DIAGNOSTICS", "1");
             command.env("RUST_BACKTRACE", "1");
-            // Exercise the bitmap-cache memory budget while diagnosing leaks.
             command.env("RUFFLE_AQW_CACHE_BUDGET_MB", "1024");
 
             let log_path = temp_path.join("ruffle-debug.log");

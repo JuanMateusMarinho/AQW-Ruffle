@@ -1536,11 +1536,6 @@ pub fn draw<'gc>(
         transform_stack: &mut transform_stack,
         is_offscreen: true,
         use_bitmap_cache: false,
-        // Exempting filtered children here would hand them a cache and then the
-        // zero budgets below, which is the combination that makes a dirty cache
-        // stand in with its previous texture -- art from another moment drawn
-        // into the bitmap. `BitmapData.draw` has always flattened filters along
-        // with the caches and keeps doing so.
         cache_filtered_children: false,
         dirty_cache_redraws_remaining: 0,
         dirty_cache_redraws_reserved: 0,

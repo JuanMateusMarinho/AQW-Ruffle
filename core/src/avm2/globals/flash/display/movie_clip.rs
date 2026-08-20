@@ -127,11 +127,6 @@ fn labels_for_scene<'gc>(
         start: scene_start,
         length: scene_length,
     } = scene;
-    // Rebuilt only when this clip has not already built this scene's labels.
-    // The `FrameLabel` instances are shared between reads; the `Array` wrapping
-    // them is not, so a caller that mutates the returned array still gets a
-    // fresh one. `FrameLabel` is `final` and exposes only getters, so sharing an
-    // instance is unobservable except by comparing identity across two reads.
     let labels = match mc.cached_scene_labels(*scene_start, *scene_length) {
         Some(labels) => labels,
         None => {

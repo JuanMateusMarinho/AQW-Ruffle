@@ -1568,10 +1568,6 @@ impl<'gc> EditText<'gc> {
         self.invalidate_cached_bitmap();
     }
 
-    /// The x position of the caret in layout space.
-    ///
-    /// The caret may sit after the last character, which has no bounds of its
-    /// own, so fall back to the right edge of the character before it.
     fn caret_layout_x(self, position: usize) -> Option<Twips> {
         let layout = self.0.layout.borrow();
         if let Some(bounds) = layout.char_bounds(position) {
@@ -1583,12 +1579,9 @@ impl<'gc> EditText<'gc> {
         }
     }
 
-    /// Scroll horizontally so that the caret stays visible, like FP does while
-    /// the user types or moves through the text. Layout isn't clipped to the
-    /// field, so without this the text keeps being laid out past the right edge
-    /// and simply stops being drawn.
+    /// Scroll horizontally so that the caret stays visible, like FP does while the user types
+    /// or moves through the text.
     fn scroll_caret_into_view(self) {
-        // Wrapped text has nowhere to scroll to.
         if self.0.flags.get().contains(EditTextFlag::WORD_WRAP) {
             return;
         }
@@ -1644,28 +1637,10 @@ impl<'gc> EditText<'gc> {
         self.0.max_chars.set(value);
     }
 
-    /// Colour to draw an input field with once it is running out of room,
-    /// or `None` while there is still plenty left.
-    ///
-    /// A field with `maxChars` set just stops accepting keystrokes when it
-    /// fills up, with nothing on screen to explain why. AQW's chat entry is
-    /// capped at 150 characters and it's easy to type past that mid-sentence,
-    /// so the text warms to amber with about a sentence of room left and turns
-    /// red for the last few characters, while there is still time to shorten
-    /// the message rather than only once the field refuses further input.
-    /// Tinting the text (and with it the caret and underline, which are drawn
-    /// in the same colour) costs no space in a layout the content owns.
-    /// `RUFFLE_AQW_NO_CHAR_LIMIT_HINT` disables it.
     fn char_limit_hint_color(self) -> Option<Color> {
-        /// Bright enough to read against the dark chat backdrop.
         const WARNING_COLOR: Color = Color::from_rgb(0xffc400, 255);
         const LIMIT_COLOR: Color = Color::from_rgb(0xff3b30, 255);
-        /// Short caps (spin-box digits, initials) are always near their limit,
-        /// so a hint there would be permanent decoration rather than a warning.
         const MIN_LIMIT: i32 = 20;
-        /// Upper bounds on how early each stage starts, in characters left.
-        /// The fractions below scale with smaller caps and clamp to these on
-        /// AQW's 150-character chat: amber for the last 45, red for the last 10.
         const MAX_WARNING_MARGIN: i32 = 45;
         const MAX_LIMIT_MARGIN: i32 = 10;
 
@@ -1922,7 +1897,6 @@ impl<'gc> EditText<'gc> {
                 }
             }
         }
-        // Also for plain caret movement, which doesn't count as a change.
         self.scroll_caret_into_view();
 
         if changed {

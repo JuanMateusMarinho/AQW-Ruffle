@@ -80,137 +80,58 @@ pub trait RenderBackend: Any {
         false
     }
 
-    /// Best-effort report of this process's GPU memory usage and the
-    /// OS-granted budget, in bytes, when the backend has a way to measure it.
     fn gpu_memory_info(&self) -> Option<(u64, u64)> {
         None
     }
 
-    /// `(cumulative allocations, cumulative frees, retained bytes)` of the
-    /// backend's offscreen render-target pool, when it has one. The
-    /// allocation delta over time measures texture churn — the driver-memory
-    /// creep diagnostics watch for.
     fn offscreen_pool_stats(&self) -> Option<(u64, u64, u64)> {
         None
     }
 
-    /// The same triple for the pool backing the *main surface* — the scene
-    /// draw and the blend/mask/filter targets nested inside it.
-    ///
-    /// Reported separately because the two pools are managed differently, and
-    /// a backend may reclaim one while letting the other accumulate; a caller
-    /// watching only `offscreen_pool_stats` would see none of that.
     fn surface_pool_stats(&self) -> Option<(u64, u64, u64)> {
         None
     }
 
-    /// The main-surface pool's biggest buckets as `(width, height, count,
-    /// bytes)`, largest first — what shape the retention above actually has.
     fn surface_pool_largest(&self, _limit: usize) -> Vec<(u32, u32, usize, u64)> {
         Vec::new()
     }
 
-    /// `(live textures, bytes)` owned by `BitmapHandle`s — bitmap caches,
-    /// `BitmapData` surfaces, decoded SWF bitmaps.
-    ///
-    /// Deliberately outside both pool reports: these are freed when the last
-    /// handle drops rather than by pool maintenance, so they are invisible to
-    /// a caller adding up the pools, and they are the remainder when pool
-    /// totals stay flat while process memory climbs.
     fn bitmap_texture_stats(&self) -> Option<(i64, i64)> {
         None
     }
 
-    /// Those textures' biggest buckets as `(width, height, count, bytes)`.
-    /// The totals say how much is held; only the shape says by what.
     fn bitmap_texture_largest(&self, _limit: usize) -> Vec<(u32, u32, usize, u64)> {
         Vec::new()
     }
 
-    /// `(distinct sizes, bytes across all of them)` for those textures. How
-    /// spread out the sizes are, plus a total that doubles as a check on the
-    /// breakdown above being complete.
     fn bitmap_texture_buckets(&self) -> (usize, u64) {
         (0, 0)
     }
 
-    /// Blend modes that needed a render pass of their own since the last call,
-    /// as `(mode, count)` busiest-first, and cleared by reading.
-    ///
-    /// A backend that composites these into full-surface passes pays per pass
-    /// regardless of how small the blended object is, so this says where that
-    /// cost is concentrated.
     fn take_complex_blend_counts(&mut self) -> Vec<(&'static str, u64)> {
         Vec::new()
     }
 
-    /// How much of the surface those blend passes actually covered since the
-    /// last call, as `(percent, [<=1%, <=5%, <=25%, >25%] layer counts)`.
-    ///
-    /// The count above says how many passes ran; this says how much of each one
-    /// was live. A backend that bounds its blend passes to the blended object
-    /// reports the same count at a fraction of the fill.
     fn take_blend_coverage(&mut self) -> (u64, [u64; 4]) {
         (0, [0; 4])
     }
 
-    /// Pixels allocated for blend render targets since the last call, as a
-    /// percentage of what full-surface targets would have cost.
-    ///
-    /// Hundreds of these are alive at once in a busy scene, so their size is a
-    /// memory question, not just a fill one.
     fn take_blend_alloc(&mut self) -> u64 {
         100
     }
 
-    /// Multiply passes since the last call, as `(onto_opaque, total,
-    /// opaque_megapixels)`, cleared by reading.
-    ///
-    /// Multiply is the one complex mode that fixed-function blend state can
-    /// express exactly -- but only against an opaque destination. `DST_COLOR` /
-    /// `ONE_MINUS_SRC_ALPHA` gives `src*dst + dst*(1-src.a)`, and the term that
-    /// is missing from it, `src*(1-dst.a)`, is zero exactly when the
-    /// destination is opaque; over a transparent one the art vanishes, which is
-    /// why this was written off wholesale.
-    ///
-    /// The destination is only transparent inside another blend or filter
-    /// target, which are cleared that way on purpose. Against the scene it is
-    /// the stage colour. So this counts how much of the multiply population
-    /// could fold into the batched draw the way a trivial blend does, dropping
-    /// the destination copy and the pass of its own -- and, being a count, says
-    /// whether that is worth building before anything is built.
     fn take_blend_dest_opacity(&mut self) -> (u64, u64, u64) {
         (0, 0, 0)
     }
 
-    /// Blend modes cheap enough to fold into GPU blend state since the last
-    /// call, as `(mode, count)` busiest-first, and cleared by reading.
-    ///
-    /// The counterpart to [`Self::take_complex_blend_counts`], and the reason
-    /// it is worth having separately: costing nothing to *composite* does not
-    /// make a blend free, because the intermediate target it renders through
-    /// is the same one either way.
     fn take_trivial_blend_counts(&mut self) -> Vec<(&'static str, u64)> {
         Vec::new()
     }
 
-    /// What those targets cost since the last call, as
-    /// `(live_percent, megapixels, alloc_percent, [<=1%, <=5%, <=25%, >25%])`.
-    ///
-    /// Live percent is how much of each target holds content; alloc percent is
-    /// how big they were against full-surface ones, the mirror of
-    /// [`Self::take_blend_alloc`]; megapixels is the absolute scale, without
-    /// which a small percentage over a large population reads as nothing.
     fn take_trivial_blend_target(&mut self) -> (u64, u64, u64, [u64; 4]) {
         (0, 0, 100, [0; 4])
     }
 
-    /// Frame-building cost since the last call, as
-    /// `(encode_ms, submit_ms, frames, process_commit_mb)`.
-    ///
-    /// Encode is CPU spent recording commands; submit is what handing them over
-    /// costs, which is where a GPU that cannot keep up shows up. Process commit
-    /// is system memory, which runs out independently of VRAM.
     fn take_render_timings(&mut self) -> (u64, u64, u64, u64) {
         (0, 0, 0, 0)
     }
@@ -782,12 +703,6 @@ pub struct ViewportDimensions {
     pub scale_factor: f64,
 }
 
-/// Whether the AQW CRT present filter is active. Written by the player when
-/// the in-game "CRT Filter" option row (injected into AQW's Options panel)
-/// is toggled, and read by the renderer each frame when choosing the final
-/// present pipeline. Lives here because it must be shared between `core`
-/// (which owns the toggle) and the wgpu backend (which owns the present),
-/// and both already depend on this crate.
 static AQW_CRT_FILTER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn aqw_crt_filter_enabled() -> bool {
@@ -798,16 +713,6 @@ pub fn set_aqw_crt_filter(enabled: bool) {
     AQW_CRT_FILTER.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Barrel-warp strength of the CRT present filter (`RUFFLE_AQW_CRT_WARP`
-/// overrides). Shared here because the wgpu backend bakes it into the
-/// present shader while the desktop host applies the SAME forward warp to
-/// mouse coordinates - the screen shows content from warp(uv), so a click
-/// at uv is aiming at warp(uv); using one constant keeps clicks and pixels
-/// in lockstep.
-///
-/// Per-game default (from the launcher's env): AQW's wide 16:9 window made
-/// the 0.04 curvature read oddly (field feedback), so it gets a gentler
-/// 0.025; DragonFable keeps 0.04.
 pub fn aqw_crt_warp_strength() -> f32 {
     use std::sync::OnceLock;
     static WARP: OnceLock<f32> = OnceLock::new();
@@ -823,16 +728,6 @@ pub fn aqw_crt_warp_strength() -> f32 {
     })
 }
 
-/// Whether the CRT present filter squeezes its (16:9) content into a centred
-/// 4:3 region — the look of a widescreen signal on an old 4:3 tube, dark
-/// surround on the sides. Shared for the same reason as the warp above: the
-/// wgpu backend bakes it into the present shader while the desktop host must
-/// apply the SAME horizontal squeeze to mouse coordinates, or clicks land off
-/// the squeezed picture. Only meaningful while the CRT filter is on.
-///
-/// `RUFFLE_AQW_CRT_ASPECT_43` overrides (`0`/`false`/`off` = disable). Default
-/// is on for AQW — the game whose 16:9 art this is for — and off for
-/// DragonFable.
 pub fn aqw_crt_aspect_43_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -843,42 +738,11 @@ pub fn aqw_crt_aspect_43_enabled() -> bool {
     })
 }
 
-/// Offscreen render-target pool retention, in MB, that drives the GPU-pressure
-/// valve.
-///
-/// Measured in the field: a full room with event FX retains 118-255 MB, while
-/// `castleparty` (the pathological map) retains 2458 MB — a ~10x gap, so the
-/// engage/release band sits in the empty valley between the two regimes and no
-/// observed scenario idles inside it.
-///
-/// Retention replaced the OS video-memory percentage as the trigger: DXGI
-/// `CurrentUsage` parks at a constant while `Budget` moves with unrelated
-/// system load, so the old valve engaged on noise and starved combat FX in
-/// rooms that were never under real pressure.
-///
-/// The valve has two halves in two crates: the player clamps its cache-redraw
-/// quotas from these, and the renderer squeezes its pools. They lived as
-/// separate copies with a comment asking whoever edited one to remember the
-/// other; they are shared from here so that cannot be got wrong.
 pub const AQW_POOL_SOFT_MB: u64 = 600;
-/// Retention that releases soft pressure. Below the engage threshold, so the
-/// valve cannot chatter around a single value.
 pub const AQW_POOL_SOFT_RELEASE_MB: u64 = 450;
-/// Retention that engages hard pressure. See [`AQW_POOL_SOFT_MB`].
 pub const AQW_POOL_HARD_MB: u64 = 1500;
-/// Retention that drops hard pressure back to soft. See [`AQW_POOL_SOFT_MB`].
 pub const AQW_POOL_HARD_RELEASE_MB: u64 = 1200;
 
-/// Reads one of the fork's boolean environment switches.
-///
-/// Presence used to be the whole test in most places, which meant `NO_FOO=0`
-/// *enabled* the kill switch it reads as disabling. An explicit `0`, `false`,
-/// `off` or `no` (any case, surrounding whitespace ignored) turns the switch
-/// off; any other value, including an empty one, turns it on. Unset returns
-/// `default`.
-///
-/// Duplicated in `ruffle_core` rather than shared, to keep the crates
-/// uncoupled for six lines of parsing; the two must agree on the spellings.
 pub fn aqw_env_flag(name: &str, default: bool) -> bool {
     let Some(value) = std::env::var_os(name) else {
         return default;

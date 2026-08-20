@@ -145,8 +145,6 @@ impl PartialEq for Method<'_> {
 }
 
 impl Method<'_> {
-    /// Stable identity, for keying a profile map without holding a GC pointer
-    /// or formatting a name on every call.
     pub fn as_ptr(self) -> usize {
         Gc::as_ptr(self.0) as usize
     }

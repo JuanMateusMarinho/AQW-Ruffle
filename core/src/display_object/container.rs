@@ -27,15 +27,8 @@ use std::rc::Rc;
 
 const RENDER_LIST_INDEX_CACHE_THRESHOLD: usize = 8;
 
-/// Whether removing a named child leaves the parent's field alone when the
-/// field no longer holds that child.
-///
 /// FP does not: it nulls the field for any non-null value, even one script put
 /// there afterwards, which is what `avm2/remove_child_clear_field` records.
-/// Guarding the write was a June 2026 attempt at AQW cutscene loading; the
-/// cutscene fault was traced since to a frame script throwing `#1009` and
-/// taking its own `stop()` down with it, which this does not address. Off by
-/// default; set this to put the guard back without a rebuild.
 fn keep_removed_child_field() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED
@@ -43,7 +36,6 @@ fn keep_removed_child_field() -> bool {
 }
 
 /// Dispatch the `removedFromStage` event on a child and all of it's
-/// grandchildren.
 pub fn dispatch_removed_from_stage_event<'gc>(
     child: DisplayObject<'gc>,
     context: &mut UpdateContext<'gc>,
@@ -87,7 +79,6 @@ pub fn dispatch_added_to_stage_event_only<'gc>(
     }
 }
 
-/// Dispatch the `addedToStage` event on a child and all of it's grandchildren.
 pub fn dispatch_added_to_stage_event<'gc>(
     child: DisplayObject<'gc>,
     context: &mut UpdateContext<'gc>,
@@ -172,7 +163,6 @@ pub trait TDisplayObjectContainer<'gc>:
         self.raw_container().get_id(index)
     }
 
-    /// Get a child's position in the render list.
     #[no_dynamic]
     fn child_index(self, child: DisplayObject<'gc>) -> Option<usize> {
         self.raw_container().get_index(child)
@@ -689,9 +679,6 @@ pub struct ChildContainer<'gc> {
     /// updated list.
     render_list: Rc<Vec<DisplayObject<'gc>>>,
 
-    /// Lazily populated pointer-to-index map for repeated `getChildIndex`
-    /// calls. Structural mutations invalidate it, while swaps update the two
-    /// affected entries in place.
     #[collect(require_static)]
     render_list_index: RefCell<Option<FnvHashMap<usize, usize>>>,
 
@@ -833,11 +820,7 @@ impl<'gc> ChildContainer<'gc> {
                                 );
                             }
                         }
-                        Ok(_) => {
-                            // Only reachable with `keep_removed_child_field`:
-                            // the field has since been replaced by another child
-                            // or by script, so the guard leaves it alone.
-                        }
+                        Ok(_) => {}
                         Err(_) => {
                             // In FP, errors when accessing the
                             // original value are completely
@@ -988,7 +971,6 @@ impl<'gc> ChildContainer<'gc> {
         self.render_list.get(id).copied()
     }
 
-    /// Get a child's render-list index, building a cache only when needed.
     fn get_index(&self, child: DisplayObject<'gc>) -> Option<usize> {
         if self.render_list.len() < RENDER_LIST_INDEX_CACHE_THRESHOLD {
             return self
@@ -1243,9 +1225,6 @@ impl<'gc> ChildContainer<'gc> {
 
     fn render_list_mut(&mut self) -> &mut Vec<DisplayObject<'gc>> {
         *self.render_list_index.get_mut() = None;
-        // A live `RenderIter` (one per level of an in-flight `enter_frame`
-        // walk) makes the next line clone the whole list rather than mutate
-        // in place. Count that before it happens.
         if super::aqw_diagnostics_enabled() && Rc::strong_count(&self.render_list) > 1 {
             use std::sync::atomic::Ordering;
             super::AQW_RENDERLIST_COPIES.fetch_add(1, Ordering::Relaxed);

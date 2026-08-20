@@ -173,10 +173,6 @@ impl GlowFilter {
             source,
             &filter.inner_blur_filter(),
         );
-        // The blurred content lives at the origin of the (possibly padded)
-        // blur target; without a blur pass it's the source sub-region
-        // itself. Its UVs must be computed against the texture that's
-        // actually sampled, not the source's dimensions.
         let (blurred_texture, blur_dims, blur_origin) = if let Some(blurred) = &blurred {
             blurred.ensure_cleared(draw_encoder);
             let texture = blurred.color_texture();

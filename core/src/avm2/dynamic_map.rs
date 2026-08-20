@@ -24,10 +24,6 @@ pub enum DynamicKey<'gc> {
     // can be `number`
     Uint(u32),
     Object(Object<'gc>),
-    // A `Dictionary` built with `new Dictionary(true)` holds its object keys
-    // weakly, so an entry stops keeping its own key alive. Only `Dictionary`
-    // ever produces either object variant, and a given dictionary uses one or
-    // the other for its whole life, so the two never mix within one map.
     WeakObject(WeakObject<'gc>),
 }
 
@@ -142,11 +138,6 @@ impl<K: Eq + Hash, V> DynamicMap<K, V> {
         }
     }
 
-    /// Drop every entry whose key `keep` rejects, and report how many went.
-    ///
-    /// Resets the enumeration cursor: unlike `remove`, this can move entries
-    /// between buckets, so a public index captured before the call no longer
-    /// refers to the same entry.
     pub fn retain(&mut self, mut keep: impl FnMut(&K) -> bool) -> usize {
         let before = self.table.len();
         self.table.retain(|(k, _)| keep(k));

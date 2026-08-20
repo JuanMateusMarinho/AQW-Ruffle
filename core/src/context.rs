@@ -572,71 +572,28 @@ pub struct RenderContext<'a, 'gc> {
     /// Whether to use cacheAsBitmap, vs drawing everything explicitly
     pub use_bitmap_cache: bool,
 
-    /// Whether a child carrying filters keeps its cache even though
-    /// `use_bitmap_cache` is off.
-    ///
-    /// A filter is only applied when a cache's texture is drawn, so switching
-    /// the cache off drops it. Baking an AQW subtree has to exempt filtered
-    /// children for that reason, and it is the *only* place that should:
-    /// `use_bitmap_cache` alone cannot say why it is off, and the other two
-    /// places that turn it off must keep their old behaviour. See the
-    /// scaling-grid path in `display_object.rs`, which turns it off on the
-    /// live context and then draws the same subtree nine times.
     pub cache_filtered_children: bool,
 
-    /// Maximum number of dirty AQW bitmap caches that can be redrawn during this frame.
-    ///
-    /// Clean caches remain available. This spreads texture allocation and redraw work
-    /// across frames when many player assets appear at once in a crowded room.
     pub dirty_cache_redraws_remaining: u32,
 
-    /// Number of dirty bitmap cache redraws already reserved during this frame.
     pub dirty_cache_redraws_reserved: u32,
 
-    /// Approximate remaining pixel budget for dirty bitmap cache redraws this frame.
     pub dirty_cache_redraw_pixels_remaining: u64,
 
-    /// Remaining budget for *small* dirty AQW cache redraws this frame (below the
-    /// large-cache defer thresholds). Small caches used to bypass budgeting
-    /// entirely, but FX storms (fireworks, ultra-boss skill spam) run hundreds of
-    /// small filtered clips at once and the unbudgeted redraw swarm melts FPS and
-    /// churns the offscreen texture pool.
     pub small_cache_redraws_remaining: u32,
 
-    /// Number of small dirty cache redraws already reserved during this frame.
     pub small_cache_redraws_reserved: u32,
 
-    /// Remaining screen-pixel budget for small dirty cache redraws this frame.
-    /// The count quota bounds how many; this bounds how much GPU fill/filter
-    /// work they add up to. In fullscreen each redraw covers 4-6x the pixels
-    /// of its windowed self, and admitting a windowed *count* of them melts
-    /// crowded-room FPS.
     pub small_cache_redraw_pixels_remaining: u64,
 
-    /// Remaining budget for aged redraws: caches that kept losing the (render-
-    /// order) budget race for many consecutive frames get a reserved quota so
-    /// every stale object still refreshes within about a second.
     pub aged_cache_redraws_remaining: u32,
 
     /// The current player's stage (including all loaded levels)
     pub stage: Stage<'gc>,
 }
 
-/// Pixel budget left to non-oversized large redraws after the oversized lane
-/// admits a redraw that alone exceeds the whole per-frame budget (a map-scale
-/// filtered overlay in fullscreen). Charging the oversized redraw in full
-/// zeroed the pool, and budget admission runs in painter's order — the
-/// background overlay reserved first every frame and the combat FX rendered
-/// on top of it starved into chronic deferral (stale weapon art during
-/// attacks). Ordinary FX redraws cost ~10-100k px each, so this allowance is
-/// a fraction of the oversized redraw the frame already absorbed; it matches
-/// the small bucket's per-frame pixel budget, an amount of extra fill that is
-/// already known not to hurt crowded fullscreen rooms.
 const AQW_DIRTY_CACHE_REDRAW_FOLLOWER_FLOOR_PIXELS: u64 = 1_500_000;
 
-/// Kill-switch: `RUFFLE_AQW_NO_LARGE_FLOOR` restores full charging of
-/// oversized cache redraws (followers starve for the rest of the frame), for
-/// field A/B without a rebuild.
 fn aqw_large_redraw_floor_disabled() -> bool {
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DISABLED
@@ -656,8 +613,6 @@ impl<'gc> RenderContext<'_, 'gc> {
             return false;
         }
 
-        // Always allow one oversized cache to make progress, but do not let a
-        // burst of them allocate in the same frame.
         if pixels > self.dirty_cache_redraw_pixels_remaining
             && self.dirty_cache_redraws_reserved > 0
         {
@@ -668,10 +623,6 @@ impl<'gc> RenderContext<'_, 'gc> {
         self.dirty_cache_redraws_remaining -= 1;
         self.dirty_cache_redraws_reserved += 1;
         self.dirty_cache_redraw_pixels_remaining = if pixels > remaining {
-            // Oversized lane: leave a follower allowance instead of zeroing
-            // the pool (see AQW_DIRTY_CACHE_REDRAW_FOLLOWER_FLOOR_PIXELS).
-            // Capped at what the frame had, so a braked (VRAM-pressure)
-            // budget is never topped back up.
             if aqw_large_redraw_floor_disabled() {
                 0
             } else {
@@ -688,8 +639,6 @@ impl<'gc> RenderContext<'_, 'gc> {
             return false;
         }
 
-        // As with large redraws, always let one over-budget redraw make
-        // progress per frame so a lone biggish FX can't starve forever.
         if pixels > self.small_cache_redraw_pixels_remaining
             && self.small_cache_redraws_reserved > 0
         {

@@ -67,11 +67,6 @@ impl<'a> FilterSource<'a> {
         ]
     }
 
-    /// Vertices sampling both this source and a blurred companion texture.
-    /// The blurred texture is not necessarily the same size as the source
-    /// (it may be a padded pool target holding the blurred content region at
-    /// `blur_region_origin`), so its UVs are computed against its own
-    /// dimensions rather than the source's.
     pub fn vertices_with_blur_offset(
         &self,
         blur_offset: (f32, f32),
@@ -136,9 +131,6 @@ impl<'a> FilterSource<'a> {
         ]
     }
 
-    /// See `vertices_with_blur_offset` for the `blur_texture_dims` /
-    /// `blur_region_origin` semantics; this variant offsets the blurred
-    /// texture both ways for bevel highlight and shadow.
     pub fn vertices_with_highlight_and_shadow(
         &self,
         blur_offset: (f32, f32),

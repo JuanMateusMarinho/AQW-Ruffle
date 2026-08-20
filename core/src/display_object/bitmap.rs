@@ -129,9 +129,6 @@ pub struct BitmapGraphicData<'gc> {
     /// How to snap this bitmap to the pixel grid
     pixel_snapping: Cell<PixelSnapping>,
 
-    /// Flicker probe: last drawn (post-snapping) and pre-snapping vertical
-    /// positions, and how often the first jumped while the second held still.
-    /// See `render_self`.
     probe_last_drawn_y: Cell<f64>,
     probe_last_raw_y: Cell<f64>,
     probe_jumps: Cell<u32>,
@@ -140,9 +137,6 @@ pub struct BitmapGraphicData<'gc> {
 
 use crate::display_object::aqw_diagnostics_enabled;
 
-/// How many jumps to see before reporting. High enough that a bitmap which
-/// legitimately moves a pixel now and then never trips it; an oscillation
-/// reaches it in a second.
 const SNAP_JUMP_REPORT_COUNT: u32 = 20;
 
 impl<'gc> Bitmap<'gc> {
@@ -236,20 +230,7 @@ impl<'gc> Bitmap<'gc> {
         self.0.pixel_snapping.set(value);
     }
 
-    /// Watch for a bitmap that visibly jumps while standing still.
-    ///
-    /// `PixelSnapping::Auto` rounds the translation to whole pixels, but only
-    /// inside a hard scale window (0.999..=1.001) with no hysteresis, and the
-    /// rounding itself has an edge at .5. Either boundary can be straddled: a
-    /// scale drifting across the window turns snapping on and off, and a
-    /// position sitting on a half-pixel flips which pixel it rounds to. Both
-    /// paint the art a pixel from where it was on the previous frame, every
-    /// frame, while the object itself is still — which is what held art
-    /// vibrating in place looks like. Flash's rule differs, so content that
-    /// is steady there can vibrate here.
-    ///
-    /// The signature is a *drawn* position that moves while the pre-snapping
-    /// one does not; genuine movement moves both.
+    /// Flash's rule differs, so content that is steady there can vibrate here.
     fn note_snap_jump(self, context: &mut RenderContext<'_, 'gc>, snapping: PixelSnapping) {
         if self.0.probe_reported.get() {
             return;

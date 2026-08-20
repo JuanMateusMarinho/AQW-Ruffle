@@ -301,8 +301,6 @@ impl Definition {
                 DynamicKey::Object(object) => {
                     Value::Object(*object).coerce_to_string(activation).unwrap()
                 }
-                // A prototype is never a weak `Dictionary`, so this is
-                // unreachable in practice; a collected key has no name to give.
                 DynamicKey::WeakObject(object) => match object.upgrade(activation.gc()) {
                     Some(object) => Value::Object(object).coerce_to_string(activation).unwrap(),
                     None => continue,

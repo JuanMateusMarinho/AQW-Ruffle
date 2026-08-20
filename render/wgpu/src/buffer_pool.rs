@@ -9,46 +9,16 @@ use std::sync::{Arc, Mutex, Weak};
 type PoolInner<T> = Mutex<Vec<T>>;
 type Constructor<Type, Description> = Box<dyn Fn(&Descriptors, &Description) -> Type>;
 
-/// Maintenance ticks (≈ frames) an idle pooled texture may sit unused before
-/// the maintenance pass frees it regardless of the retention budget. Long
-/// enough to survive deferred cache redraws that skip a texture for a couple
-/// of seconds, short enough to drain the piles left behind by map changes.
 pub(crate) const POOL_IDLE_EVICT_TICKS: u64 = 120;
 
-/// Entries idle for fewer ticks than this are never evicted, even when the
-/// pool is over budget. This protects the recent working set: evicting a
-/// texture that gets reallocated at the same size next frame frees nothing —
-/// it just cycles allocations through the driver's deferred-destruction
-/// queue every frame, which is exactly the commit-memory creep the pool is
-/// supposed to prevent.
 const POOL_PROTECT_TICKS: u64 = 4;
 
-/// How long hard VRAM pressure must persist before the escape reset fires.
-/// Short paging episodes (map-entry bursts) resolve themselves; a streak
-/// this long means the process is parked over its OS budget.
 const POOL_HARD_RESET_AFTER_TICKS: u64 = 96;
 
-/// Minimum spacing between escape resets. The reset costs one visible hitch
-/// (a whole pool's worth of deferred destruction plus a warmup of fresh
-/// allocations), so if even that can't get the process back under budget,
-/// repeating it faster just turns the hitch periodic.
 const POOL_HARD_RESET_COOLDOWN_TICKS: u64 = 600;
 
-/// How long pressure must stay released before the escape reset re-arms.
-/// The reset drains the pool, and pool retention is exactly what the valve
-/// measures, so the reading always dips right after a reset — even a futile
-/// one that live demand is about to undo. Requiring a sustained release keeps
-/// a one-shot escape from becoming a periodic drain.
 const POOL_EPISODE_END_TICKS: u64 = 240;
 
-/// Round an offscreen render-target dimension up to a coarse bucket (powers
-/// of two up to 1024, multiples of 512 above). Animated filtered content
-/// changes bounds by a few pixels every frame; exact-size pool keys make
-/// every step a brand-new texture allocation, and that allocate/destroy
-/// churn is what inflates driver memory in busy rooms. Callers that opt in
-/// must treat the returned texture as larger than the content: render with
-/// a viewport confined to the logical size and sample only the logical UV
-/// sub-rectangle.
 pub fn quantize_pool_dimension(dim: u32) -> u32 {
     if dim <= 16 {
         16
@@ -63,31 +33,12 @@ pub fn quantize_pool_dimension(dim: u32) -> u32 {
 pub struct TexturePool {
     pools: FnvHashMap<TextureKey, BufferPool<(wgpu::Texture, wgpu::TextureView), AlwaysCompatible>>,
     globals_cache: FnvHashMap<GlobalsKey, Arc<Globals>>,
-    /// Advanced once per frame by `maintain`; pooled entries are stamped with
-    /// it when returned, giving each an idle age.
     clock: Arc<AtomicU64>,
-    /// Cumulative number of textures actually created (pool misses).
     total_allocs: Arc<AtomicU64>,
-    /// Cumulative number of idle textures freed by maintenance.
     total_frees: u64,
-    /// Consecutive maintenance ticks spent under hard VRAM pressure; drives
-    /// the escape reset.
     hard_pressure_streak: u64,
-    /// Clock value before which another escape reset may not fire.
     hard_reset_cooldown_until: u64,
-    /// Whether the escape reset already fired during the current hard-
-    /// pressure episode. When the reset works (arena blocks returned, VRAM
-    /// back under budget) pressure releases and re-arms it; when the live
-    /// demand instantly refills the pool it does NOT re-fire — a futile
-    /// reset repeated on cooldown is just a periodic 2 GB hitch.
-    ///
-    /// Re-arming requires a *sustained* release (`POOL_EPISODE_END_TICKS`),
-    /// not an instantaneous one: the reset drains the pool, and the valve now
-    /// measures pool retention, so the tick right after a reset always looks
-    /// like a success.
     hard_reset_fired_this_episode: bool,
-    /// Consecutive maintenance ticks spent below hard pressure; gates
-    /// re-arming `hard_reset_fired_this_episode`.
     low_pressure_streak: u64,
 }
 
@@ -104,8 +55,6 @@ impl TexturePool {
             * u64::from(key.format.block_copy_size(None).unwrap_or(4))
     }
 
-    /// Bytes of GPU texture memory *currently held* by this pool (idle textures
-    /// available for reuse), computed from the live buckets.
     pub fn retained_bytes(&self) -> u64 {
         self.pools
             .iter()
@@ -113,16 +62,6 @@ impl TexturePool {
             .sum()
     }
 
-    /// The buckets holding the most bytes, as `(width, height, count, bytes)`,
-    /// largest first.
-    ///
-    /// Retention totals say how much is held but not what shape it is, and the
-    /// two lead to opposite fixes: a handful of very large targets (a filtered
-    /// item drawn at big bounds) is a size problem, while thousands of small
-    /// ones is a variety problem. Filter/blend/mask targets take their size
-    /// from the content's bounds, so an unusually large or heavily filtered
-    /// item costs far more than an ordinary one — which is what the field
-    /// report of two specific players dominating a crowded room suggests.
     pub fn largest_buckets(&self, limit: usize) -> Vec<(u32, u32, usize, u64)> {
         let mut buckets: Vec<(u32, u32, usize, u64)> = self
             .pools
@@ -145,9 +84,6 @@ impl TexturePool {
         buckets
     }
 
-    /// `(cumulative allocations, cumulative frees, retained bytes)` — the
-    /// allocation delta per second is the churn measurement the diagnostics
-    /// sweep reports.
     pub fn stats(&self) -> (u64, u64, u64) {
         (
             self.total_allocs.load(Ordering::Relaxed),
@@ -156,44 +92,6 @@ impl TexturePool {
         )
     }
 
-    /// Once-per-frame pool maintenance. Advances the idle clock, frees
-    /// long-idle textures, and if retention still exceeds `budget`, frees the
-    /// longest-idle entries beyond it — but never ones used within the
-    /// protection window. A hot working set larger than the budget is
-    /// deliberately left alone when VRAM is healthy: freeing it would only
-    /// re-allocate the same sizes next frame, feeding the driver's
-    /// deferred-destruction backlog without reclaiming anything. Frees are
-    /// capped at `max_free_bytes` per call so piled-up destruction spreads
-    /// across frames instead of stalling one (the periodic hitch).
-    ///
-    /// `vram_pressure` (0 = healthy, 1 = soft, 2 = hard, from the process
-    /// GPU-memory budget) picks the eviction stance. Every gradual policy
-    /// under pressure was field-tested on 13/07 and failed:
-    /// - Fast draining (budget 0-64 MB, ≥128 MB/frame): multi-GB destroy/
-    ///   create bang-bang — the redraw valve's deferrals make alive targets
-    ///   look idle, and the drain teleports the once-a-second VRAM reading
-    ///   through the release threshold.
-    /// - Holding everything: the process parks over its OS budget and WDDM
-    ///   pages live textures (15 fps).
-    /// - Slow bleeding (24 MB/frame toward a 512 MB floor): a drain↔realloc
-    ///   loop against the deferred working set — allocating while paging is
-    ///   synchronously expensive, 5 fps.
-    ///
-    /// What demonstrably recovers (observed when the window was minimized:
-    /// VRAM 7.6→4.2 GB, then steady 24 fps in the same room) is a FULL
-    /// one-shot drain: emptying the pool zeroes whole driver-arena blocks,
-    /// which is what actually returns memory to the OS — a partial bleed
-    /// leaves every block fragmented and returns nothing. So under pressure
-    /// the pool only tightens its long-idle pass, and if hard pressure
-    /// *persists* it fires one full reset (one hitch), then cools down.
-    ///
-    /// `healthy_idle_ticks` is how long an entry may sit unused before the
-    /// long-idle pass frees it while VRAM is healthy; pressure overrides it
-    /// downwards. Callers pass their own because the two pools have opposite
-    /// needs: the offscreen pool wants piles from map changes drained
-    /// promptly, while the main-surface pool's sizes recur as players move and
-    /// animate, so freeing them on a timer just buys a reallocation a moment
-    /// later.
     pub fn maintain(
         &mut self,
         budget: u64,
@@ -208,9 +106,6 @@ impl TexturePool {
             _ => 32,
         };
 
-        // Escape reset: sustained hard pressure means the process is parked
-        // over its OS budget and paging; nothing gradual gets it back under.
-        // At most once per pressure episode — see `hard_reset_fired_this_episode`.
         if vram_pressure == 2 {
             self.hard_pressure_streak += 1;
             self.low_pressure_streak = 0;
@@ -228,14 +123,6 @@ impl TexturePool {
             }
         } else {
             self.hard_pressure_streak = 0;
-            // Re-arm only after pressure has STAYED released. Draining the pool
-            // is what the reset does, and pool retention is what the valve
-            // reads, so the instant after a reset the signal always says
-            // "recovered" — even when the reset was futile and live demand is
-            // about to refill it. Re-arming on that reading turns the one-shot
-            // escape into a periodic drain, and recycling a drained target that
-            // a deferred cache still references paints one object with
-            // another's art.
             self.low_pressure_streak += 1;
             if self.low_pressure_streak >= POOL_EPISODE_END_TICKS {
                 self.hard_reset_fired_this_episode = false;
@@ -244,7 +131,6 @@ impl TexturePool {
 
         let mut free_left = max_free_bytes;
 
-        // Pass 1: long-idle entries go regardless of budget.
         for (key, pool) in self.pools.iter() {
             if free_left == 0 {
                 break;
@@ -259,10 +145,6 @@ impl TexturePool {
             self.total_frees += dropped;
         }
 
-        // Pass 2 (healthy VRAM only): keep the idle hoard under the normal
-        // retention budget, sparing the recent working set. Under pressure
-        // this is deliberately off — gradual budget eviction only churns
-        // against the deferred working set (see above).
         if vram_pressure > 0 {
             return;
         }
@@ -391,12 +273,8 @@ impl BufferDescription for AlwaysCompatible {
 }
 
 pub struct BufferPool<Type, Description: BufferDescription> {
-    /// Idle items, each stamped with the pool clock value at return time.
     available: Arc<PoolInner<(Type, Description, u64)>>,
     constructor: Constructor<Type, Description>,
-    /// Shared with `PoolEntry`s so returns are stamped with the owner's
-    /// frame clock. Pools whose owner never advances it (`new`) simply see
-    /// every entry as age 0.
     clock: Arc<AtomicU64>,
 }
 
@@ -422,7 +300,6 @@ impl<Type, Description: BufferDescription> BufferPool<Type, Description> {
         }
     }
 
-    /// Number of idle items currently available for reuse.
     pub fn available_len(&self) -> usize {
         self.available
             .lock()
@@ -430,9 +307,6 @@ impl<Type, Description: BufferDescription> BufferPool<Type, Description> {
             .len()
     }
 
-    /// Drop up to `max_items` idle items whose age (ticks since return, per
-    /// the shared clock) is at least `min_age`, oldest first. Returns how
-    /// many were dropped. Items still checked out are unaffected.
     pub fn evict_idle(&self, now: u64, min_age: u64, max_items: usize) -> usize {
         let mut guard = self
             .available
@@ -443,7 +317,6 @@ impl<Type, Description: BufferDescription> BufferPool<Type, Description> {
             .collect();
         candidates.sort_by_key(|&i| guard[i].2);
         candidates.truncate(max_items);
-        // Remove back-to-front so earlier indices stay valid.
         candidates.sort_unstable_by(|a, b| b.cmp(a));
         let dropped = candidates.len();
         for i in candidates {

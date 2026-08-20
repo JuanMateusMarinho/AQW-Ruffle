@@ -263,7 +263,6 @@ impl<'gc> OptValue<'gc> {
     pub fn known_falsey(self) -> bool {
         if self.constant_value.is_some_and(|v| v.is_falsey()) {
             // If this value is known to be a constant value, and that value is
-            // falsey, then return false
             // NOTE: This condition is also met if this value is known to be
             // `null`, since we represent that using `ConstantValue::Null`
             true
@@ -1255,13 +1254,6 @@ fn abstract_interpret_ops<'gc>(
                 let value = scope_stack.at(index).0;
 
                 if matches!(value.constant_value, Some(ConstantValue::Receiver)) && !sets_local_0 {
-                    // If the value on the scope stack was the receiver, and
-                    // local #0's value hasn't changed (i.e. local #0 is still
-                    // set to the reciever), we can optimize this op to a
-                    // `getlocal0`.
-
-                    // NOTE: We also perform this optimization in the handling
-                    // of `Op::FindPropStrict`/`Op::FindProperty`.
                     optimize_op_to!(Op::GetLocal { index: 0 });
                 }
 
@@ -1347,10 +1339,6 @@ fn abstract_interpret_ops<'gc>(
                             // behavior- see the test `avm2/scope_optimizations`.
 
                             if vtable.has_trait(&multiname) {
-                                // See `Op::GetScopeObject`'s handling for an
-                                // explanation for this additional optimization
-                                // to `Op::GetLocal` rather than
-                                // `Op::GetScopeObject`.
                                 if matches!(value.constant_value, Some(ConstantValue::Receiver))
                                     && !sets_local_0
                                 {

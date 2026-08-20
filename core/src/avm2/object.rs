@@ -890,10 +890,6 @@ impl Hash for Object<'_> {
     }
 }
 
-// Identity for weak references is the address of the box they point at, which
-// stays readable after the value is collected -- `GcWeak` keeps the allocation
-// alive for as long as any weak pointer to it exists. That is what lets a dead
-// key still be found and removed from a weak `Dictionary`.
 impl PartialEq for WeakObject<'_> {
     fn eq(&self, other: &Self) -> bool {
         std::ptr::eq(self.as_ptr(), other.as_ptr())

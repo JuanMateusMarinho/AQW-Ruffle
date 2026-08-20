@@ -5,11 +5,6 @@ use crate::avm2::value::Value;
 
 pub use crate::avm2::object::dictionary_allocator;
 
-/// `Dictionary(weakKeys:Boolean = false)`
-///
-/// The allocator runs before the constructor, so the weak-key decision is made
-/// here — still before any entry can be inserted, which is what lets a
-/// dictionary use one kind of object key for its whole life.
 pub fn dictionary_initializer<'gc>(
     _activation: &mut Activation<'_, 'gc>,
     this: Value<'gc>,

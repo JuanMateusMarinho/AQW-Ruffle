@@ -345,8 +345,6 @@ fn get_or_create_value<'gc>(
                 }
             }
             Some(ObjectTableEntry::Complete(object_id, rc_val)) => {
-                // AMF3 supports references for repeated objects. AMF0 references require the
-                // flash_lso writer API, so preserve the existing duplicate-object behavior there.
                 avm2_stub_method!(
                     activation,
                     "flash.utils.ByteArray",

@@ -200,7 +200,6 @@ pub fn exec<'gc>(
 
     let caller_dxns = activation.default_xml_namespace();
 
-    // Limit AVM2 call depth to prevent stack overflow on infinite recursion
     const MAX_CALL_DEPTH: usize = 512;
     if activation.context.avm2.call_depth() >= MAX_CALL_DEPTH {
         let mut method_name = WString::new();
@@ -317,7 +316,6 @@ impl fmt::Debug for BoundMethod<'_> {
     }
 }
 
-/// Pops the profile frame opened for one `exec`, on every exit path.
 pub fn display_function<'gc>(output: &mut WString, method: Method<'gc>) {
     let bound_class = method.bound_class();
 

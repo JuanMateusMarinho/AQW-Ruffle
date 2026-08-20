@@ -119,10 +119,6 @@ impl<'gc> Avm2ClassRegistry<'gc> {
 #[derive(Collect)]
 #[collect(no_drop)]
 pub struct MovieLibrary<'gc> {
-    // Stored weak: `MovieLibrary` lives in `MovieLibraries`, which is keyed by
-    // `Weak<SwfMovie>` so unused libraries can be evicted once nothing else
-    // references the movie. A strong `Arc` here would keep that key's strong
-    // count above zero forever, defeating the weak-map eviction entirely.
     #[collect(require_static)]
     swf: Weak<SwfMovie>,
     characters: HashMap<CharacterId, Character<'gc>>,

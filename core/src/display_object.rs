@@ -117,93 +117,26 @@ pub struct BitmapCache {
     /// Whether we warned that this bitmap was too large to be cached
     warned_for_oversize: bool,
 
-    /// Whether we reported this cache resolving to a zero-sided rect. Separate
-    /// from the oversize flag because they are opposite ends of the same
-    /// suspicion: a non-finite value crossing into `Twips` collapses one way
-    /// and saturates the other, and both were seen in the same object group.
     warned_for_zero: bool,
 
-    /// Render-back offset, relative to the object's translation, that matches
-    /// the texture contents from the last admitted redraw. A deferred (stale)
-    /// cache must be drawn at this anchor: the live bounds/draw_offset may have
-    /// moved or scaled since the texture was rendered, and using them visibly
-    /// displaces the object (e.g. a weapon glow drifting away in a busy room).
     stale_anchor: Point<Twips>,
 
-    /// Consecutive rendered frames this cache stayed dirty but had its redraw
-    /// deferred by the AQW budget. Feeds the aged-redraw quota so a cache that
-    /// keeps losing the budget race (admission is in render order) still
-    /// refreshes within about a second instead of staying stale forever.
     deferred_frames: u32,
 
-    /// Consecutive rendered frames this cache was found dirty, whether or not
-    /// its redraw was admitted. Distinct from `deferred_frames`, which counts
-    /// only refusals and resets on every redraw: this keeps counting through
-    /// admitted redraws, so it measures how long the contents have been
-    /// *changing* rather than how long they have been stale. See
-    /// `aqw_defer_eligible_frames`.
     dirty_streak: u32,
 
-    /// How many times this cache has been baked since the object was created.
-    ///
-    /// Deliberately survives `clear()`, unlike `dirty_streak`: four paths clear
-    /// a cache and every one of them resets that streak, so a cache rebaked
-    /// through a clear every frame would read as brand new. This is what
-    /// separates the two readings the per-class attribution cannot tell apart --
-    /// one object rebaking N times a window, or N objects baking once each --
-    /// and those call for opposite fixes.
     bake_count: u32,
 
-    /// Consecutive redraws where the object's transform was unchanged but the
-    /// computed cache geometry was not. See `note_static_churn`.
     static_churn: u32,
 
-    /// Whether that churn has been reported, so it is said once per cache.
     churn_reported: bool,
 }
 
-/// How long geometry has to keep moving under a static transform before it is
-/// reported. An object that resizes once trips this for a frame or two; only
-/// a genuine oscillation survives two seconds of it.
 const STATIC_CHURN_REPORT_FRAMES: u32 = 48;
 
 const MAX_CACHE_BITMAP_DIMENSION: u32 = 4096;
 const MAX_CACHE_BITMAP_PIXELS: u32 = 2_500_000;
 
-/// The ceiling on an AQW cache texture, raised on 2026-08-12 to the one Flash
-/// Player itself used: 8191 a side, 16777215 pixels. `RUFFLE_AQW_CACHE_MAX_SIDE`
-/// and `RUFFLE_AQW_CACHE_MAX_PIXELS` override; 4096 and 8000000 are the values
-/// this fork ran before.
-///
-/// Refusing a cache is not a graceful degradation here, it is the worst case the
-/// renderer has: the subtree renders vector every frame *and* every blend
-/// placement inside it becomes its own live pass. Measured 2026-08-12 in
-/// Battleon, an avatar item that lost its cache this way (`Dmnk26FiendRider`)
-/// emitted ~2490 complex blends per sweep window with the counters repeating to
-/// the digit between windows -- static art recomposed 24 times a second -- and
-/// took the frame from ~35 ms to ~68. `live_hadcache` was 1222-1922 whenever it
-/// was on screen and exactly 0 whenever it was not.
-///
-/// The old limits were stricter than the player being emulated, and the log said
-/// so at every refusal: `flash_acceptable_size=true` beside
-/// `aqw_practical_acceptable_size=false`.
-///
-/// **These are surface pixels, not stage pixels.** The sizes that tripped the
-/// old caps -- 4054x2112, 4503x1618 -- are roughly 1750x920 of content times a
-/// fullscreen view scale of about 2.3 (window scale times the 1.25 supersample).
-/// So the same item kept its cache in a window and lost it in fullscreen, which
-/// is the same coordinate-space confusion as the offscreen-bypass defect. The
-/// clean fix is to judge content size and let the texture scale with the view;
-/// raising the ceiling is the cheap half, and it is the half that can be
-/// measured tonight.
-/// **Raised to Flash's own limits on 2026-08-12 and put back the same night.**
-/// Two sessions with the offending item on screen showed no change at all:
-/// `live_hadcache` stayed at 1262-1924 with the ceiling raised, and again with
-/// redraw deferral switched off entirely. Whatever suppresses that cache is
-/// neither its size nor its admission, so the raise bought nothing and loosened
-/// a memory limit in the one area this fork has a standing problem with. Set
-/// `RUFFLE_AQW_CACHE_MAX_SIDE=8191` and `RUFFLE_AQW_CACHE_MAX_PIXELS=16777215`
-/// to try it again once something says it would help.
 const MAX_AQW_CACHE_BITMAP_SIDE_DEFAULT: u32 = 4096;
 const MAX_AQW_CACHE_BITMAP_PIXELS_DEFAULT: u32 = 8_000_000;
 
@@ -226,33 +159,14 @@ fn aqw_max_cache_pixels() -> u32 {
             .unwrap_or(MAX_AQW_CACHE_BITMAP_PIXELS_DEFAULT)
     })
 }
-/// A transform scale component beyond this is degenerate for bitmap caching: even
-/// a 1px object would exceed the cache dimension limit, so the cache would be
-/// rejected anyway. Used to short-circuit such objects (e.g. AQW's occasional
-/// `instance####` with a multi-million-pixel transform) before the bounds
-/// traversal and to guard against NaN/inf matrices.
 const CACHE_DEGENERATE_SCALE: f32 = MAX_CACHE_BITMAP_DIMENSION as f32;
 
-/// Reads one of the fork's boolean environment switches.
-///
-/// Presence used to be the whole test, which meant `NO_SCALE9=0` *enabled* the
-/// kill switch it reads as disabling -- the one spelling a user is most likely
-/// to reach for. An explicit `0`, `false`, `off` or `no` (any case, surrounding
-/// whitespace ignored) now turns the switch off; any other value, including an
-/// empty one, turns it on. Unset returns `default`.
-///
-/// Callers cache the result in a `OnceLock`, so this runs once per switch.
 pub(crate) fn aqw_env_flag(name: &str, default: bool) -> bool {
     let Some(value) = std::env::var_os(name) else {
         return default;
     };
     let value = value.to_string_lossy();
     let value = value.trim();
-    // An empty value means unset. `$env:VAR = ""` is the obvious way to clear a
-    // switch in PowerShell but it leaves the variable defined and empty, and
-    // reading that as "set" silently keeps the switch on -- which invalidated
-    // several field A/Bs on 2026-08-05 before anyone noticed the runs were
-    // comparing a lever against itself.
     if value.is_empty() {
         return default;
     }
@@ -267,110 +181,25 @@ pub(crate) fn aqw_diagnostics_enabled() -> bool {
     *ENABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_DIAGNOSTICS", false))
 }
 
-/// Kill switch for skipping clean subtrees inside a nested goto frame.
-/// `RUFFLE_AQW_NO_FRAME_SKIP=1` restores the unconditional full-stage walk.
 pub(crate) fn frame_skip_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_FRAME_SKIP", false))
 }
 
-/// Kill switch for handing a nested goto only the orphans that were marked
-/// since its last pass. `RUFFLE_AQW_NO_ORPHAN_PENDING=1` puts both orphan loops
-/// back on the whole list, every nested frame.
 pub(crate) fn orphan_pending_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_ORPHAN_PENDING", false))
 }
 
-/// Stop handing a frame script back when it throws out of turn, mid-construction.
-/// `RUFFLE_AQW_NO_SCRIPT_REQUEUE=1`.
 pub(crate) fn script_requeue_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_SCRIPT_REQUEUE", false))
 }
-/// Let every dirty cache redraw in the frame it goes dirty, instead of letting
-/// the budget defer it and compose the previous texture. **Off by default since
-/// 2026-08-12**, when the grace window below made deferral safe enough to keep;
-/// `RUFFLE_AQW_NO_REDRAW_DEFER=1` brings it back, and is the escape if wrong
-/// colours ever resurface.
-///
-/// It shipped *on* in V2.8, and that cost 2.4x of frame time in a scene with
-/// animated map art (69.9 ms/frame against 29.4 with deferral restored, measured
-/// in Battleon on 2026-08-11 with `blend_bake` at 4052 against 267). The
-/// paragraph below about the cost is what that measurement corrected: it was
-/// taken while standing alone casting one skill, a scene where deferral has
-/// almost nothing to defer, and it is wrong by about 27x for a busy one.
-///
-/// A deferred cache stands in with its last texture, and that texture carries
-/// the colour its contents had when it was rendered. For a skill FX whose
-/// colour is rewritten once as it is cast, the stand-in is the *old* colour --
-/// so the effect flashes between the two while instances take turns being
-/// admitted. That is the bug this addresses, and removing deferral is the only
-/// thing measured to remove it: four separate confirmations on 2026-08-05,
-/// including one unasked-for, when fixing an unrelated env-parsing bug silently
-/// re-enabled deferral and the flicker came back with it.
-///
-/// Bounding how long a cache may stay stale is not enough -- lowering the
-/// starvation threshold from 24 frames to 4 shortened each flash and removed
-/// none, because a stand-in is the wrong colour on its very first frame.
-///
-/// Cost, measured in the same session at 1080p fullscreen: submit time per
-/// frame went from 6.8-9.8 ms to 8.9-11.1 ms, against a 41.7 ms budget at
-/// 24fps. `redraw_large` rose from ~130-200 to ~190-235 per window, which is
-/// exactly the deferred work now being done on time.
-///
-/// What replaced it is not a better budget but a narrower one: deferral is back,
-/// and `aqw_defer_eligible_frames` withholds it from caches that have not been
-/// changing long enough to be safe to stand in for. Turning this on again
-/// disables that too, since there is then no deferral for it to gate.
 pub(crate) fn redraw_defer_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_REDRAW_DEFER", false))
 }
 
-/// How many frames a cache must have been going dirty in a row before the
-/// redraw budget is allowed to defer it. `RUFFLE_AQW_DEFER_ELIGIBLE_FRAMES=N`
-/// overrides; `0` restores the ungated budget, which is the behaviour that
-/// flickers.
-///
-/// The bet, and what makes this a different axis from the dead one above: art
-/// that changes every frame is *animating*, and one frame of animation lag on
-/// it is invisible -- that is the map content the deferral was built for, and
-/// where the 2.4x of frame time measured on 2026-08-11 lives. Art that goes
-/// dirty after standing still has had something *happen* to it, and a stand-in
-/// there shows the state before it happened, which is the skill FX composing
-/// its pre-cast colour. So the grace window is not a bound on how stale a
-/// texture may get (that was tried, 24 frames to 4, and changed nothing because
-/// a stand-in is wrong on its first frame) but on how settled the object has to
-/// be before a stale texture is allowed to represent it at all.
-///
-/// It works only if the colour write lands inside the window, while the clip is
-/// young, and that was bisected in the field on 2026-08-12 against the Wicked
-/// Purgatory repro in fullscreen: 0 and 4 flicker, 8, 12 and 60 do not. 12 is
-/// the default rather than 8 because Wicked Purgatory is one effect and another
-/// skill may write its colour later, and because the two are indistinguishable
-/// on cost.
-///
-/// It separates the two populations on its own, with no asset names in it. In
-/// Battleon, where the emitters are animated map art, `defer_grace` runs at
-/// 0-2% of admitted redraws -- that art never settles, so it stays deferrable
-/// and the frame time the budget was restored for is kept. In a room dominated
-/// by skill FX, the same counter tracks the effect's blend count roughly 1:1.
-///
-/// Where it does cost is the transient: entering a busy room builds dozens of
-/// caches at once and every one of them is inside its window, which took
-/// `defer_grace` to 42-61% of admitted redraws for a window or two (and, at
-/// N=60, to 76% with deferral entirely neutralised -- the shape of the
-/// 2026-07-30 failure, where an exemption swallowed the budget rather than
-/// carving an exception in it). If that transient ever shows up as a hitch on
-/// room change, cap graced redraws per frame rather than lowering N: the cap
-/// bounds the burst without shortening the window that correctness rests on.
-///
-/// Steady-state cost was not separable from scene: public-room sessions differ
-/// in who is standing in them and what they are wearing, and one heavy item is
-/// worth dozens of blend passes per bake, so frame time across runs moved by
-/// more than the lever ever did. The honest figure is ~1-2 ms/frame, from the
-/// two comparisons that were matched on occupancy and effect load.
 pub(crate) fn aqw_defer_eligible_frames() -> u32 {
     static FRAMES: OnceLock<u32> = OnceLock::new();
     *FRAMES.get_or_init(|| {
@@ -381,35 +210,18 @@ pub(crate) fn aqw_defer_eligible_frames() -> u32 {
     })
 }
 
-/// See `aqw_defer_eligible_frames`. 12 frames is half a second at AQW's 24fps.
 const AQW_DEFER_ELIGIBLE_FRAMES_DEFAULT: u32 = 12;
 
-/// Kill-switch for letting a filtered child keep its cache inside an AQW bake,
-/// which is the only way its filters get applied at all.
-/// `RUFFLE_AQW_NO_NESTED_FILTER_CACHE=1` drops them again.
 fn aqw_nested_filter_cache_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_NESTED_FILTER_CACHE", false))
 }
 
-/// The per-object flicker probes, which are too expensive to leave on the
-/// general diagnostics flag. `RUFFLE_AQW_FLICKER_PROBE=1`.
 fn aqw_flicker_probe_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_FLICKER_PROBE", false))
 }
 
-/// Restrict the tint probe to objects whose movie URL contains one of these
-/// strings, set by giving `RUFFLE_AQW_FLICKER_PROBE` anything other than
-/// `1`/`true` (e.g. `RUFFLE_AQW_FLICKER_PROBE=Assets_,IceWolfPuppy`).
-/// Comma-separated, so a hunt does not have to know up front which file the art
-/// came from.
-///
-/// Reporting whatever renders first does not survive contact with AQW: measured
-/// 2026-08-02, the whole 400-report budget went in 1.4 seconds, 365 of them on
-/// `charselect.swf`, before the session reached the skill under investigation.
-/// A budget that is reached is a budget that chooses the subject, so the subject
-/// is named instead.
 fn aqw_flicker_probe_filter() -> Option<&'static str> {
     static FILTER: OnceLock<Option<String>> = OnceLock::new();
     FILTER
@@ -420,14 +232,6 @@ fn aqw_flicker_probe_filter() -> Option<&'static str> {
         .as_deref()
 }
 
-/// Whether the probes should look at art from `url`.
-///
-/// Unfiltered, the character-select screen alone spends a whole report budget
-/// before the session is even in a room, so it is never the subject and never
-/// gets to be the subject. The game shell and the map are on screen for the
-/// whole session and do the same thing more slowly: a run on 2026-08-05 spent
-/// 219 of 400 reports on `Game3098*` and `Loader3` and never reached the cast
-/// FX.
 fn flicker_probe_covers(url: &str) -> bool {
     match aqw_flicker_probe_filter() {
         Some(filter) => filter
@@ -443,8 +247,6 @@ fn flicker_probe_covers(url: &str) -> bool {
     }
 }
 
-/// True when `url` has `segment` as a whole path segment, ignoring case, the
-/// query string and the fragment.
 fn url_path_has_segment(url: &str, segment: &str) -> bool {
     url.split(['?', '#'])
         .next()
@@ -453,7 +255,6 @@ fn url_path_has_segment(url: &str, segment: &str) -> bool {
         .any(|part| part.eq_ignore_ascii_case(segment))
 }
 
-/// Host of an absolute URL, without the port.
 fn url_host(url: &str) -> Option<&str> {
     let after_scheme = url.split_once("://")?.1;
     let authority = after_scheme.split(['/', '?', '#']).next()?;
@@ -461,13 +262,9 @@ fn url_host(url: &str) -> Option<&str> {
 }
 
 fn is_aqw_movie_url(url: &str) -> bool {
-    // Only the `gamefiles` segment is load-bearing: matching the segment rather
-    // than the literal `/game/gamefiles/` keeps this working if the path in
-    // front of it ever moves.
     url_path_has_segment(url, "gamefiles")
 }
 
-/// The last path segment of `url`, for grouping art by file.
 fn url_basename(url: &str) -> &str {
     url.split(['?', '#'])
         .next()
@@ -477,7 +274,6 @@ fn url_basename(url: &str) -> &str {
         .unwrap_or(url)
 }
 
-/// Tally `items` and render the busiest `limit` as `name:count`.
 fn top_counts(items: impl IntoIterator<Item = String>, limit: usize) -> String {
     let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     for item in items {
@@ -493,23 +289,6 @@ fn top_counts(items: impl IntoIterator<Item = String>, limit: usize) -> String {
         .join(",")
 }
 
-/// Name the orphan list: what these objects are, and how long they have been
-/// there.
-///
-/// The population probe answered "are they inert" (2994 of 2998 neither playing
-/// nor holding a queued script) but not "what are they". That gap is what
-/// decides the only remaining cheap fix. The freeze is the right shape for this
-/// -- it stops the per-frame cost without releasing anything, so it cannot
-/// reproduce the #1009 storms that every actual release attempt caused (see the
-/// avatar-retention notes) -- but it currently only matches avatar-asset art,
-/// and the probe measured just 11 of 3035 orphans matching that. Widening it
-/// safely means knowing what the other 3024 are.
-///
-/// The orphan manager already records the half of this that was known: AQW does
-/// not release an avatar mid-session. That explains retention, not the class of
-/// object, and the freeze predicate needs the class.
-///
-/// Once per sweep, so a 3000-entry walk and its strings cost once a second.
 fn aqw_report_orphan_census(context: &UpdateContext<'_>) {
     use crate::avm2::object::TObject;
 
@@ -521,11 +300,7 @@ fn aqw_report_orphan_census(context: &UpdateContext<'_>) {
 
     let (mut clips, mut constructed, mut frozen, mut quiet, mut playing) =
         (0u64, 0u64, 0u64, 0u64, 0u64);
-    // Of the freezes, how many the widened (structural) predicate accounts for
-    // rather than the avatar-art one.
     let mut frozen_inert = 0u64;
-    // Ticks on the orphan list, bucketed at AQW's 24fps: under a second, under
-    // the freeze's own 5s grace, under 25s, and everything that outlived that.
     let mut age = [0u64; 4];
     let mut classes: Vec<String> = Vec::with_capacity(total);
     let mut movies: Vec<String> = Vec::with_capacity(total);
@@ -581,19 +356,12 @@ fn aqw_report_orphan_census(context: &UpdateContext<'_>) {
     );
 }
 
-/// Report the URL gates that every game-specific path here hangs off.
-///
-/// All of them fail closed and silent, so a game update that moved its asset
-/// tree would show up only as performance quietly regressing months later. This
-/// says it out loud instead, and runs before the gate itself so it still fires
-/// when the gate is the thing that broke.
 fn aqw_report_gates(context: &mut UpdateContext<'_>) {
     if !aqw_diagnostics_enabled() {
         return;
     }
     static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let frames = FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // ~10s in, once the first room's assets are up, then once a minute.
     if frames < 240 || !(frames - 240).is_multiple_of(1440) {
         return;
     }
@@ -616,8 +384,6 @@ fn aqw_report_gates(context: &mut UpdateContext<'_>) {
     );
     tracing::info!(target: "aqw_diag", "{line}");
 
-    // Alongside the sweep, for the same reason: the launcher spawns the game
-    // detached and discards stdout, so the file is the channel that survives.
     use std::io::Write;
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
@@ -628,26 +394,9 @@ fn aqw_report_gates(context: &mut UpdateContext<'_>) {
     }
 }
 
-/// Temporary probe for the detached/uncoloured AQW item art.
-///
-/// Every item art piece runs, in its first frame,
-/// `MovieClip(stage.getChildAt(0)).mcSetColor(this, ...)` — it reaches up to
-/// the stage to have the game colour and place it. `mcSetColor` is defined on
-/// `Game`, the document class of `Game3097.swf`, and `Loader3.swf` puts that
-/// object at index 0 (`stage.removeChildAt(0)` then
-/// `stage.addChild(MovieClip(loader.content))`).
-///
-/// In the field that coercion fails with #1034 against a `Loader`, so the call
-/// never happens and the piece keeps its default colour and position. This
-/// reports what is actually sitting on the stage, to find out where the
-/// `Loader` comes from. Logged at warn so it survives the default `RUST_LOG`.
-///
-/// Diagnostic scaffolding — remove once the display-list question is answered.
 fn aqw_report_stage_children(context: &mut UpdateContext<'_>) {
     let stage = context.stage;
 
-    // Describe index 0 as the item art would find it: the display object kind
-    // plus the AVM2 class the coercion would be tested against.
     let describe = |child: DisplayObject<'_>| {
         let kind = match child {
             DisplayObject::LoaderDisplay(_) => "Loader",
@@ -667,14 +416,6 @@ fn aqw_report_stage_children(context: &mut UpdateContext<'_>) {
         format!("{kind}/{class}")
     };
 
-    // Watchdog rather than a periodic sample: a snapshot at the character
-    // screen showed a MovieClip at index 0, so whatever the failing item art
-    // sees is transient and sampling on a timer would miss it.
-    //
-    // Identity is the child's pointer, compared against the last one seen. This
-    // runs every frame, before the sweep's one-per-second throttle, so it must
-    // not allocate: resolving the class name and formatting only happen on the
-    // frame where index 0 actually changes.
     static LAST_PTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let child = stage.child_by_index(0);
     let ptr = child.map(|c| c.as_ptr() as usize).unwrap_or(0);
@@ -710,17 +451,6 @@ impl BitmapCache {
         self.matrix_a = f32::NAN;
     }
 
-    /// Detect a cache that rebuilds every frame while its object stands still.
-    ///
-    /// `is_dirty` keys off bounds run through `ceil()`, and the draw offset
-    /// comes from a filter rect run through `floor()`. An edge that lands on a
-    /// pixel boundary can therefore flip between two values indefinitely: the
-    /// cache is regenerated each frame, and because the offset is added to the
-    /// object's translation at draw time, a flip there paints the art a pixel
-    /// away from where it was. Held art that vibrates in place is this.
-    ///
-    /// Returns the streak length once it is long enough to rule out an object
-    /// that merely resized, and only once per cache.
     fn note_static_churn(
         &mut self,
         matrix: &Matrix,
@@ -759,21 +489,6 @@ impl BitmapCache {
             || self.bitmap.is_none()
     }
 
-    /// Which of `is_dirty`'s conditions fired, for the sweep's `dirty_*`
-    /// columns.
-    ///
-    /// Measured 2026-08-07: restoring the redraw budget cut admitted small
-    /// redraws from ~45 to ~5 per frame while `redraw_deferred` stayed at zero.
-    /// Deferral cannot do that -- a deferred redraw is a *refused* one and
-    /// would show up as deferred -- so the caches were not going dirty in the
-    /// first place, and the budget is not what decides that. This says which of
-    /// the three conditions is actually firing.
-    ///
-    /// Ordered by how much each explains, not by how `is_dirty` evaluates them.
-    /// A missing texture is the one that would point somewhere other than the
-    /// content: nothing the art does removes a texture, but `clear()` on the
-    /// offscreen-cache bypass does, and that bypass has a known coordinate-space
-    /// defect that makes it fire on art which is plainly on screen.
     fn dirty_reason(
         &self,
         other: &Matrix,
@@ -786,11 +501,6 @@ impl BitmapCache {
         if self.source_width != source_width || self.source_height != source_height {
             return Some(CacheDirtyReason::Size);
         }
-        // `make_dirty` poisons this field, so NaN here means the subtree said it
-        // changed rather than that the object moved. Checked before the matrix
-        // comparison it would otherwise fall into, and after the two above, so
-        // `dirty_notex` and `dirty_size` keep the meaning earlier sessions
-        // measured them with and only the `dirty_matrix` bucket splits.
         if self.matrix_a.is_nan() {
             return Some(CacheDirtyReason::Invalidated);
         }
@@ -830,11 +540,6 @@ impl BitmapCache {
             if current.width == actual_width && current.height == actual_height {
                 return; // No need to resize it
             }
-            // With size padding, keep an existing texture as long as the
-            // logical contents still fit and the texture isn't oversized by
-            // more than ~2x in pixels (shrink hysteresis). Pulsing FX bounds
-            // then reuse one allocation instead of recreating a GPU texture
-            // every frame.
             if allow_size_padding
                 && current.width >= actual_width
                 && current.height >= actual_height
@@ -867,11 +572,6 @@ impl BitmapCache {
         let acceptable_size = (flash_acceptable_size && practical_acceptable_size)
             || (aqw_flash_acceptable_size && aqw_practical_acceptable_size);
 
-        // The flicker probe reports a refused allocation as `has_texture=false`
-        // but cannot say why: it runs after `update`, and the sizes that decide
-        // this are the post-filter ones, which never leave here. Letting the
-        // probe arm this line too spares a run that reads "no texture" with no
-        // reason attached -- which is what the 2026-08-06 run was.
         if (aqw_diagnostics_enabled() || aqw_flicker_probe_enabled())
             && !acceptable_size
             && !self.warned_for_oversize
@@ -907,10 +607,6 @@ impl BitmapCache {
             );
         }
 
-        // The allocation may be padded up to a size bucket; the logical
-        // contents occupy the top-left region and the margin stays transparent
-        // (the redraw clears the whole texture), so consumers can keep treating
-        // the texture dimensions as the drawable size.
         let (alloc_width, alloc_height) = if allow_size_padding {
             (
                 quantize_cache_dimension(actual_width),
@@ -940,8 +636,6 @@ impl BitmapCache {
     /// temporarily disabled.
     fn clear(&mut self) {
         self.bitmap = None;
-        // Nothing survives to stand in, so the object starts over as far as
-        // deferral eligibility is concerned.
         self.dirty_streak = 0;
     }
 
@@ -949,8 +643,6 @@ impl BitmapCache {
         self.bitmap.as_ref().map(|b| b.handle.clone())
     }
 
-    /// Estimated bytes held by this cache's texture (RGBA), for AQW memory
-    /// diagnostics and the cache-memory budget.
     fn estimated_bytes(&self) -> u64 {
         self.bitmap
             .as_ref()
@@ -985,10 +677,6 @@ pub struct RenderOptions {
     /// Matrix is applied by default.
     pub apply_matrix: bool,
 
-    /// Whether to apply 9-slice scaling from `scale9Grid`/`DefineScalingGrid`.
-    ///
-    /// This is disabled only while recursively drawing the individual 9-slice
-    /// regions of the object that owns the scaling grid.
     pub apply_scaling_grid: bool,
 }
 
@@ -1128,8 +816,6 @@ impl Default for DisplayObjectBase<'_> {
             sound_transform: Default::default(),
             blend_mode: Default::default(),
             opaque_background: Default::default(),
-            // A brand new object always has frame work pending: it has no AVM2
-            // object yet, so `construct_frame` has to reach it.
             flags: Cell::new(DisplayObjectFlags::VISIBLE | DisplayObjectFlags::SUBTREE_NEEDS_FRAME),
             scroll_rect: Cell::new(None),
             next_scroll_rect: Default::default(),
@@ -1198,10 +884,6 @@ impl<'gc> DisplayObjectBase<'gc> {
         self.color_transform.get()
     }
 
-    /// Returns whether the value actually changed, so callers can skip work
-    /// that only matters on a real change. Content re-applies the same tint
-    /// every frame often enough that treating every write as a change is not
-    /// affordable.
     pub fn set_color_transform(&self, color_transform: ColorTransform) -> bool {
         self.color_transform.replace(color_transform) != color_transform
     }
@@ -1627,12 +1309,6 @@ impl<'gc> DisplayObjectBase<'gc> {
         self.set_flag(DisplayObjectFlags::CACHE_INVALIDATED, false);
     }
 
-    /// Whether something inside this subtree announced a change this frame.
-    ///
-    /// Only readable up to `pre_render`, which clears it -- so a descendant that
-    /// walks up to ask this always reads false. That is a dead counter waiting
-    /// to happen, and the reason the sampling for `live_cand` sits in
-    /// `pre_render` itself rather than beside the rest of the blend accounting.
     fn cache_invalidated(&self) -> bool {
         self.contains_flag(DisplayObjectFlags::CACHE_INVALIDATED)
     }
@@ -1704,19 +1380,10 @@ impl<'gc> DisplayObjectBase<'gc> {
     }
 }
 
-/// Indicates which kind of bounds should be returned by `self_bounds`.
-/// In most cases `BoundsMode::Engine` should be used.
 #[derive(Copy, Clone, Debug)]
 pub enum BoundsMode {
-    /// The bounds visible on the stage (e.g. takes MorphShape ratio into
-    /// account). Used for hit testing and rendering.
     Engine,
 
-    /// The bounds returned by ActionScript (e.g. doesn't take MorphShape
-    /// ratio into account - always uses ratio 0 AKA start shape).
-    /// This is used in AVM1 in MovieClip::getBounds(), getRect(), _width, _height, hitTest (object)
-    /// Used in AVM2 in DO::getBounds(), getRect(), width, height, hitTestObject()
-    /// Used in both AVM1 and AVM2 for Transform.pixelBounds.
     Script,
 }
 
@@ -1778,14 +1445,7 @@ struct DrawCacheInfo {
     bounds: Rectangle<Twips>,
     draw_offset: Point<i32>,
     filters: Vec<Filter>,
-    /// When drawing a stale (deferred) cache, the render-back offset that
-    /// matches the texture contents (see `BitmapCache::stale_anchor`), instead
-    /// of the one derived from the live bounds/draw_offset.
     offset_override: Option<Point<Twips>>,
-    /// This cache was switched on by us for AQW avatar art, not requested by
-    /// the content. Such a cache must not inherit `cacheAsBitmap`'s pixel
-    /// snapping, and must not be deferred: the object moves, so a stale or
-    /// snapped draw is visible as shaking or as art left behind.
     aqw_auto_cache: bool,
 }
 
@@ -1794,22 +1454,6 @@ const AQW_OFFSCREEN_CACHE_LIMIT_PIXELS: f64 = 512.0 * 512.0;
 const AQW_OFFSCREEN_CACHE_LIMIT_SIDE: f64 = 1024.0;
 const AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_PIXELS: u64 = 16_384;
 const AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_SIDE: u32 = 128;
-/// Consecutive deferred frames after which a starving cache may claim the
-/// aged-redraw quota (~1s at AQW's 24fps).
-///
-/// Measured in fullscreen during a Wicked Purgatory cast on 2026-08-05:
-/// `defer_max` sits pinned at exactly this value while `starved` and
-/// `redraw_aged` are both ~3 against a quota of ~96 per window, so every
-/// deferred cache rides the threshold to the end and the rescue quota is
-/// almost entirely idle. Lowering it to 4 was tried on the strength of that:
-/// it bounded the staleness as intended and **did not** fix the wrong colours
-/// it was aimed at, while tripling aged redraws. A deferred cache composites
-/// the old colour on its very first frame, so shortening the wait shortens
-/// each flash and removes none -- duration was never what made it visible.
-/// Reverted rather than shipped, since it was cost without a demonstrated
-/// benefit.
-///
-/// `RUFFLE_AQW_STALE_CACHE_FRAMES=N` overrides, for calibrating in the field.
 const AQW_STALE_CACHE_AGED_FRAMES_DEFAULT: u32 = 24;
 
 fn aqw_stale_cache_aged_frames() -> u32 {
@@ -1822,51 +1466,28 @@ fn aqw_stale_cache_aged_frames() -> u32 {
     })
 }
 
-/// How far (in twips, per axis) a deferred cache's live offset may drift from
-/// its stale anchor before the stale texture stops being a plausible stand-in.
-/// Ambient glow pulses move bounds by a few pixels; a weapon swing moves them
-/// by hundreds, and anchored old art then shows up visibly detached from the
-/// object. 16px covers the former and catches the latter.
 const AQW_STALE_ANCHOR_MAX_DRIFT_TWIPS: i32 = 16 * 20;
 
-/// Kill-switch: `RUFFLE_AQW_NO_STALE_ANCHOR` restores the old behavior of
-/// drawing deferred caches at the live bounds (the "glow drifts away from the
-/// weapon in a busy room" artifact), for field A/B without a rebuild.
 fn aqw_stale_anchor_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_STALE_ANCHOR", false))
 }
 
-/// Kill-switch: `RUFFLE_AQW_NO_STALE_GUARD` disables the drift guard and
-/// always draws deferred caches at their stale anchor, for field A/B.
 fn aqw_stale_guard_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_STALE_GUARD", false))
 }
 
-/// Kill-switch: `RUFFLE_AQW_NO_DRIFT_NORM` restores the fixed (~1x-calibrated)
-/// stale-anchor drift tolerance instead of scaling it by the view, for field
-/// A/B without a rebuild.
 fn aqw_drift_norm_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_DRIFT_NORM", false))
 }
 
-/// Kill-switch: `RUFFLE_AQW_NO_PADDED_CACHE` restores exact-size cache
-/// textures, for field A/B without a rebuild.
 fn aqw_padded_cache_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_PADDED_CACHE", false))
 }
 
-/// Round a cache texture dimension up to a coarse bucket. AQW's animated
-/// filtered clips change bounds by a few pixels every frame; allocating the
-/// exact size recreates the GPU texture (and every offscreen-pool target
-/// derived from it) each frame, and that allocate/destroy churn is what bloats
-/// driver memory in busy rooms. Buckets make those small bounds changes land
-/// on the same allocation. The padding margin is cleared transparent on every
-/// redraw and the on-screen quad covers the whole texture, so the drawn
-/// output is unchanged.
 fn quantize_cache_dimension(dim: u32) -> u32 {
     if dim <= 1024 {
         dim.next_multiple_of(32)
@@ -1875,49 +1496,21 @@ fn quantize_cache_dimension(dim: u32) -> u32 {
     }
 }
 
-/// VRAM pressure level (0 = none, 1 = soft, 2 = hard), updated about once per
-/// second by `aqw_cache_sweep` from the renderer's process GPU-memory report.
-/// Under pressure the per-frame cache-redraw quotas are clamped (see
-/// `Player::render`) so no new cache textures are allocated while the driver
-/// drains its deferred-destruction backlog.
 static AQW_VRAM_PRESSURE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 pub fn aqw_vram_pressure() -> u8 {
     AQW_VRAM_PRESSURE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Kill-switch: `RUFFLE_AQW_NO_VRAM_VALVE` disables the VRAM pressure valve.
 fn aqw_vram_valve_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_VRAM_VALVE", false))
 }
 
-// The thresholds this valve engages on are shared with the renderer, which
-// squeezes its pools off the same numbers; see `ruffle_render::backend` for the
-// field calibration behind them.
 use ruffle_render::backend::{
     AQW_POOL_HARD_MB, AQW_POOL_HARD_RELEASE_MB, AQW_POOL_SOFT_MB, AQW_POOL_SOFT_RELEASE_MB,
 };
 
-/// Refresh `AQW_VRAM_PRESSURE` from the renderer's process GPU-memory report.
-///
-/// Returns `(used_mb, budget_mb)` for the sweep log (`(0, 0)` if unavailable).
-///
-/// The valve is driven by how many bytes the offscreen render-target pool is
-/// retaining, NOT by the OS video-memory percentage. The DXGI reading is kept
-/// for the log only: `CurrentUsage` reports the driver's committed arena, which
-/// parks at a constant (measured: 4281 MB for a whole session, unmoved by room
-/// changes) while `Budget` fluctuates with unrelated system load. Dividing a
-/// parked constant by a noisy denominator made the valve engage on noise, and
-/// engaging clamps large redraws to zero - which is what left combat FX stale
-/// in ordinary full rooms (measured: `redraw_deferred` 736-1300 and
-/// `stale_fallback` 160-430 while engaged, both 0 with the valve released).
-/// Pool retention, by contrast, is our own number, responds to actual load, and
-/// separates the two regimes cleanly.
-///
-/// Hysteresis keeps the valve from flapping: the squeeze it triggers lowers the
-/// very quantity being measured, so engage and release thresholds are kept a
-/// wide band apart.
 fn update_aqw_vram_pressure(renderer: &mut dyn RenderBackend) -> (u64, u64) {
     use std::sync::atomic::Ordering;
 
@@ -1925,7 +1518,6 @@ fn update_aqw_vram_pressure(renderer: &mut dyn RenderBackend) -> (u64, u64) {
         AQW_VRAM_PRESSURE.store(0, Ordering::Relaxed);
         return (0, 0);
     }
-    // Diagnostics only - see the note above on why this is not the trigger.
     let (used_mb, budget_mb) = renderer
         .gpu_memory_info()
         .map(|(used, budget)| (used / (1024 * 1024), budget / (1024 * 1024)))
@@ -1979,8 +1571,6 @@ fn update_aqw_vram_pressure(renderer: &mut dyn RenderBackend) -> (u64, u64) {
     (used_mb, budget_mb)
 }
 
-/// Per-sweep-window counters for the AQW dirty-cache budget, reported by
-/// `aqw_cache_sweep` under diagnostics. Relaxed atomics; reset on each sweep.
 static AQW_CACHE_REDRAWS_LARGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AQW_CACHE_REDRAWS_SMALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AQW_CACHE_REDRAWS_AGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1988,48 +1578,21 @@ static AQW_CACHE_REDRAWS_DEFERRED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static AQW_CACHE_STALE_FALLBACKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-/// Longest run of consecutive deferred frames any one cache reached in the
-/// window: how stale the worst object on screen actually got, in frames.
 static AQW_CACHE_DEFER_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Deferrals of caches that were already past `aqw_stale_cache_aged_frames` and
-/// still lost -- the backlog queueing for the aged quota. Compared against
-/// `redraw_aged`, this says whether the threshold or the quota is the binding
-/// constraint, which want different fixes.
 static AQW_CACHE_STARVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AQW_BLEND_LAYERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Avatar-asset subtrees switched to a bitmap cache, cumulative.
 pub(crate) static AQW_AVATAR_CACHES_ENABLED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Kill-switch: `RUFFLE_AQW_NO_AVATAR_CACHE` restores live re-rendering of
-/// avatar art every frame, for field A/B without a rebuild.
 pub(crate) fn aqw_avatar_cache_disabled() -> bool {
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_AVATAR_CACHE", false))
 }
 
-/// Blend commands tallied by the SWF that emitted them, so a single expensive
-/// item can be named rather than inferred.
-///
-/// The field report is that frame rate tracks *which* items are on screen, not
-/// how many players are: one character page in a browser stutters on its own.
-/// Attributing blends to their source file is what turns that into a number.
-/// Diagnostics-only -- it allocates and locks per blend.
 static AQW_BLEND_BY_SWF: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
     std::sync::Mutex::new(None);
 
-/// These nine composite through a render pass of their own, and a pass costs a
-/// copy of the target plus a read of that copy -- a serialisation point the GPU
-/// cannot overlap with anything. The rest fold into fixed-function blend state
-/// on an ordinary draw. `blend_layers` counts both populations together, which
-/// is why it overstates: 42% of the non-Normal blends in the accumulated sweep
-/// are the cheap kind. Mirrors `BlendType::from` in
-/// `render/wgpu/src/blend.rs` -- if that mapping moves, this moves with it.
-///
-/// `Shader` is deliberately not counted here even though it also takes a pass
-/// of its own: the renderer tallies it separately from the nine, and the
-/// control this feeds (`blend_modes`) is the nine. AQW emits none.
 fn is_complex_blend(mode: ExtendedBlendMode) -> bool {
     matches!(
         mode,
@@ -2046,7 +1609,6 @@ fn is_complex_blend(mode: ExtendedBlendMode) -> bool {
 }
 
 fn note_blend_source(url: &str) {
-    // Just the file name; the directory is the same for every item.
     let name = url
         .rsplit(['/', '\\'])
         .next()
@@ -2059,15 +1621,12 @@ fn note_blend_source(url: &str) {
     }
     if let Ok(mut guard) = AQW_BLEND_BY_SWF.lock() {
         let counts = guard.get_or_insert_with(std::collections::HashMap::new);
-        // A room only ever holds so many distinct items; the cap is just to
-        // keep a pathological case from growing without bound.
         if counts.len() < 512 || counts.contains_key(name) {
             *counts.entry(name.to_owned()).or_insert(0) += 1;
         }
     }
 }
 
-/// Drains the per-SWF tally as `name:count`, busiest first, capped to `limit`.
 fn take_blend_sources(limit: usize) -> Vec<(String, u64)> {
     let Ok(mut guard) = AQW_BLEND_BY_SWF.lock() else {
         return Vec::new();
@@ -2081,27 +1640,9 @@ fn take_blend_sources(limit: usize) -> Vec<(String, u64)> {
     counts
 }
 
-/// Blend attribution, second generation. `blend_swfs` above names the *file* a
-/// blend came from, which was enough to convict one item in the V2.0 work but
-/// cannot answer the question left open after it: a cached subtree is supposed
-/// to collapse its blends into a single texture draw, so the ones still being
-/// emitted are either art no cache ever covers, or art whose cache is rebaked
-/// so often the cache buys nothing. Those two want opposite fixes and the file
-/// name cannot tell them apart -- the same SWF appears on both sides.
-///
-/// So each blend is booked against the *bake* it happened inside, or against
-/// the object itself when it happened live. A bake root that emits dozens
-/// means the cost is inside one subtree; many roots emitting one or two each
-/// means the cost is how many bakes there are.
-///
-/// Diagnostics-only: it locks and allocates per blend, and pushes a label per
-/// bake.
 struct BakeTally {
-    /// Bakes started with this object as the outermost cached root.
     bakes: u64,
-    /// Complex blends emitted anywhere inside those bakes.
     complex: u64,
-    /// Everything else non-Normal, which the renderer folds into blend state.
     trivial: u64,
 }
 
@@ -2109,40 +1650,21 @@ static AQW_BLEND_BY_BAKE: std::sync::Mutex<Option<std::collections::HashMap<Stri
     std::sync::Mutex::new(None);
 static AQW_BLEND_BY_LIVE: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
     std::sync::Mutex::new(None);
-/// The same name for the trivial ones. They were left anonymous while they
-/// were assumed to be the cheap half; the renderer-side measurement says they
-/// take a full-surface target each and fill 1% of it, so which art emits them
-/// is the same question naming `ReignoldKnightCC` answered for the complex
-/// ones.
 static AQW_BLEND_BY_LIVE_TRIVIAL: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
     std::sync::Mutex::new(None);
 
-/// Complex blends split by where they were emitted from. Read against
-/// `blend_modes`, whose sum is the renderer's own count of the same passes:
-/// `blend_bake + blend_live` has to land on it, or something is emitting
-/// blends this attribution never sees and the split below describes a fraction.
 static AQW_BLEND_COMPLEX_BAKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AQW_BLEND_COMPLEX_LIVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AQW_BLEND_TRIVIAL_BAKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AQW_BLEND_TRIVIAL_LIVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Bakes started, and the deepest nesting reached. A cache inside a bake is
-/// possible since the filtered-children exemption (2026-08-06), so depth is
-/// worth watching: it multiplies the work a single outer bake stands for.
 static AQW_BAKES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AQW_BAKE_DEPTH_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 thread_local! {
-    /// The chain of cache bakes currently being rendered into. Rendering is
-    /// single-threaded, and `render_base` pushes on the way into an offscreen
-    /// context and pops on the way out, so the bottom of this stack is the
-    /// outermost cached root a blend is being emitted underneath.
     static AQW_BAKE_STACK: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// `Class@file.swf` -- what a reader needs to find the art. The class name is
-/// the useful half (`town-battleon` holds hundreds of distinct clips), the file
-/// is what can actually be downloaded and opened.
 fn aqw_blend_label<'gc>(this: DisplayObject<'gc>) -> String {
     let class = this
         .object2()
@@ -2167,9 +1689,6 @@ fn aqw_blend_label<'gc>(this: DisplayObject<'gc>) -> String {
     }
 }
 
-/// Marks the subtree rendered inside `this`'s cache bake, so blends emitted
-/// under it are booked against `this`. Pops on drop, which is what keeps the
-/// stack balanced through the early returns in the render path.
 struct AqwBakeScope(bool);
 
 impl AqwBakeScope {
@@ -2186,8 +1705,6 @@ impl AqwBakeScope {
             stack.len() as u64
         });
         AQW_BAKE_DEPTH_MAX.fetch_max(depth, Relaxed);
-        // Booked at the outermost root, the same place its blends will be, so
-        // the ratio in `bake_top` is blends per bake of that root.
         if depth == 1
             && let Ok(mut guard) = AQW_BLEND_BY_BAKE.lock()
         {
@@ -2217,13 +1734,6 @@ impl Drop for AqwBakeScope {
     }
 }
 
-/// Books one emitted blend. `owner` is the outermost bake root when this blend
-/// happened inside a bake, and `None` when it was drawn live.
-///
-/// Called where the blend is actually handed to the renderer, not where the
-/// object's blend mode is read: an object whose subtree drew nothing has its
-/// blend thrown away, and counting at the top would book passes that never
-/// exist. That gap is a large part of why `blend_layers` reads high.
 fn note_blend_emitted<'gc>(this: DisplayObject<'gc>, owner: Option<&str>, complex: bool) {
     use std::sync::atomic::Ordering::Relaxed;
     match (owner.is_some(), complex) {
@@ -2246,9 +1756,6 @@ fn note_blend_emitted<'gc>(this: DisplayObject<'gc>, owner: Option<&str>, comple
             }
         }
         None => {
-            // Live blends are the population the caching was supposed to
-            // remove, so both kinds are worth a name -- the trivial ones cost
-            // a target of their own just the same, they only save the pass.
             let label = aqw_blend_label(this);
             let tally = if complex {
                 note_live_blend_ancestry(this);
@@ -2266,8 +1773,6 @@ fn note_blend_emitted<'gc>(this: DisplayObject<'gc>, owner: Option<&str>, comple
     }
 }
 
-/// The bake a blend emitted right now belongs to: the outermost one, since
-/// that is the cache whose texture the whole lot ends up inside.
 fn aqw_current_bake() -> Option<String> {
     if !aqw_diagnostics_enabled() {
         return None;
@@ -2275,34 +1780,13 @@ fn aqw_current_bake() -> Option<String> {
     AQW_BAKE_STACK.with(|stack| stack.borrow().first().cloned())
 }
 
-/// Every off-screen-cache bypass, and how many of those were on art that was
-/// actually on screen. Before the coordinate fix, `bypass_onscreen` was the
-/// number that showed the mismatch was live rather than latent: it came back
-/// equal to `bypass_all`, every bypass in the session landing on visible art.
-///
-/// With the fix in place the bypass makes the same comparison this probe does,
-/// so `bypass_onscreen` is now a regression guard and belongs at zero. If it
-/// climbs again, the two have drifted back apart.
 static AQW_CACHE_BYPASS_ALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AQW_CACHE_BYPASS_ONSCREEN: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-/// Caches the fix kept alive: off-screen by the old comparison, on-screen by
-/// the corrected one.
 static AQW_CACHE_BYPASS_SAVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AQW_BYPASS_BY_OBJECT: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
     std::sync::Mutex::new(None);
 
-/// Books one bypass, and decides whether it was justified.
-///
-/// The bypass compares `bounds` -- which carries the whole render transform
-/// stack, viewport matrix included -- against `stage.view_bounds()`, which is
-/// set in `stage.rs::build_matrices` as `stage_tx * view_bounds` and so is in
-/// stage pixels with no viewport applied. Every other consumer of
-/// `view_bounds` in the tree (`graphic.rs`, `bitmap.rs`, `edit_text.rs`,
-/// `video.rs`, and our own sweep) compares it against engine-space world
-/// bounds. Putting the view rect through `view_matrix()` lands it in the same
-/// space `bounds` is already in, which is the cheaper of the two corrections
-/// because the bounds traversal has been done by this point.
 fn note_cache_bypass<'gc>(
     this: DisplayObject<'gc>,
     context: &RenderContext<'_, 'gc>,
@@ -2325,7 +1809,6 @@ fn note_cache_bypass<'gc>(
     }
 }
 
-/// Drains the wrongly-bypassed tally as `Class@file:count`, busiest first.
 fn take_bypassed_objects(limit: usize) -> Vec<String> {
     let Ok(mut guard) = AQW_BYPASS_BY_OBJECT.lock() else {
         return Vec::new();
@@ -2342,34 +1825,13 @@ fn take_bypassed_objects(limit: usize) -> Vec<String> {
         .collect()
 }
 
-/// Whether any ancestor of a live blend carries a bitmap cache.
-///
-/// This is the other half of the same question, and it needs no probe on the
-/// cache side to interpret: if an ancestor had a cache that was engaged this
-/// frame, we would either not be rendering at all (clean cache, parent draws
-/// its texture) or be inside its bake and booked against it. So a blend
-/// arriving here live means no ancestor cache took effect -- and the split is
-/// between "no ancestor ever wanted one" and "an ancestor wanted one and it
-/// was suppressed", which are different bugs with different fixes.
 static AQW_BLEND_LIVE_NO_CACHE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AQW_BLEND_LIVE_HAD_CACHE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// What caching a given ancestor would buy, and what it would cost to buy it.
-///
-/// Both halves are needed and the fork has twice been tempted to decide on the
-/// first alone. A blend pass is not priced by how many there are but by the
-/// area each one covers, so two hundred tiny blends can be cheaper left alone
-/// than collapsed into a bake that has to cover the screen. `blends` is the
-/// prize, `area_px` is the price.
 struct LiveAncestorTally {
-    /// Live complex blends emitted anywhere under this ancestor.
     blends: u64,
-    /// What a bake of this ancestor would have to cover, in stage pixels,
-    /// sampled once per window because it costs a bounds traversal.
     area_px: u64,
-    /// How far above the emitter this ancestor sits. Shallow and cheap is the
-    /// shape worth having; the deepest ancestors are whole maps.
     depth: u32,
 }
 
@@ -2377,22 +1839,9 @@ static AQW_BLEND_LIVE_BY_ANCESTOR: std::sync::Mutex<
     Option<std::collections::HashMap<String, LiveAncestorTally>>,
 > = std::sync::Mutex::new(None);
 
-/// Frames in which an object's subtree announced a change, by the same label
-/// `live_cand` uses, so the two can be read together.
-///
-/// This is the half of the price that count-and-area misses. A bake is not paid
-/// once: it is paid again every time the contents change, and a candidate that
-/// changes every frame charges its whole area every frame. Static art collapses
-/// its blends once and lives on the result; animated map art may cost more
-/// baked than it did live, which is exactly why "cache the map" has stayed open
-/// since 2026-08-08 rather than being tried.
-static AQW_CONTENT_DIRTY_FRAMES: std::sync::Mutex<
-    Option<std::collections::HashMap<String, u64>>,
-> = std::sync::Mutex::new(None);
+static AQW_CONTENT_DIRTY_FRAMES: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+    std::sync::Mutex::new(None);
 
-/// Sampled from `pre_render`, the last point where the invalidation flag is
-/// still set. Cheap by construction: a flag read per object per frame, and a map
-/// touch only for the ones that actually changed.
 fn note_content_dirty_frame<'gc>(this: DisplayObject<'gc>) {
     let label = aqw_blend_label(this);
     let Ok(mut guard) = AQW_CONTENT_DIRTY_FRAMES.lock() else {
@@ -2404,14 +1853,6 @@ fn note_content_dirty_frame<'gc>(this: DisplayObject<'gc>) {
     }
 }
 
-/// Drains the per-ancestor tally as `Class@file:blends/areaKpx/depth/dirty`,
-/// by prize.
-///
-/// Read `dirty` against `render_frames` on the same line: at `render_frames` the
-/// candidate changes every frame and a bake of it recurs in full every frame;
-/// near zero it collapses its blends once and the texture then costs nothing.
-/// Prize and area alone cannot tell those two apart, and they are the difference
-/// between a cache that pays and one that doubles the bill.
 fn take_live_ancestors(limit: usize) -> Vec<String> {
     let dirty = AQW_CONTENT_DIRTY_FRAMES
         .lock()
@@ -2441,40 +1882,15 @@ fn take_live_ancestors(limit: usize) -> Vec<String> {
         .collect()
 }
 
-/// Why an object that asked to be cached ended up drawing itself instead.
-///
-/// `live_hadcache` says this happened; it cannot say which of six unrelated
-/// branches did it, and each one has a different fix. Two hypotheses were spent
-/// guessing between them on 2026-08-12 -- the size ceiling and redraw admission,
-/// both raised/disabled with the counter unmoved -- before it was cheaper to
-/// just record the branch. Same move that split `dirty_matrix`.
 #[derive(Copy, Clone)]
 pub(crate) enum CacheSuppressReason {
-    /// Caching is switched off for this context: the object sits inside an AQW
-    /// bake, which disables descendant caches on purpose, and it is not one of
-    /// the filtered children exempted from that.
     NotHere,
-    /// The offscreen-cache bypass threw it away.
     Bypassed,
-    /// Bounds beyond what the cache dimensions can express at all.
     OversizeU16,
-    /// The redraw was admitted, `update` ran, and no texture came back with a
-    /// non-zero rect to allocate -- so the size gates refused it, or the
-    /// renderer did. The `Skipping bitmap cache allocation` line separates
-    /// those two, and it fires once per cache.
     AllocRefused,
-    /// `update` ran on a rect with a zero side. `NonZero` then refuses the
-    /// allocation before any size gate is consulted, so the cache never gets a
-    /// texture, the subtree draws itself, and every blend inside it becomes its
-    /// own live pass -- for as long as the object exists, since nothing in that
-    /// state repairs itself. The detail carries the bounds that produced it.
     AllocZero,
-    /// Deferred, with no texture yet to stand in with.
     DeferredNoTexture,
-    /// Deferred, holding a texture, but the object has moved too far from where
-    /// that texture was rendered for it to be a plausible stand-in.
     DriftFallback,
-    /// Not dirty and still no texture, which should not happen.
     CleanNoTexture,
 }
 
@@ -2493,9 +1909,8 @@ impl CacheSuppressReason {
     }
 }
 
-static AQW_CACHE_SUPPRESSED: std::sync::Mutex<
-    Option<std::collections::HashMap<String, u64>>,
-> = std::sync::Mutex::new(None);
+static AQW_CACHE_SUPPRESSED: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+    std::sync::Mutex::new(None);
 
 fn note_cache_suppressed<'gc>(
     this: DisplayObject<'gc>,
@@ -2515,7 +1930,6 @@ fn note_cache_suppressed<'gc>(
     }
 }
 
-/// Drains the suppression tally as `reason|Class@file:count`, busiest first.
 fn take_cache_suppressed(limit: usize) -> Vec<String> {
     take_live_blend_tally(&AQW_CACHE_SUPPRESSED, limit)
 }
@@ -2527,12 +1941,6 @@ fn note_live_blend_ancestry<'gc>(this: DisplayObject<'gc>) {
     let mut had_cache = false;
     while let Some(parent) = node {
         depth += 1;
-        // Every ancestor is a candidate: caching any one of them would collapse
-        // every blend below it into a single draw. Which one is worth it is the
-        // question this answers, and it is deliberately answered for all of
-        // them rather than for a hand-picked "root", because every hand-drawn
-        // class this fork has written -- avatar asset roots in V2.0 -- has been
-        // missed by the next heavy thing the game shipped.
         note_live_blend_candidate(parent, depth);
         if parent.is_bitmap_cached() {
             AQW_BLEND_LIVE_HAD_CACHE.fetch_add(1, Relaxed);
@@ -2560,13 +1968,9 @@ fn note_live_blend_candidate<'gc>(ancestor: DisplayObject<'gc>, depth: u32) {
     if counts.len() >= 512 {
         return;
     }
-    // Only on first sight in this window: a bounds traversal of a whole map
-    // subtree is not something to run per blend. Stage pixels, deliberately --
-    // the surface size follows from the view scale, and pricing a candidate
-    // should not change with the window.
     let bounds = ancestor.world_bounds(BoundsMode::Engine);
-    let area_px = (bounds.width().to_pixels().max(0.0) * bounds.height().to_pixels().max(0.0))
-        as u64;
+    let area_px =
+        (bounds.width().to_pixels().max(0.0) * bounds.height().to_pixels().max(0.0)) as u64;
     counts.insert(
         label,
         LiveAncestorTally {
@@ -2577,7 +1981,6 @@ fn note_live_blend_candidate<'gc>(ancestor: DisplayObject<'gc>, depth: u32) {
     );
 }
 
-/// Drains the per-bake tally as `Class@file:bakes/complex`, busiest first.
 fn take_bake_blends(limit: usize) -> Vec<String> {
     let Ok(mut guard) = AQW_BLEND_BY_BAKE.lock() else {
         return Vec::new();
@@ -2594,12 +1997,10 @@ fn take_bake_blends(limit: usize) -> Vec<String> {
         .collect()
 }
 
-/// Drains the live-blend tally as `Class@file:complex`, busiest first.
 fn take_live_blends(limit: usize) -> Vec<String> {
     take_live_blend_tally(&AQW_BLEND_BY_LIVE, limit)
 }
 
-/// The same, for the blends that fold into blend state.
 fn take_live_trivial_blends(limit: usize) -> Vec<String> {
     take_live_blend_tally(&AQW_BLEND_BY_LIVE_TRIVIAL, limit)
 }
@@ -2622,10 +2023,6 @@ fn take_live_blend_tally(
         .map(|(name, count)| format!("{name}:{count}"))
         .collect()
 }
-/// Frame-tick phase accounting (nanoseconds per sweep window) filled in by
-/// `run_all_phases_avm2`, plus how many orphan subtrees the orphan freeze
-/// skipped. Splits the tick cost between orphan processing, the on-stage
-/// tree, and event broadcasts, so a CPU-bound tick names its hot phase.
 pub(crate) static AQW_TICK_ORPHAN_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static AQW_TICK_STAGE_NS: std::sync::atomic::AtomicU64 =
@@ -2635,49 +2032,14 @@ pub(crate) static AQW_TICK_BCAST_NS: std::sync::atomic::AtomicU64 =
 pub(crate) static AQW_ORPHANS_FROZEN: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Why a bitmap cache was found dirty, for the sweep's `dirty_*` columns.
 #[derive(Copy, Clone)]
 pub(crate) enum CacheDirtyReason {
-    /// The cache holds no texture, so there is nothing to composite and the
-    /// redraw is forced. Nothing the content does causes this -- only a
-    /// `clear()`, or an allocation that was refused.
     NoTexture,
-    /// The subtree's pixel size changed.
     Size,
-    /// Something inside the subtree announced that it changed, through
-    /// `invalidate_cached_bitmap`. That is the only way a change that leaves
-    /// the box and the transform alone -- a colour write, a child swapped for
-    /// another of the same size -- can reach the cache at all, since `is_dirty`
-    /// compares nothing but geometry. It is recorded by poisoning `matrix_a`
-    /// with NaN, so it arrives here indistinguishable from a real transform
-    /// change unless it is picked out first; separating the two is the point of
-    /// this variant.
     Invalidated,
-    /// The composed transform changed: the object moved or scaled, or the
-    /// window resized under it.
     Matrix,
 }
 
-/// Dirty-cache attribution, plus how many caches the offscreen-cache bypass
-/// threw away.
-///
-/// `dirty_notex` tracking `bypass_cleared` is the signature to look for: a
-/// cache cleared and then immediately rebuilt is work the content never asked
-/// for, and the bypass that clears it compares two different coordinate spaces
-/// (`render_bounds_with_transform`, which carries the viewport matrix, against
-/// `stage.view_bounds()`, which does not). At the view scale this fork runs, the
-/// rectangle it calls "on screen" is a fraction of the stage, so art in plain
-/// view is judged off it.
-/// Bakes bucketed by how many times that same cache had already been baked:
-/// first ever, 2-4, 5-24, 25-120, and beyond.
-///
-/// This is the fork the bake investigation turns on, and `bake_top` cannot
-/// answer it because it attributes by class. A class showing 37 bakes a window
-/// is either one object rebaking almost every frame -- a cache that buys
-/// nothing and charges for the privilege, fixable by refusing to cache art that
-/// keeps dirtying -- or 37 short-lived objects baking once each, which is
-/// honest work and needs a different fix entirely. Mass in the first bucket
-/// means the second reading; mass in the last two means the first.
 static AQW_BAKE_REPEAT_HIST: [std::sync::atomic::AtomicU64; 5] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -2700,9 +2062,6 @@ fn aqw_note_bake_repeat(bake_count: u32) {
     AQW_BAKE_REPEAT_MAX.fetch_max(u64::from(bake_count), Relaxed);
 }
 
-/// Drains the repeat tally as `(hist, max)`. The max is a lifetime figure for
-/// whichever cache has baked most, so it does not reset with the window --
-/// which is what makes a single long-lived offender visible at all.
 fn take_bake_repeats() -> ([u64; 5], u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let hist = std::array::from_fn(|i| AQW_BAKE_REPEAT_HIST[i].swap(0, Relaxed));
@@ -2715,58 +2074,13 @@ pub(crate) static AQW_CACHE_DIRTY_SIZE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static AQW_CACHE_DIRTY_MATRIX: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-/// The share of what used to be counted as `dirty_matrix` that is really a
-/// content change announced from inside the subtree (`CacheDirtyReason::
-/// Invalidated`). The two were indistinguishable until 2026-08-12, which is why
-/// the plan of "defer geometry, never defer colour" could not be written: the
-/// signal it assumed exists in the sweep did not.
 pub(crate) static AQW_CACHE_DIRTY_INVALID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-/// Redraws that skipped the budget because the cache had not been dirty long
-/// enough to be eligible for deferral (`aqw_defer_eligible_frames`). This is
-/// the *added* work the grace window buys, not deferrals it prevented -- the
-/// budget might well have admitted them anyway. Read it against `redraw_large`
-/// and `redraw_small`: if it approaches their sum, the grace has eaten the
-/// budget instead of carving an exception out of it, which is how the
-/// 2026-07-30 attempt at exempting colour-dirty caches failed.
 pub(crate) static AQW_CACHE_DEFER_GRACE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static AQW_CACHE_BYPASS_CLEARED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// What the orphan list is made of, and what a skip could win.
-///
-/// Measured 2026-08-07: opening the inventory and switching class takes the
-/// orphan list from ~105 to 3010 and `tick_orphan_ms` from ~240 to 1720 per
-/// ~2s window -- 86% of a core, on a CPU whose single-core speed is AQW's real
-/// cap -- and neither number comes back down for the rest of the session. Only
-/// ~200 of those orphans are frozen, because the V1.4 freeze only matches
-/// avatar art. The history says this is chronic rather than new: past sessions
-/// peak at 3000-5700 orphans and 1800-2800ms.
-///
-/// Two candidate fixes need different facts, so this measures both at once:
-///
-/// - widening the *freeze* (low risk, the mechanism and its kill-switch exist)
-///   needs the population split -- how many orphans are inert and why.
-/// - extending the V2.5 subtree mark to the ordinary tick (it is deliberately
-///   nested-goto-only, see `can_skip_frame_pass`, because the ordinary frame is
-///   the safety net for a mark the scheme fails to set) needs the *prize*:
-///   `orph_clean_ms` is the time that a mark-driven skip would not have spent.
-///
-/// Population counters are per tick, from the Enter pass; the `_ns` pair covers
-/// all three passes. Diagnostics-only: one timer pair per orphan visit.
-/// How far a cache invalidation travelled to reach the cache it dirtied.
-///
-/// `invalidate_cached_bitmap` walks up from whatever changed, so a cache is
-/// dirtied either by its own geometry or by a descendant some levels down. The
-/// two call for opposite fixes and the bake counters cannot tell them apart: a
-/// cache that keeps dirtying *itself* is one that should not exist, and the
-/// question is whether it pays for its bakes. A cache dirtied from *below* sits
-/// above the animation, and no threshold fixes that -- it is placed wrong, and
-/// tearing it down only chooses which half of the loss to keep paying.
-///
-/// Bucketed by distance from the origin: itself, one level, two or three,
-/// deeper.
 static AQW_INVALIDATE_DEPTH: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -2774,20 +2088,13 @@ static AQW_INVALIDATE_DEPTH: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
-/// Which objects set off invalidations that reached an *ancestor's* cache --
-/// "what is animating in there", answered by name rather than by guess.
 static AQW_INVALIDATE_ORIGIN: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
     std::sync::Mutex::new(None);
 
 thread_local! {
-    /// Zero only for the object the invalidation started at, which is the one
-    /// worth attributing. Without it the walk below would run again at every
-    /// level the recursion climbs.
     static AQW_INVALIDATE_ORIGIN_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-/// Diagnostics-only: walk what the invalidation is about to walk, recording
-/// every cache it will dirty and how far up it is.
 fn aqw_note_invalidation(origin: DisplayObject<'_>) {
     use std::sync::atomic::Ordering::Relaxed;
     let mut node = Some(origin);
@@ -2821,25 +2128,15 @@ fn aqw_note_invalidation(origin: DisplayObject<'_>) {
     }
 }
 
-/// Drains the depth histogram as `self/d1/d2-3/d4+`.
 fn take_invalidate_depth() -> [u64; 4] {
     use std::sync::atomic::Ordering::Relaxed;
     std::array::from_fn(|i| AQW_INVALIDATE_DEPTH[i].swap(0, Relaxed))
 }
 
-/// Drains the origin tally as `Class@file:count`, busiest first.
 fn take_invalidate_origins(limit: usize) -> Vec<String> {
     take_live_blend_tally(&AQW_INVALIDATE_ORIGIN, limit)
 }
 
-/// Inert probes that ran out of budget before reaching a verdict, and so left
-/// their subtree unfrozen however inert it was.
-///
-/// The direct reading of whether the budget is the binding constraint: it is
-/// non-zero exactly when a subtree is too big to judge, and those are the same
-/// subtrees whose walk costs the most. Raising `RUFFLE_AQW_INERT_PROBE_BUDGET`
-/// should drive this to zero and `orph_clean_ms` down with it; if this stays
-/// high after raising it, the budget was not what was stopping the freeze.
 pub(crate) static AQW_ORPHAN_PROBE_EXHAUSTED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -2862,8 +2159,6 @@ pub(crate) static AQW_ORPHAN_CLEAN_NS: std::sync::atomic::AtomicU64 =
 pub(crate) static AQW_ORPHAN_DIRTY_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Bill one orphan visit to the clean/dirty split, `clean` being what the V2.5
-/// subtree mark says about it.
 pub(crate) fn aqw_note_orphan_visit(clean: bool, elapsed_ns: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     if clean {
@@ -2875,51 +2170,17 @@ pub(crate) fn aqw_note_orphan_visit(clean: bool, elapsed_ns: u64) {
     }
 }
 
-/// AS3 clips whose timeline actually advanced in `enter_frame`, against
-/// `aqw_clips` (every clip walked).
-///
-/// Measured 2026-08-01: `stage_enter_ms` is 98% of the stage tick, and two
-/// windows with the same clip count differed 21x in cost -- so the driver is
-/// how many clips are *playing*, not how many exist. A frame script that
-/// throws abandons everything after it, including the `stop()` that authored
-/// timelines almost always end on (see the note on Error #1009), which would
-/// leave clips advancing forever. This ratio is what tells those apart.
 pub(crate) static AQW_CLIPS_ADVANCED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Nanoseconds inside `run_frame_internal`, the timeline-advance half of
-/// `enter_frame`. `stage_enter_ms` minus this is the cost of the tree walk
-/// itself -- the recursion, and the queued-tag work every AS3 clip does
-/// whether or not it is playing.
-///
-/// Needed because neither clip count nor playing count predicts the cost:
-/// measured 2026-08-01, one window walked 9277 clips with 596 advancing for
-/// 124ms, another walked 8079 with 71 advancing for 2253ms.
 pub(crate) static AQW_RUNFRAME_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Time in `broadcast_frame_entered`. Nested inside the stage's `enter_frame`,
-/// so `stage_enter_ms` has been reporting it as walk cost all along.
 pub(crate) static AQW_BCAST_ENTER_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// `run_goto` cost, calls, and frames stepped through.
-///
-/// AQW's aura cooldown handler (`playerAuras.countDownAct`) drives a 90-frame
-/// mask with `gotoAndStop` on four segments per aura per frame, and a backward
-/// goto restarts at frame 1 and replays forward. Whether that is what makes
-/// each handler call cost ~5.4ms, or whether the cost is elsewhere in the
-/// handler, is the difference between fixing timeline seeking and fixing
-/// something else -- so it gets measured rather than assumed.
 pub(crate) static AQW_GOTO_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// `run_goto` split into its three phases, plus placement tags parsed.
-///
-/// A goto costs ~1.4ms while stepping 12-17 frames -- about 100us per frame,
-/// far more than reading a handful of tags should take. The phases have very
-/// different fixes: scanning is tag parsing (a `PlaceObject3` parse allocates
-/// for filters and name), removal walks the render list, and applying
-/// instantiates or updates children. Measure before rewriting any of them.
 pub(crate) static AQW_GOTO_SCAN_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static AQW_GOTO_REMOVE_NS: std::sync::atomic::AtomicU64 =
@@ -2929,29 +2190,9 @@ pub(crate) static AQW_GOTO_APPLY_NS: std::sync::atomic::AtomicU64 =
 pub(crate) static AQW_GOTO_TAGS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// The apply phase split again: placing children (`run_goto_command` over the
-/// merged commands) against `run_inner_goto_frame`, the recursive frame an
-/// explicit goto runs afterwards.
-///
-/// Apply is 98% of a goto -- scanning tags is 1.7% -- so this is the cut that
-/// says whether the cost is placing objects or re-running a whole frame.
-/// Gotos that skipped the recursive frame because they changed nothing that
-/// needs one.
 pub(crate) static AQW_GOTO_FAST: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Opt-in, and off by default because it is **not** semantically correct.
-///
-/// Skipping the recursive frame breaks 10 timeline tests
-/// (`movieclip_gotoandstop_queueing`, `movieclip_displayevents_*`,
-/// `swf_10_queued_goto_scripts_construct`, ...): the frame is a *global*
-/// operation -- it broadcasts `frameConstructed`/`exitFrame`, runs other
-/// clips' frame scripts, and drains queued tags -- so "this clip changed
-/// nothing structural" is not a sound reason to skip it.
-///
-/// Kept behind `RUFFLE_AQW_GOTO_FASTPATH=1` only to measure the ceiling: it
-/// takes an aura goto from 6600us to roughly what SWF 9 content pays. The
-/// real fix is to make the recursive frame cheap rather than to skip it.
 pub(crate) fn aqw_goto_fastpath_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_GOTO_FASTPATH", false))
@@ -2968,11 +2209,9 @@ pub(crate) static AQW_GOTO_REWINDS: std::sync::atomic::AtomicU64 =
 pub(crate) static AQW_GOTO_FRAMES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Broadcast-handler time by listener class, for calls over 0.1ms.
 static AQW_LISTENER_COST: std::sync::Mutex<Option<std::collections::HashMap<String, (u64, u64)>>> =
     std::sync::Mutex::new(None);
 
-/// Record one handler call. `(calls, nanoseconds)` per class.
 pub(crate) fn aqw_note_listener_cost(class: String, ns: u64) {
     if let Ok(mut guard) = AQW_LISTENER_COST.lock() {
         let entry = guard
@@ -2984,7 +2223,6 @@ pub(crate) fn aqw_note_listener_cost(class: String, ns: u64) {
     }
 }
 
-/// Top `n` listener classes since the last call, as `Class=ms/calls`.
 fn aqw_listener_cost_top(n: usize) -> String {
     let Ok(mut guard) = AQW_LISTENER_COST.lock() else {
         return String::new();
@@ -2992,8 +2230,6 @@ fn aqw_listener_cost_top(n: usize) -> String {
     let Some(map) = guard.as_mut() else {
         return String::new();
     };
-    // Microseconds, so a handler that is cheap per call but runs constantly is
-    // still visible instead of rounding to zero.
     let mut rows: Vec<_> = map
         .iter()
         .map(|(class, (calls, ns))| (ns / 1_000, *calls, class.clone()))
@@ -3007,13 +2243,6 @@ fn aqw_listener_cost_top(n: usize) -> String {
         .join(",")
 }
 
-/// `run_inner_goto_frame_impl` split into its steps.
-///
-/// The subtree skip took `gotoAndStop` from ~1590us to ~500us per call, but it
-/// only covers the two stage walks. The nested frame also iterates every orphan
-/// twice and runs `cleanup_dead_orphans`, none of which the skip touches, and at
-/// ~2000 nested frames per window against 99-1755 orphans that is a plausible
-/// remainder. Measure which step it actually is before changing any of them.
 pub(crate) static AQW_INNER_ORPHAN_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static AQW_INNER_STAGE_NS: std::sync::atomic::AtomicU64 =
@@ -3025,18 +2254,6 @@ pub(crate) static AQW_INNER_CLEANUP_NS: std::sync::atomic::AtomicU64 =
 pub(crate) static AQW_INNER_FRAMES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// The orphan loops are 70-77% of the nested frame, but the cost barely moves
-/// between 85 and 2943 orphans, so it is not obviously proportional to the list.
-/// These separate the two candidates: `VISITS` counts every orphan the loops
-/// hand to the callback, `WORK` counts the ones that were actually dirty. If
-/// visits dominate, the fix is to stop iterating; if work does, the fix is to
-/// stop those orphans from staying dirty.
-/// Why the orphan gate reopens. It engages while the orphan list is small but
-/// stops working once the list balloons (measured: 1490 of 1514 nested frames
-/// found it open at 1719 orphans), so something bumps the epoch on nearly every
-/// goto. The two candidates need opposite fixes: `ORPHAN_ADDS` means gotos are
-/// orphaning children, `MARK_BUMPS` means marks are terminating outside the
-/// stage tree.
 pub(crate) static AQW_GATE_OPEN: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static AQW_ORPHAN_ADDS: std::sync::atomic::AtomicU64 =
@@ -3049,43 +2266,17 @@ pub(crate) static AQW_INNER_ORPHAN_VISITS: std::sync::atomic::AtomicU64 =
 pub(crate) static AQW_INNER_ORPHAN_WORK: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// The queued-tag half of `enter_frame`, which `runframe_ms` does not cover:
-/// draining the pending `PlaceObject` queue (`unqueue_ms`) and executing those
-/// tags (`place_ms`, `places` = tags run).
-///
-/// This is the last unmeasured block in the phase. Everything else has been
-/// ruled out by measurement: timeline advance is ~5ms, render-list copies run
-/// 3-15 per frame at one element each, and the fork's own hook is 2%.
 pub(crate) static AQW_UNQUEUE_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static AQW_PLACE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static AQW_PLACE_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Render-list deep copies forced by `Rc::make_mut`, and elements copied.
-///
-/// `enter_frame` keeps a `RenderIter` alive at every level while it recurses,
-/// and each one holds a strong `Rc` to that container's render list. Any child
-/// added or removed while the walk is in flight therefore clones the whole
-/// list instead of mutating it in place -- by design, so iteration stays valid
-/// (see the comment on `ChildContainer::render_list`), but the cost lands on
-/// exactly the workload that churns children fastest.
-///
-/// Measured 2026-08-01: walking a constant ~8800 clips cost 0.12us/clip at
-/// rest and 11.19us/clip during skill spam, with timeline advance flat at
-/// ~2ms. These two counters are what tie that 100x to the copies.
 pub(crate) static AQW_RENDERLIST_COPIES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static AQW_RENDERLIST_COPIED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// `tick_stage_ms` split by phase.
-///
-/// The three stage passes cost very different things -- advancing timelines,
-/// constructing newly placed objects, and running the content's own frame
-/// scripts -- and summing them hides which one grew. Measured 2026-08-01: the
-/// total is 42-58ms/frame on the updated game while the fork's own per-clip
-/// hook accounts for ~1.2ms of it, so the answer is in here.
 pub(crate) static AQW_STAGE_ENTER_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static AQW_STAGE_CTOR_NS: std::sync::atomic::AtomicU64 =
@@ -3093,23 +2284,10 @@ pub(crate) static AQW_STAGE_CTOR_NS: std::sync::atomic::AtomicU64 =
 pub(crate) static AQW_STAGE_SCRIPT_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Clips the per-clip AQW timeline hook ran on, and nanoseconds it spent, per
-/// sweep window.
-///
-/// `enter_frame` calls that hook on every `MovieClip` in the tree, so its cost
-/// scales with the size of the display list rather than with anything AQW-
-/// specific. The counters separate it from the rest of the stage phases, which
-/// `tick_stage_ms` lumps together with the game's own frame scripts -- without
-/// them there is no way to tell a hook that got expensive from content that
-/// got heavier.
 pub(crate) static AQW_HOOK_CLIPS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static AQW_HOOK_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Kill-switch for the per-clip AQW timeline hook, so its whole cost can be
-/// taken out in the field for an A/B without a rebuild. Turning it off also
-/// turns off the avatar cache and both freezes, so compare `tick_stage_ms`
-/// (CPU) rather than frame rate.
 pub(crate) fn aqw_throttle_hook_disabled() -> bool {
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_THROTTLE_HOOK", false))
@@ -3152,47 +2330,21 @@ fn slice_matrix(
     })
 }
 
-/// Test toggle: when `RUFFLE_AQW_NO_SCALE9` is set, the 9-slice scaling path is
-/// disabled, so we can measure its FPS cost against the visual fix it provides.
 fn aqw_scale9_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_SCALE9", false))
 }
 
 thread_local! {
-    /// When the stage viewport last changed size (a window resize). Set from
-    /// `Stage::build_matrices`; read by the 9-slice path below.
     static LAST_AQW_RESIZE: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
 }
 
-/// How long after a resize the AQW 9-slice path stays disabled. A resize
-/// invalidates every bitmap cache at once; in a crowded room the per-frame
-/// redraw budget can't refresh them all immediately, and AQW simultaneously
-/// re-lays-out its HUD by real pixels. During that storm the 9-slice path can
-/// paint a panel (e.g. the gold/exp bar) black, and a deferred parent cache
-/// freezes that black frame for many frames. Falling back to the normal render
-/// path for a moment after a resize avoids the black (the normal path degrades
-/// to stale-but-visible, which is what `RUFFLE_AQW_NO_SCALE9` showed); 9-slice
-/// resumes once the layout settles. Resizes don't happen in normal play, so
-/// this has no steady-state cost.
 const AQW_RESIZE_SETTLE: std::time::Duration = std::time::Duration::from_millis(1000);
 
-/// Record that the stage viewport just changed size. Called from
-/// `Stage::build_matrices` when the stage size actually changes.
 pub fn note_aqw_stage_resize() {
     LAST_AQW_RESIZE.with(|cell| cell.set(Some(std::time::Instant::now())));
 }
 
-/// Whether we're still within the post-resize settle window.
-///
-/// This is called for every display object every frame (via `render_base`),
-/// so the common case - no resize in the last second - must be nearly free:
-/// it's a single thread-local read of `None`. Only within the settle window
-/// after an actual resize do we pay the `Instant::elapsed()` timer read, and
-/// once the window elapses we reset the cell back to `None` so subsequent
-/// frames take the cheap path again. (Reading a timer per object per frame,
-/// as an earlier version did, measurably cost FPS in effect-heavy boss fights
-/// on slower `QueryPerformanceCounter` hardware.)
 fn aqw_recently_resized() -> bool {
     LAST_AQW_RESIZE.with(|cell| match cell.get() {
         None => false,
@@ -3212,10 +2364,6 @@ fn render_aqw_scaling_grid<'gc>(
     if aqw_scale9_disabled() || aqw_recently_resized() {
         return false;
     }
-    // Ordered cheapest-first. This runs for every display object on every
-    // frame, and virtually none of them have a scaling grid, so the tests that
-    // reject them should be the free ones: `options` is `Copy` and the grid is
-    // a `Cell` read, while the URL test clones an `Arc` and scans a string.
     if !options.apply_transform || !options.apply_matrix || !options.apply_scaling_grid {
         return false;
     }
@@ -3234,9 +2382,6 @@ fn render_aqw_scaling_grid<'gc>(
     let parent_matrix = parent_transform.matrix;
     let object_matrix = base_transform.matrix;
 
-    // AQW window panels use an object-local scale and translation. Preserve
-    // their corners and edges while stretching only the scaling-grid center.
-    // Rotated or skewed content keeps the standard rendering path.
     if object_matrix.b.abs() > SCALING_GRID_EPSILON
         || object_matrix.c.abs() > SCALING_GRID_EPSILON
         || object_matrix.a <= SCALING_GRID_EPSILON
@@ -3295,11 +2440,6 @@ fn render_aqw_scaling_grid<'gc>(
     let src_y = [bounds.y_min, grid.y_min, grid.y_max, bounds.y_max];
     let old_use_bitmap_cache = context.use_bitmap_cache;
     context.use_bitmap_cache = false;
-    // Each slice draws the subtree under its own matrix, so a cache down there
-    // is dirty on nearly every one of the nine and would be baked -- and often
-    // reallocated -- nine times a frame. That is why this path clears the flag
-    // above, and the filter exemption has to be cleared with it: a panel drawn
-    // inside a bake arrives here with it set.
     let old_cache_filtered_children = context.cache_filtered_children;
     context.cache_filtered_children = false;
 
@@ -3379,9 +2519,6 @@ fn should_bypass_offscreen_bitmap_cache<'gc>(
     let width = bounds.width().to_pixels().ceil().max(0.0);
     let height = bounds.height().to_pixels().ceil().max(0.0);
 
-    // Ordered ahead of the on-screen test only so the cheap arithmetic settles
-    // first and the two comparisons below are done once; both are pure
-    // predicates and this object is bypassed exactly when both agree.
     if width * height < AQW_OFFSCREEN_CACHE_LIMIT_PIXELS
         && width < AQW_OFFSCREEN_CACHE_LIMIT_SIDE
         && height < AQW_OFFSCREEN_CACHE_LIMIT_SIDE
@@ -3389,32 +2526,6 @@ fn should_bypass_offscreen_bitmap_cache<'gc>(
         return false;
     }
 
-    // The two sides of this comparison were in different coordinate spaces.
-    // `bounds` comes from `render_bounds_with_transform` over the render
-    // transform stack, so it carries the viewport matrix -- supersampling times
-    // window scale, measured at 2.29 in a large window. `stage.view_bounds()`
-    // is set in `stage.rs::build_matrices` as `stage_tx * view_bounds`, from
-    // `movie_width`/`movie_height` in stage pixels, with no viewport in it.
-    //
-    // The effect was not a wash: at view scale 2.29 the rectangle art had to
-    // reach to be considered visible shrank to ~44% of the stage per axis, so
-    // art plainly on screen to the right or below was judged off-screen and had
-    // its cache thrown away. It costs no correctness -- the bypass only falls
-    // back to vector rendering, which draws the same picture -- but a subtree
-    // that loses its cache re-emits every blend mode inside it, every frame.
-    // Measured in the field: one wrong bypass per frame on a weapon released 36
-    // complex blend passes per frame, 19% of the passes in the heaviest window.
-    //
-    // Putting the view rect through `view_matrix()` lands it in the space
-    // `bounds` is already expressed in. The other direction -- comparing
-    // `world_bounds(BoundsMode::Engine)` against `view_bounds` untouched -- is
-    // what the five other consumers of `view_bounds` do (`graphic.rs`,
-    // `bitmap.rs`, `edit_text.rs`, `video.rs`, and our own sweep) and is equally
-    // correct, but it costs a second bounds traversal where this costs a matrix
-    // multiply on a rectangle already to hand.
-    //
-    // Kill-switch: `RUFFLE_AQW_NO_BYPASS_VIEW_FIX=1` restores the mismatched
-    // comparison, for field A/B without a rebuild.
     let stage_view_bounds = context.stage.view_bounds();
     let on_screen = if aqw_bypass_view_fix_disabled() {
         bounds.intersects(&stage_view_bounds)
@@ -3422,10 +2533,6 @@ fn should_bypass_offscreen_bitmap_cache<'gc>(
         bounds.intersects(&(context.stage.view_matrix() * stage_view_bounds))
     };
 
-    // How often the fix is the deciding vote: the old comparison called this
-    // off-screen and the corrected one does not, so a cache that used to be
-    // discarded now survives. This is the number that says whether a field A/B
-    // is measuring anything.
     if aqw_diagnostics_enabled() && on_screen && !bounds.intersects(&stage_view_bounds) {
         AQW_CACHE_BYPASS_SAVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -3433,15 +2540,11 @@ fn should_bypass_offscreen_bitmap_cache<'gc>(
     !on_screen
 }
 
-/// Kill-switch: `RUFFLE_AQW_NO_BYPASS_VIEW_FIX` restores the stage-space vs
-/// render-space comparison the off-screen cache bypass used to make.
 fn aqw_bypass_view_fix_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_BYPASS_VIEW_FIX", false))
 }
 
-/// Total bitmap-cache memory budget in MB before off-screen caches are evicted.
-/// Controlled by `RUFFLE_AQW_CACHE_BUDGET_MB`; `0`/unset disables eviction.
 fn aqw_cache_budget_mb() -> u64 {
     static BUDGET: OnceLock<u64> = OnceLock::new();
     *BUDGET.get_or_init(|| {
@@ -3452,23 +2555,15 @@ fn aqw_cache_budget_mb() -> u64 {
     })
 }
 
-/// Once-per-second AQW memory sweep. Totals bitmap-cache memory across the
-/// display tree and, with `RUFFLE_AQW_DIAGNOSTICS`, logs orphan/loader/cache
-/// counts so the source of a leak can be identified. When cache memory exceeds
-/// `RUFFLE_AQW_CACHE_BUDGET_MB`, off-screen caches are evicted to cap memory.
-/// No-op unless diagnostics or a budget are enabled.
 pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
     let diagnostics = aqw_diagnostics_enabled();
     let budget_mb = aqw_cache_budget_mb();
     aqw_report_gates(context);
-    // Before the AQW gate: the probe has to report even if the root movie is
-    // not what we expect, since that is one of the things it could reveal.
     aqw_report_stage_children(context);
     if !is_aqw_movie_url(context.stage.movie().url()) {
         return;
     }
 
-    // Throttle to roughly once per second.
     static SWEEP_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if !SWEEP_FRAME
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -3477,17 +2572,12 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         return;
     }
 
-    // VRAM pressure valve: sample the renderer's GPU-memory report and adjust
-    // the per-frame cache-redraw quotas (consumed in `Player::render`). This
-    // runs even with diagnostics off - it's the field guard against the
-    // paging collapse when the driver's texture backlog fills the card.
     let (vram_mb, vram_budget_mb) = update_aqw_vram_pressure(context.renderer);
 
     if !diagnostics && budget_mb == 0 {
         return;
     }
 
-    // Evict using the previous sweep's total so this stays a single pass.
     static LAST_CACHE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let budget_bytes = budget_mb.saturating_mul(1024 * 1024);
     let over_budget = budget_bytes > 0
@@ -3515,28 +2605,13 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         let loaders = context.load_manager.len();
         let cache_mb = cache_bytes / (1024 * 1024);
         let evicted_mb = evicted_bytes / (1024 * 1024);
-        // Probe for a suspected leak: `MovieLibraries` is keyed by `Weak<SwfMovie>`
-        // but `MovieLibrary` also stores a strong `Arc<SwfMovie>` (self.swf), so the
-        // weak key can never expire and entries accumulate forever. Count total
-        // libraries known, plus how many are AQW asset movies (item/avatar/map
-        // SWFs loaded via `/game/gamefiles/`), to see if this grows monotonically
-        // as items/avatars are loaded over a session.
         let movie_libs_total = context.library.known_movies().count();
         let movie_libs_aqw = context
             .library
             .known_movies()
             .filter(|m| is_aqw_movie_url(m.url()))
             .count();
-        // Probe: how many topmost avatar-asset clips (armor pieces, helms,
-        // capes, weapons, hair — roughly 8-14 per avatar) the timeline
-        // throttle counted last frame. Frozen (hidden/TRASH) subtrees are
-        // excluded. The crowded-room throttle engages at
-        // `AQW_AVATAR_THROTTLE_ROOTS` (96) and hardens at 192.
         let avatar_roots = *context.aqw_avatar_asset_roots_previous;
-        // Dirty-cache budget activity accumulated since the previous sweep
-        // (~48 frames): how many redraws were admitted per class, how many were
-        // deferred, and how many blend layers were pushed. `redraw_small` and
-        // `blend_layers` are the FX-storm signature (fireworks, ultra skill spam).
         use std::sync::atomic::Ordering;
         let redraw_large = AQW_CACHE_REDRAWS_LARGE.swap(0, Ordering::Relaxed);
         let redraw_small = AQW_CACHE_REDRAWS_SMALL.swap(0, Ordering::Relaxed);
@@ -3550,10 +2625,6 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         let tick_stage_ms = AQW_TICK_STAGE_NS.swap(0, Ordering::Relaxed) / 1_000_000;
         let tick_bcast_ms = AQW_TICK_BCAST_NS.swap(0, Ordering::Relaxed) / 1_000_000;
         let orphans_frozen = AQW_ORPHANS_FROZEN.swap(0, Ordering::Relaxed);
-        // Population of the orphan list (per tick, so divide by `render_frames`
-        // for a headcount) and the clean/dirty cost split across all three
-        // passes. `orph_clean_ms` against `tick_orphan_ms` is the ceiling on
-        // what a mark-driven skip in the ordinary tick could win.
         let dirty_notex = AQW_CACHE_DIRTY_NOTEX.swap(0, Ordering::Relaxed);
         let dirty_size = AQW_CACHE_DIRTY_SIZE.swap(0, Ordering::Relaxed);
         let dirty_matrix = AQW_CACHE_DIRTY_MATRIX.swap(0, Ordering::Relaxed);
@@ -3565,10 +2636,6 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         let orph_script = AQW_ORPHAN_POP_SCRIPT.swap(0, Ordering::Relaxed);
         let orph_avatar = AQW_ORPHAN_POP_AVATAR.swap(0, Ordering::Relaxed);
         let orph_quiet = AQW_ORPHAN_POP_QUIET.swap(0, Ordering::Relaxed);
-        // `self` against the rest is the fork: a cache dirtying itself is a
-        // cache that may not pay for its bakes; a cache dirtied from below is a
-        // cache sitting above the animation. `dirty_origin` names what does the
-        // dirtying when it comes from below.
         let invalidate_depth = take_invalidate_depth()
             .iter()
             .map(u64::to_string)
@@ -3580,12 +2647,8 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         let orph_dirty_visits = AQW_ORPHAN_DIRTY_VISITS.swap(0, Ordering::Relaxed);
         let orph_clean_ms = AQW_ORPHAN_CLEAN_NS.swap(0, Ordering::Relaxed) / 1_000_000;
         let orph_dirty_ms = AQW_ORPHAN_DIRTY_NS.swap(0, Ordering::Relaxed) / 1_000_000;
-        // Read against `tick_stage_ms`: the share of the stage phases that is
-        // our per-clip hook rather than AQW's own scripts. `aqw_clips` is the
-        // display-list size it walks, which is what a content update moves.
         let aqw_hook_ms = AQW_HOOK_NS.swap(0, Ordering::Relaxed) / 1_000_000;
         let aqw_clips = AQW_HOOK_CLIPS.swap(0, Ordering::Relaxed);
-        // These three sum to `tick_stage_ms`.
         let aqw_playing = AQW_CLIPS_ADVANCED.swap(0, Ordering::Relaxed);
         let runframe_ms = AQW_RUNFRAME_NS.swap(0, Ordering::Relaxed) / 1_000_000;
         let bcast_enter_ms = AQW_BCAST_ENTER_NS.swap(0, Ordering::Relaxed) / 1_000_000;
@@ -3622,12 +2685,6 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         let stage_ctor_ms = AQW_STAGE_CTOR_NS.swap(0, Ordering::Relaxed) / 1_000_000;
         let stage_script_ms = AQW_STAGE_SCRIPT_NS.swap(0, Ordering::Relaxed) / 1_000_000;
         let vram_pressure = aqw_vram_pressure();
-        // Offscreen texture-pool churn since the previous sweep (~48 frames):
-        // `pool_allocs` = new GPU textures the pool had to create (misses),
-        // `pool_free` = idle ones maintenance destroyed, `pool_mb` = bytes
-        // currently retained for reuse. Sustained `pool_allocs` is the
-        // deferred-destruction churn (§5 commit creep) that the padded
-        // filter targets and age-based eviction are meant to kill.
         static LAST_POOL_ALLOCS: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(0);
         static LAST_POOL_FREES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3641,12 +2698,6 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
             } else {
                 (0, 0, 0)
             };
-        // Same three numbers for the main-surface pool. That pool feeds the
-        // scene draw and every blend/mask/filter target nested in it, whose
-        // sizes follow on-screen content — so a crowded room asks it for many
-        // distinct sizes. It is reported separately because the columns above
-        // cover only the offscreen pool, which can look idle while this one
-        // grows.
         static LAST_TEX_ALLOCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         static LAST_TEX_FREES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let (tex_allocs, tex_free, tex_mb) =
@@ -3659,10 +2710,6 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
             } else {
                 (0, 0, 0)
             };
-        // What shape the surface-pool retention has. A crowded room where two
-        // particular players dominate the cost points at a few oversized
-        // filter/blend targets rather than sheer count, and only the size
-        // breakdown can tell those apart.
         let tex_top = context
             .renderer
             .surface_pool_largest(4)
@@ -3671,10 +2718,6 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
             .collect::<Vec<_>>()
             .join(",");
 
-        // Which blend modes are paying for their own full-surface pass. The
-        // `blend_layers` count above says how many there were; this says which,
-        // and that decides whether there is a cheap fix (modes expressible as
-        // GPU blend state) or only the structural one.
         let blend_modes = context
             .renderer
             .take_complex_blend_counts()
@@ -3683,67 +2726,24 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
             .collect::<Vec<_>>()
             .join(",");
 
-        // How much of the surface those passes actually covered. The counts
-        // above cannot show this: bounding a blend pass removes no passes, it
-        // shrinks them, so `blend_layers`/`blend_modes` stay put either way and
-        // only `blend_cover` moves. `blend_cover_hist` is the per-layer spread
-        // (<=1%, <=5%, <=25%, >25%), so a few full-screen overlays cannot hide
-        // a good median.
-        // `blend_alloc` is the memory side: how big those targets were, against
-        // full-surface ones. Hundreds are alive at once in a crowded room, so
-        // this is what decides whether VRAM clears the OS grant.
         let blend_alloc = context.renderer.take_blend_alloc();
-        // How much of the multiply population -- 55% of complex blends in a
-        // crowded room -- composites onto an opaque destination, where
-        // fixed-function blend state is exactly equivalent and the pass of its
-        // own could collapse into the batched draw. Reads as
-        // `onto_opaque/total (Npx)`; the megapixels are the scale, since the
-        // same ratio over tiny targets is not the same prize. A low ratio
-        // closes the question, and closing it is the point.
         let (blend_mul_opaque, blend_mul_total, blend_mul_opaque_mpx) =
             context.renderer.take_blend_dest_opacity();
-        let blend_mul_opaque = format!(
-            "{blend_mul_opaque}/{blend_mul_total} ({blend_mul_opaque_mpx}Mpx)"
-        );
-        // Where the frame actually goes. `render_frames` is how many frames the
-        // other two cover, so they read as ms/frame against the 41.7ms budget
-        // at 24fps. `commit_mb` is system memory, which hit 98% of the machine
-        // while VRAM sat well inside its budget -- they run out separately.
+        let blend_mul_opaque =
+            format!("{blend_mul_opaque}/{blend_mul_total} ({blend_mul_opaque_mpx}Mpx)");
         let (render_encode_ms, render_submit_ms, render_frames, commit_mb) =
             context.renderer.take_render_timings();
-        // Which files those blends came from. If one item dominates, the cost
-        // is that item's art, not the number of players -- which is what the
-        // field reports and what a stuttering single-character page implies.
         let avatar_caches = AQW_AVATAR_CACHES_ENABLED.load(Ordering::Relaxed);
         let blend_swfs = take_blend_sources(6)
             .iter()
             .map(|(name, count)| format!("{name}:{count}"))
             .collect::<Vec<_>>()
             .join(",");
-        // Where the expensive blends come from. `blend_bake`+`blend_live` is the
-        // control against `blend_modes`, whose sum is the renderer's own count of
-        // the same passes; if they disagree, this attribution is missing a path.
-        // Two known reasons for a small shortfall the other way, where the
-        // renderer counts fewer: it drops an Alpha/Erase with no Layer above it
-        // and one whose scissor came out empty. One reason it counts more:
-        // `BitmapData.draw` blends without going through here, which is AQW's
-        // own rasteriser (Static Player Art, the map raster) rather than the
-        // scene, and is worth knowing about separately if the gap is large.
-        //
-        // The split is the question: a cached subtree is meant to collapse its
-        // blends into one texture draw, so `blend_live` is art no cache covers,
-        // and `blend_bake` is art whose cache is being rebuilt often enough that
-        // the cache buys nothing. `bake_top` reads `Class@file:bakes/complex` --
-        // dividing the two says whether one bake is expensive or there are simply
-        // a lot of them, which is the fork the whole investigation turns on.
         let blend_bake = AQW_BLEND_COMPLEX_BAKED.swap(0, Ordering::Relaxed);
         let blend_live = AQW_BLEND_COMPLEX_LIVE.swap(0, Ordering::Relaxed);
         let blend_bake_triv = AQW_BLEND_TRIVIAL_BAKED.swap(0, Ordering::Relaxed);
         let blend_live_triv = AQW_BLEND_TRIVIAL_LIVE.swap(0, Ordering::Relaxed);
         let bakes = AQW_BAKES.swap(0, Ordering::Relaxed);
-        // Reads as `first/2-4/5-24/25-120/more`. Against `bake_top`, which is
-        // per class, this says whether that class is one object rebaking or a
-        // stream of new ones.
         let (bake_reps, bake_reps_max) = take_bake_repeats();
         let bake_reps = bake_reps
             .iter()
@@ -3753,50 +2753,20 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         let bake_depth = AQW_BAKE_DEPTH_MAX.swap(0, Ordering::Relaxed);
         let bake_top = take_bake_blends(6).join(",");
         let blend_live_top = take_live_blends(6).join(",");
-        // The two halves of "why is this blend not inside a cache".
-        // `bypass_all` against `bypass_cleared` is the correction to how that
-        // counter reads; `bypass_onscreen` is the defect firing on art the
-        // player can see, and `bypass_top` names it.
-        // `live_nocache`/`live_hadcache` splits the live blends themselves:
-        // no ancestor ever asked for a cache, against an ancestor asked and
-        // did not get one.
         let bypass_all = AQW_CACHE_BYPASS_ALL.swap(0, Ordering::Relaxed);
         let bypass_onscreen = AQW_CACHE_BYPASS_ONSCREEN.swap(0, Ordering::Relaxed);
         let bypass_saved = AQW_CACHE_BYPASS_SAVED.swap(0, Ordering::Relaxed);
         let bypass_top = take_bypassed_objects(6).join(",");
         let live_nocache = AQW_BLEND_LIVE_NO_CACHE.swap(0, Ordering::Relaxed);
         let live_hadcache = AQW_BLEND_LIVE_HAD_CACHE.swap(0, Ordering::Relaxed);
-        // `Class@file:blends/areaKpx/depth` -- what caching that ancestor would
-        // collapse, against what its bake would have to cover. Divide blends by
-        // `render_frames` for a per-frame prize. A candidate worth having is a
-        // large first number beside a small second one; the map root will show
-        // the largest prize of all and is worthless, because its area is the
-        // whole scene.
         let live_cand = take_live_ancestors(8).join(",");
-        // `reason|Class@file:count` -- which branch abandoned a cache the
-        // content (or the auto-cache) had asked for. This is the column that
-        // says what to fix when `live_hadcache` is high.
         let cache_suppress = take_cache_suppressed(8).join(",");
-        // `Dictionary` retention. The class takes a `weakKeys` flag and drops
-        // it, so object-space entries are pinned for the dictionary's whole
-        // life; content that expects the player to drop unreachable keys gets
-        // a leak instead. `dict_okeys` is the size of that exposure -- string
-        // and numeric keys are plain dynamic properties, so they cannot be
-        // weak and are deliberately not counted here.
         let (dicts, dict_okeys) = crate::avm2::object::dictionary_stats();
-        // The third texture bucket, and the only one nothing else reports:
-        // everything held by a `BitmapHandle`. `cache_mb` above walks the
-        // stage, so a cache on a detached subtree -- an orphaned avatar, a
-        // clip parked in AQW's TRASH -- stops being counted while its texture
-        // stays alive. `bmp_mb` counts it regardless of where the owner sits.
         let (bmp_tex, bmp_mb) = context
             .renderer
             .bitmap_texture_stats()
             .map(|(count, bytes)| (count, bytes / (1024 * 1024)))
             .unwrap_or((0, 0));
-        // Same breakdown `tex_top` gives the surface pool. A room-sized bucket
-        // repeated hundreds of times says the map raster; thousands of small
-        // ones say avatar art. The totals cannot tell those apart.
         let bmp_top = context
             .renderer
             .bitmap_texture_largest(15)
@@ -3804,11 +2774,6 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
             .map(|(w, h, count, bytes)| format!("{w}x{h}x{count}={}MB", bytes / (1024 * 1024)))
             .collect::<Vec<_>>()
             .join(",");
-        // How many distinct sizes those textures come in, and the total across
-        // all of them. `bmp_sizes` separates "a few allocations repeated" from
-        // "the same content re-rasterized at dimensions that keep shifting",
-        // and `bmp_tracked_mb` is the control: it has to land near `bmp_mb`,
-        // or the breakdown above is describing only a fraction of the problem.
         let (bmp_sizes, bmp_tracked) = context.renderer.bitmap_texture_buckets();
         let bmp_tracked_mb = bmp_tracked / (1024 * 1024);
         let (blend_cover, blend_cover_buckets) = context.renderer.take_blend_coverage();
@@ -3818,22 +2783,6 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
             .collect::<Vec<_>>()
             .join("/");
 
-        // What used to be the blind spot: everything above counts only the
-        // blends that cost a pass of their own, and a trivial blend skips the
-        // pass and nothing else -- it takes the same target, clear, sub-render
-        // and composite quad. Until this was measured, neither the V2.0 scissor
-        // nor the target shrink reached them, because both were gated on the
-        // blend being complex.
-        //
-        // `blend_triv_cover` is the same question `blend_cover` answers for the
-        // complex ones (how much of the target was ever written) and
-        // `blend_triv_alloc` mirrors `blend_alloc` (how big it was against a
-        // full-surface one). They now move in opposite directions, and that is
-        // the check that the sizing is working: alloc should be small and cover
-        // large. Before it, alloc was 100% by construction and cover read 0-1%.
-        // `blend_triv_mpx` is the absolute scale both have to be read against;
-        // divide it by `render_frames` for per frame, where the same empty room
-        // measured 109.7 before and is the number to compare against.
         let trivial_blend_modes = context
             .renderer
             .take_trivial_blend_counts()
@@ -3850,11 +2799,6 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
             .collect::<Vec<_>>()
             .join("/");
 
-        // Built once, emitted twice. The two destinations used to carry their
-        // own field lists and had already drifted ~30 columns apart -- the
-        // console was missing every `goto_*`, `inner_*` and `stage_*` the file
-        // had. Nothing checks two hand-written lists of eighty names against
-        // each other, so there is deliberately only one.
         let line = format!(
             "orphans={orphans} loaders={loaders} cached_objects={cached_objects} \
              cache_mb={cache_mb} evicted_mb={evicted_mb} over_budget={over_budget} \
@@ -3926,8 +2870,6 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
 
         tracing::info!(target: "aqw_diag", "AQW sweep: {line}");
 
-        // Also append to a file so the sweep is captured even when the game is
-        // spawned detached (the normal launcher discards stdout/stderr).
         use std::io::Write;
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
@@ -3982,8 +2924,6 @@ fn aqw_sweep_node<'gc>(
     }
 }
 
-/// Ping-pong state for one display object, keyed by pointer in
-/// `note_position_oscillation`.
 #[derive(Default)]
 struct OscillationState {
     prev1: f64,
@@ -3998,19 +2938,6 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// Report art that vibrates in place, whatever kind of object it is.
-///
-/// Earlier probes watched one mechanism each — cache geometry, then bitmap
-/// pixel snapping — and a vector `Graphic` would have tripped neither. This
-/// watches the only thing all of them share: the world position the object is
-/// actually drawn at.
-///
-/// The signature is a strict A-B-A ping-pong of small amplitude, sustained.
-/// Real animation walks through many positions; alternating between exactly
-/// two, a fraction of a pixel apart, for dozens of frames is an artifact. What
-/// it cannot say on its own is *whose* artifact — but the amplitude does: an
-/// exact 1.0 means something is rounding, anything else means the transform
-/// itself is being driven that way.
 fn note_position_oscillation<'gc>(this: DisplayObject<'gc>, context: &RenderContext<'_, 'gc>) {
     const REPORT_FLIPS: u32 = 30;
     const MAX_TRACKED: usize = 4096;
@@ -4078,17 +3005,6 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// List map-art clips whose timeline keeps running.
-///
-/// With the position probe silent, art that still appears to move has to be
-/// changing what it *draws* rather than where: a clip advancing between frames
-/// whose contents sit at different heights looks exactly like the object
-/// bobbing. The interesting case is a clip that is stopped in the player and
-/// running here, which no rendering fix would ever reach.
-///
-/// Reports name, class and frame count, because those are what identify a
-/// piece of scenery — every probe so far could see that *something* was wrong
-/// without being able to say which object it was.
 fn note_map_clip_animation<'gc>(this: DisplayObject<'gc>) {
     const REPORT_CHANGES: u32 = 30;
     const MAX_REPORTS: usize = 25;
@@ -4154,7 +3070,6 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
-/// What `note_tint_progression` accumulates for one object across frames.
 struct TintProgress {
     last_frame: u16,
     frame_changes: u32,
@@ -4166,42 +3081,12 @@ struct TintProgress {
 thread_local! {
     static TINT_PROGRESS: std::cell::RefCell<std::collections::HashMap<usize, TintProgress>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
-    /// Keys already reported. Reported entries leave the map above so their
-    /// slot is reusable -- holding them there let long-lived scenery fill the
-    /// table and lock out every object that appeared afterwards, which is what
-    /// the FX under investigation always does.
     static TINT_PROGRESS_DONE: std::cell::RefCell<std::collections::HashSet<usize>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
-/// Follow a tinted object over time instead of photographing it once.
-///
-/// `note_tint_mechanism` already established what the wrong-coloured instances
-/// carry: a colour transform, tweened from a darkened base toward blue, and the
-/// orange ones sit at the base value. It cannot say *why* they sit there,
-/// because it reports each object once. This one films: it counts how often the
-/// clip's own timeline advances and how often the composed colour changes, then
-/// reports both.
-///
-/// The two outcomes want opposite fixes, which is the whole point of measuring
-/// before writing another one:
-///
-/// - frames advancing but the colour never changing means the tween does not
-///   come from this clip's timeline, so nothing that freezes this clip is
-///   responsible and the source of the transform is the thing to find.
-/// - frames not advancing means this clip is stuck, and `playing` splits that
-///   again: stopped by content versus still playing but not being stepped.
 fn note_tint_progression<'gc>(this: DisplayObject<'gc>, context: &RenderContext<'_, 'gc>) {
-    // 48 samples is two seconds at 24fps, and a cast FX can be gone before
-    // that -- a threshold the subject cannot reach is a threshold that decides
-    // what you see, the same way a low cap does. 16 is still long enough for a
-    // tween to visibly progress.
     const SAMPLES_BEFORE_REPORT: u32 = 16;
-    // Both caps were reached on 2026-08-05 while the wrong-coloured instances
-    // were on screen, and a cap that is reached stops reporting for the rest of
-    // the session -- so everything after it is invisible. A session's worth of
-    // these lines is a couple of MB, which is nothing next to missing the
-    // subject for the third run in a row.
     const MAX_TRACKED: usize = 8192;
     const MAX_REPORTS: usize = 4000;
 
@@ -4278,12 +3163,6 @@ fn note_tint_progression<'gc>(this: DisplayObject<'gc>, context: &RenderContext<
             color.b_multiply.to_f32()
         ),
         add = format!("{},{},{}", color.r_add, color.g_add, color.b_add),
-        // The composed transform above cannot say *where* the colour was
-        // written. This is the object's own, and the two split the remaining
-        // explanations: differing here means the write is per instance and some
-        // are skipped; identical here, with the composed values differing,
-        // means the write is on an ancestor and the wrong-coloured instances
-        // hang off a different one.
         own = format!(
             "{:.3},{:.3},{:.3}/{},{},{}",
             own_color.r_multiply.to_f32(),
@@ -4302,21 +3181,7 @@ fn note_tint_progression<'gc>(this: DisplayObject<'gc>, context: &RenderContext<
     );
 }
 
-/// Report how a tinted object is actually tinted.
-///
-/// Two instances of one asset drawing in different colours in the same frame
-/// narrows to three mechanisms, and they are not distinguishable by looking at
-/// the screen: a colour transform that one instance did not receive, a filter
-/// that did not apply, or a blend resolving against different content. Each
-/// wants a different fix, and three guesses have already been spent here. This
-/// says which one is in play by printing what each instance actually carries.
 fn note_tint_mechanism<'gc>(this: DisplayObject<'gc>, context: &RenderContext<'_, 'gc>) {
-    // Each object reports once, so the cap only exists to bound a pathological
-    // scene. The first version set it at 40 and the whole budget was spent on
-    // startup objects before the skill under investigation was ever cast --
-    // a cap low enough to be reached is a cap that decides what you see. 400
-    // was reached too, on 2026-08-05, in a run where the wrong-coloured FX was
-    // on screen and went unrecorded.
     const MAX_REPORTS: usize = 4000;
 
     let url = this.movie().url().to_owned();
@@ -4328,7 +3193,6 @@ fn note_tint_mechanism<'gc>(this: DisplayObject<'gc>, context: &RenderContext<'_
     let filters = this.filters();
     let color = context.transform_stack.transform().color_transform;
     let tinted = color != Default::default();
-    // Only objects that carry one of the three mechanisms are interesting.
     if blend == ExtendedBlendMode::Normal && filters.is_empty() && !tinted {
         return;
     }
@@ -4376,22 +3240,11 @@ fn note_tint_mechanism<'gc>(this: DisplayObject<'gc>, context: &RenderContext<'_
 }
 
 thread_local! {
-    /// Per object: the last state `note_cache_decision` reported, and how many
-    /// lines it has spent.
-    ///
-    /// The first version keyed on (object, camera distance) and reported each
-    /// once. That cannot see the thing being chased -- art that is right and
-    /// then goes wrong again while the camera holds still -- because the key
-    /// does not change when that happens. It also spent its whole budget in 12
-    /// seconds, 96% of it on children inside bakes, and a budget that runs out
-    /// decides what you get to see.
     static CACHE_DECISION_STATE:
         std::cell::RefCell<std::collections::HashMap<usize, (u64, u32)>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// A colour quantized coarsely enough that a fade -- which walks a multiplier a
-/// little every frame -- reports a few steps instead of a line per frame.
 fn coarse_colour(ct: &ColorTransform) -> (i8, i8, i8, i8, i8, i8) {
     let step = |m: f32| (m * 8.0).round().clamp(-128.0, 127.0) as i8;
     let add = |a: i16| (a / 32) as i8;
@@ -4405,7 +3258,6 @@ fn coarse_colour(ct: &ColorTransform) -> (i8, i8, i8, i8, i8, i8) {
     )
 }
 
-/// The names of up to `levels` ancestors, nearest first, for probe output.
 fn ancestor_names<'gc>(this: DisplayObject<'gc>, levels: usize) -> String {
     let mut names = Vec::with_capacity(levels);
     let mut node = this.parent();
@@ -4424,20 +3276,6 @@ fn ancestor_names<'gc>(this: DisplayObject<'gc>, levels: usize) -> String {
     names.join("<")
 }
 
-/// Log every colour written to filtered art, and who received it.
-///
-/// The cache-decision probe found cape instances whose tinted node carried
-/// identity colour through every bake of its life, alongside another instance
-/// of the same class, in the same room, that got its tint 0.2s after appearing.
-/// Two very different causes fit that -- the tint was written and then lost, or
-/// it was never written to that instance -- and the read side cannot tell them
-/// apart. A write that never happens leaves nothing to see.
-///
-/// Note the hole this does not cover: AVM2's `DisplayObject.transform` setter
-/// writes through `DisplayObjectBase::set_color_transform` directly rather than
-/// the trait method below, so a whole-transform assignment does not appear
-/// here. It invalidates the parent's cache on its own, so it is not a
-/// correctness gap, but a silent log is not proof on its own.
 fn note_colour_write<'gc>(this: DisplayObject<'gc>, new: &ColorTransform) {
     const MAX_REPORTS: usize = 4000;
 
@@ -4475,45 +3313,11 @@ fn note_colour_write<'gc>(this: DisplayObject<'gc>, new: &ColorTransform) {
     );
 }
 
-/// Report how an object is drawn -- cache or vectors -- every time that answer,
-/// its texture, or its colour changes.
-///
-/// Item Color Custom comes out right with the camera close and wrong -- the
-/// untinted base art -- with it far, and goes wrong again the moment the camera
-/// moves after a zoom has put it right. A cache bakes its descendants' colour
-/// into the texture while vector rendering composes the tint live, which would
-/// explain a colour that depends on how the object is drawn and on nothing the
-/// content did.
-///
-/// What the first run established, on a Necromancer2016JuneDragonCape:
-///
-/// - the tint is an ordinary `ColorTransform`, on a descendant four levels down
-///   (`Symbol168_6`, multiply 0 / add 255,0,0). The note claiming AQW's tint
-///   does not arrive through `set_color_transform` was measured on skill FX and
-///   does not hold for items.
-/// - the cape's first bake ran while every child still carried identity colour,
-///   so that texture is untinted art. The tint appeared 1.2s later.
-/// - `wants_cache=true` with `has_texture=false` and non-zero `tex` was caught
-///   in the same run: `update` ran and the allocation was refused, which is
-///   `acceptable_size` and not `should_bypass_offscreen_bitmap_cache` -- the
-///   latter returns early, keeping the cache, whenever the bounds meet the
-///   view, so its limits only ever apply to art entirely off screen.
-///
-/// `tex` matters because "cached" alone does not mean a texture was composited:
-/// a cache whose allocation was refused holds none and renders as vectors too.
-///
-/// Reporting on change rather than once per camera distance is what the first
-/// run forced. The thing being chased is art that is right and then goes wrong
-/// while the camera holds still, and a key that does not move when that happens
-/// cannot record it.
 fn note_cache_decision<'gc>(
     this: DisplayObject<'gc>,
     context: &RenderContext<'_, 'gc>,
     cache_info: Option<&DrawCacheInfo>,
 ) {
-    // A line per state change is bounded by how much actually changes, so these
-    // only stop a pathological oscillator. One object that flips every frame
-    // must not be able to silence the rest, hence the per-object share.
     const MAX_REPORTS_PER_OBJECT: u32 = 80;
     const MAX_TRACKED: usize = 40000;
 
@@ -4544,8 +3348,6 @@ fn note_cache_decision<'gc>(
     let composed = context.transform_stack.transform().color_transform;
     let own = this.base().color_transform();
 
-    // The camera sits at a handful of distances, so bucketing by eighths keeps
-    // a slow drift from counting as a new state every frame.
     let bucket = (scale * 8.0).round() as i32;
     let state = {
         use std::hash::{Hash, Hasher};
@@ -4607,34 +3409,16 @@ fn note_cache_decision<'gc>(
     tracing::warn!(
         target: "aqw_diag",
         outcome,
-        // Read this first. Baking a cache renders the subtree again with
-        // `use_bitmap_cache` off for AQW, so every child inside a bake arrives
-        // here and reports `vectors` -- without this field, a properly cached
-        // item looks like a vector-drawn one from its children's lines alone.
         offscreen = context.is_offscreen,
-        // Whether anything asked for a cache at all, which separates "not
-        // cached because nobody wanted one" from "wanted one and did not get
-        // a texture".
         wants_cache = this.is_bitmap_cached(),
         has_texture,
         tex = texture_size.as_str(),
-        // The composed scale is what sizes the cache texture, and it moves with
-        // the window as well as the camera; the view scale is logged beside it
-        // so a zoom can be told from a resize.
         scale = format!("{scale:.3}"),
         view_scale = format!("{view_scale:.3}"),
         name = this.name().map(|n| n.to_string()).unwrap_or_default(),
         class = class.as_str(),
         depth = this.depth(),
-        // Which avatar this belongs to. Instances of the same item class that
-        // behave differently are the whole puzzle, and the holder is the first
-        // thing that could distinguish them -- the player's own avatar from
-        // another player's, or one of AQW's offscreen holders.
         holders = ancestor_names(this, 4).as_str(),
-        // Composed against own, the same split the tint probes use: a tint that
-        // shows up composed but not own was written above this object, and one
-        // that shows in neither was written below -- which is the case a cache
-        // bakes and this log cannot see directly.
         mult = format!(
             "{:.3},{:.3},{:.3}",
             composed.r_multiply.to_f32(),
@@ -4679,10 +3463,6 @@ pub fn render_base<'gc>(
     if options.apply_transform {
         let transform = this.base().transform(options.apply_matrix);
         context.transform_stack.push(&transform);
-        // Behind its own switch, not the general diagnostics one: these two
-        // run a map lookup per display object per frame, which is affordable
-        // for a targeted hunt but would tax — and so distort — the memory
-        // sweep that shares that flag.
         if aqw_flicker_probe_enabled() {
             note_position_oscillation(this, context);
             note_map_clip_animation(this);
@@ -4692,10 +3472,6 @@ pub fn render_base<'gc>(
     }
 
     let blend_mode = this.blend_mode();
-    // Captured here rather than at the emit site below, because by then this
-    // object's *own* bake has been pushed and popped again. What decides the
-    // booking is whether an *ancestor* was baking when this object was reached,
-    // which is exactly the stack as it stands on the way in.
     let blend_bake_owner = if blend_mode != ExtendedBlendMode::Normal {
         aqw_current_bake()
     } else {
@@ -4711,21 +3487,6 @@ pub fn render_base<'gc>(
         None
     };
 
-    // A filtered object has no other way to get its filters applied, which is
-    // why `recheck_cache_as_bitmap` forces a cache on to anything carrying one.
-    // Inside an AQW bake `use_bitmap_cache` is off (see the offscreen context
-    // below), and without this exemption the filter would simply not happen.
-    // Kill-switch: `RUFFLE_AQW_NO_NESTED_FILTER_CACHE=1`.
-    //
-    // `cache_filtered_children` is what limits this to the bake. Reading
-    // `use_bitmap_cache` alone was the first version and it also caught the two
-    // other places that switch caching off, where the exemption is not wanted
-    // and is expensive: the scaling grid turns it off on the *live* context and
-    // draws the subtree nine times, each slice under a different matrix, so a
-    // filtered descendant of an AQW panel is dirty on every slice -- nine bakes
-    // and up to nine texture allocations per frame, each. AQW's windows are
-    // scaling-grid panels and its item icons carry a ColorMatrixFilter, so the
-    // inventory is a gridful of them.
     let nested_filter_cache = !context.use_bitmap_cache
         && context.cache_filtered_children
         && !aqw_nested_filter_cache_disabled()
@@ -4737,20 +3498,10 @@ pub fn render_base<'gc>(
         let mut cache_info: Option<DrawCacheInfo> = None;
         let base_transform = context.transform_stack.transform();
         let allow_aqw_large_cache = is_aqw_movie_url(this.movie().url());
-        // A cache we switched on for avatar art, rather than one the content
-        // asked for. These belong to objects that move, so they get neither
-        // pixel snapping nor deferral -- both are only safe for art that holds
-        // still, and here they show up as shaking and as art left behind during
-        // a zoom.
         let aqw_auto_cache = !aqw_avatar_cache_disabled()
             && this
                 .as_movie_clip()
                 .is_some_and(|clip| clip.is_aqw_avatar_asset_root());
-        // A non-finite or absurdly-scaled transform can't yield a usable cache (it
-        // would be rejected as "incredibly large" further down anyway). Detect it
-        // from the matrix up front so we skip the bounds traversal and the cache
-        // math, and never feed NaN/inf into them. AQW-only to keep other content's
-        // behavior byte-identical.
         let m = &base_transform.matrix;
         let degenerate_transform = allow_aqw_large_cache
             && (!m.a.is_finite()
@@ -4778,27 +3529,15 @@ pub fn render_base<'gc>(
         filters.retain(|f| !f.impotent());
         let bypass_bitmap_cache = degenerate_transform
             || should_bypass_offscreen_bitmap_cache(this, context, options, &bounds, &filters);
-        // Padded cache textures are only safe when the redraw clear is
-        // transparent; an opaque background would paint the padding margin.
         let allow_size_padding = allow_aqw_large_cache
             && !aqw_padded_cache_disabled()
             && this.opaque_background().is_none();
 
         if let Some(cache) = &mut *this.base().bitmap_cache_mut() {
             if bypass_bitmap_cache {
-                // Only a clear that threw a texture away counts: clearing an
-                // already-empty cache costs nothing and would drown the signal.
                 if aqw_diagnostics_enabled() && cache.bitmap.is_some() {
                     AQW_CACHE_BYPASS_CLEARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                // `bypass_cleared` above answers a narrower question than it
-                // looks like it does, and the difference matters: a cache that
-                // is bypassed on *every* frame never accumulates a texture, so
-                // it has none to throw away and is counted nowhere -- which is
-                // exactly the steady state a suppressed cache sits in. Reading
-                // zero from it was taken as "the bypass never fires" once
-                // already. This counts every bypass, and separately the ones
-                // where the object was really on screen.
                 if aqw_diagnostics_enabled() {
                     note_cache_bypass(this, context, &bounds);
                 }
@@ -4818,7 +3557,6 @@ pub fn render_base<'gc>(
                     };
                     let stage_matrix = context.stage.view_matrix();
                     for filter in &mut filters {
-                        // Scaling is done by *stage view matrix* only, nothing in-between
                         filter.scale(stage_matrix.a, stage_matrix.d);
                         filter_rect = filter.calculate_dest_rect(filter_rect);
                     }
@@ -4850,20 +3588,8 @@ pub fn render_base<'gc>(
                                 None => 0,
                             };
                         }
-                        // Counts through admitted redraws, so it measures how
-                        // long the contents have been moving. Reset only on a
-                        // frame that finds the cache clean, below.
                         cache.dirty_streak = cache.dirty_streak.saturating_add(1);
                         let redraw_pixels = u64::from(actual_width) * u64::from(actual_height);
-                        // The large/small split (and the per-frame pixel budget in
-                        // `Player::render`) is calibrated in ~1x windowed pixels.
-                        // Fullscreen plus supersampling multiplies every cache's
-                        // pixel size by the view scale squared, which reclassified
-                        // ordinary combat FX as "large" and starved them on the
-                        // small large-redraw quota - chronic deferral, detached
-                        // stale weapon art and old-scale damage numbers appearing
-                        // only in fullscreen. Normalize the thresholds by the view
-                        // scale so classification matches the windowed calibration.
                         let view_scale = {
                             let view = context.stage.view_matrix();
                             f64::from(view.a.abs().max(view.d.abs())).max(1.0)
@@ -4875,35 +3601,19 @@ pub fn render_base<'gc>(
                             (f64::from(AQW_DIRTY_CACHE_REDRAW_DEFER_MIN_SIDE) * view_scale) as u32;
                         let is_large = redraw_pixels >= defer_min_pixels
                             && (actual_width >= defer_min_side || actual_height >= defer_min_side);
-                        // Small caches used to bypass the budget entirely ("small is
-                        // cheap"), but AQW FX storms (fireworks, ultra-boss skill spam)
-                        // run hundreds of small filtered clips at once — each admitted
-                        // redraw costs filter passes plus offscreen-pool textures, and
-                        // the swarm is what melts FPS. They now draw from their own
-                        // per-frame quota instead.
                         let mut admitted_aged = false;
                         let grace_admitted = cache.dirty_streak <= aqw_defer_eligible_frames();
                         let mut can_redraw_cache = if !allow_aqw_large_cache || aqw_auto_cache {
-                            // Deferral trades freshness for frame time, which
-                            // only works when the art is standing still. An
-                            // avatar cache that misses its redraw during a zoom
-                            // composites at the previous scale and visibly
-                            // detaches, so these always redraw.
                             true
                         } else if grace_admitted {
-                            // Too recently settled to stand in for itself: the
-                            // texture on hand predates whatever just happened to
-                            // this object. See `aqw_defer_eligible_frames`.
-                            AQW_CACHE_DEFER_GRACE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            AQW_CACHE_DEFER_GRACE
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             true
                         } else if is_large {
                             context.try_reserve_dirty_cache_redraw(redraw_pixels)
                         } else {
                             context.try_reserve_small_cache_redraw(redraw_pixels)
                         };
-                        // Budget admission is in render order, so the same objects can
-                        // lose the race every frame and stay stale indefinitely. Let
-                        // long-starved caches through a small reserved quota.
                         if !can_redraw_cache
                             && cache.deferred_frames >= aqw_stale_cache_aged_frames()
                             && context.try_reserve_aged_cache_redraw()
@@ -4913,9 +3623,6 @@ pub fn render_base<'gc>(
                         }
 
                         if can_redraw_cache {
-                            // Counted where the bake is actually admitted, not
-                            // where dirtiness is detected: a refused redraw
-                            // costs nothing and must not read as one.
                             cache.bake_count = cache.bake_count.saturating_add(1);
                             if aqw_diagnostics_enabled() {
                                 aqw_note_bake_repeat(cache.bake_count);
@@ -4928,8 +3635,6 @@ pub fn render_base<'gc>(
                                     draw_offset,
                                 )
                             {
-                                // Read before `update` overwrites them, so the
-                                // log shows both ends of the ping-pong.
                                 let was = (cache.source_width, cache.source_height);
                                 let was_offset = cache.draw_offset;
                                 let class = this
@@ -4981,7 +3686,6 @@ pub fn render_base<'gc>(
                                     AQW_CACHE_REDRAWS_SMALL.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
-                            // Read before the move into `DrawCacheInfo`.
                             let probe = (base_transform.matrix, bounds, filters.len());
                             cache_info = cache.handle().map(|handle| DrawCacheInfo {
                                 handle,
@@ -4994,53 +3698,37 @@ pub fn render_base<'gc>(
                                 aqw_auto_cache,
                             });
                             if cache_info.is_none() {
-                                // A zero side is refused by `NonZero` before any
-                                // size gate is consulted, so it is a different
-                                // failure with a different fix, and the counts
-                                // said the size gate cannot be carrying this:
-                                // it warns once per cache and warned once all
-                                // session against hundreds of refusals here.
-                                suppress_reason = Some(if actual_width == 0 || actual_height == 0 {
-                                    suppress_detail = Some(format!(
-                                        "{width}x{height}->{actual_width}x{actual_height}"
-                                    ));
-                                    // The raw numbers, once per cache. A zero
-                                    // rect and a rect past 65535 are the two
-                                    // ends a non-finite value produces when it
-                                    // crosses into `Twips`, and both turned up
-                                    // in this object group, so print the sides
-                                    // and the matrix rather than the size.
-                                    if aqw_diagnostics_enabled() && !cache.warned_for_zero {
-                                        cache.warned_for_zero = true;
-                                        let (m, b, filter_count) = probe;
-                                        tracing::warn!(
-                                            target: "aqw_diag",
-                                            movie = this.movie().url(),
-                                            x_min = b.x_min.get(),
-                                            x_max = b.x_max.get(),
-                                            y_min = b.y_min.get(),
-                                            y_max = b.y_max.get(),
-                                            m_a = m.a,
-                                            m_b = m.b,
-                                            m_c = m.c,
-                                            m_d = m.d,
-                                            m_tx = m.tx.get(),
-                                            m_ty = m.ty.get(),
-                                            filters = filter_count,
-                                            "AQW cache resolved to a zero-sided rect"
-                                        );
-                                    }
-                                    CacheSuppressReason::AllocZero
-                                } else {
-                                    CacheSuppressReason::AllocRefused
-                                });
+                                suppress_reason =
+                                    Some(if actual_width == 0 || actual_height == 0 {
+                                        suppress_detail = Some(format!(
+                                            "{width}x{height}->{actual_width}x{actual_height}"
+                                        ));
+                                        if aqw_diagnostics_enabled() && !cache.warned_for_zero {
+                                            cache.warned_for_zero = true;
+                                            let (m, b, filter_count) = probe;
+                                            tracing::warn!(
+                                                target: "aqw_diag",
+                                                movie = this.movie().url(),
+                                                x_min = b.x_min.get(),
+                                                x_max = b.x_max.get(),
+                                                y_min = b.y_min.get(),
+                                                y_max = b.y_max.get(),
+                                                m_a = m.a,
+                                                m_b = m.b,
+                                                m_c = m.c,
+                                                m_d = m.d,
+                                                m_tx = m.tx.get(),
+                                                m_ty = m.ty.get(),
+                                                filters = filter_count,
+                                                "AQW cache resolved to a zero-sided rect"
+                                            );
+                                        }
+                                        CacheSuppressReason::AllocZero
+                                    } else {
+                                        CacheSuppressReason::AllocRefused
+                                    });
                             }
                         } else {
-                            // Prefer an existing cache while the redraw is deferred.
-                            // If this is the first draw, normal vector rendering below
-                            // keeps the object visible until its cache is admitted.
-                            // The stale texture is anchored where its contents were
-                            // rendered; the live bounds may have moved/scaled since.
                             cache.deferred_frames = cache.deferred_frames.saturating_add(1);
                             AQW_CACHE_REDRAWS_DEFERRED
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5054,28 +3742,12 @@ pub fn render_base<'gc>(
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 }
                             }
-                            // A stale texture only stands in convincingly while the
-                            // object's bounds still sit near where its contents were
-                            // rendered. A fast animation (a weapon swing) moves them
-                            // by hundreds of pixels within a couple frames, and the
-                            // anchored old art then shows up detached, floating away
-                            // from the object. Past the drift tolerance, skip the
-                            // stale draw and let vector rendering below carry the
-                            // object this frame (briefly without filters, same
-                            // degradation as a fresh denied cache).
                             let current_offset = Point::new(
                                 bounds.x_min - base_transform.matrix.tx
                                     + Twips::from_pixels_i32(draw_offset.x),
                                 bounds.y_min - base_transform.matrix.ty
                                     + Twips::from_pixels_i32(draw_offset.y),
                             );
-                            // The tolerance is calibrated in ~1x windowed
-                            // pixels, like the large/small thresholds above,
-                            // but the offsets it is compared against are in
-                            // view-scaled surface pixels — scale it by the
-                            // view too, or fullscreen trips the drift guard on the
-                            // ambient motion that windowed absorbs and blinks
-                            // the object's filters off for a frame.
                             let max_drift_twips = if aqw_drift_norm_disabled() {
                                 AQW_STALE_ANCHOR_MAX_DRIFT_TWIPS
                             } else {
@@ -5125,8 +3797,6 @@ pub fn render_base<'gc>(
                         }
                     } else {
                         cache.deferred_frames = 0;
-                        // Settled. The next thing to happen to this object gets
-                        // the grace window again.
                         cache.dirty_streak = 0;
                         if cache.bitmap.is_none() {
                             suppress_reason = Some(CacheSuppressReason::CleanNoTexture);
@@ -5149,10 +3819,6 @@ pub fn render_base<'gc>(
                             "Skipping cacheAsBitmap for incredibly large object {:?} ({width} x {height})",
                             name
                         );
-                        // Same raw numbers as the zero case, for the same
-                        // reason: these are the two ends of one suspicion, and
-                        // comparing them needs the sides and the matrix, not
-                        // the size that both of them mangle.
                         if aqw_diagnostics_enabled() {
                             let m = &base_transform.matrix;
                             tracing::warn!(
@@ -5190,9 +3856,6 @@ pub fn render_base<'gc>(
         note_cache_suppressed(this, reason, suppress_detail.as_deref());
     }
 
-    // Placed here rather than beside the other probes at the top of the
-    // function because this is the first point where the outcome exists: the
-    // preference, the size gates and the redraw budget have all had their say.
     if aqw_flicker_probe_enabled() {
         note_cache_decision(this, context, cache_info.as_ref());
     }
@@ -5201,9 +3864,6 @@ pub fn render_base<'gc>(
     if let Some(cache_info) = cache_info {
         // In order to render an object to a texture, we need to draw its entire bounds.
         // Calculate the offset from tx/ty in order to accommodate any drawings that extend the bounds
-        // negatively. A stale (deferred) cache instead anchors at the offset recorded
-        // when its texture was actually rendered, so the old contents stay attached to
-        // the object rather than jumping to bounds they no longer match.
         let (offset_x, offset_y) = if let Some(anchor) = cache_info.offset_override {
             (anchor.x, anchor.y)
         } else {
@@ -5234,32 +3894,8 @@ pub fn render_base<'gc>(
                 library: context.library,
                 transform_stack: &mut transform_stack,
                 is_offscreen: true,
-                // The outer cache already captures this subtree. Reusing child
-                // cacheAsBitmap objects here duplicates textures and can explode
-                // memory in crowded AQW rooms. Filtered children are exempt:
-                // a filter is applied when a cache texture is drawn and the
-                // vector path has no step that applies one, so switching the
-                // cache off silently drops them -- and a ColorMatrixFilter is a
-                // colour operation, which is how an item can draw in the wrong
-                // colour for exactly as long as an ancestor is cached.
                 use_bitmap_cache: !is_aqw_movie_url(this.movie().url()),
-                // The exemption belongs to this context and to no other. The
-                // two other places that clear `use_bitmap_cache` -- the scaling
-                // grid and `BitmapData.draw` -- want the plain behaviour, and
-                // inferring the exemption from the flag alone gave the scaling
-                // grid nine bakes per frame for every filtered descendant.
                 cache_filtered_children: true,
-                // Not zero, which is what the first attempt at that exemption
-                // (2026-08-06) tripped over: `try_reserve_*` refuses on a zero
-                // budget, so a nested cache that went dirty could never be
-                // admitted and composited its *stale* texture into the parent's
-                // -- art from another moment baked into everything. Deferring is
-                // never right in here anyway. It trades freshness for frame
-                // time across frames, and a bake is a single frame's work whose
-                // result is then held; a deferral inside one is not paid back,
-                // it is preserved. The allowance is unbounded because what can
-                // reach it is bounded already: only filtered children get a
-                // cache here at all.
                 dirty_cache_redraws_remaining: u32::MAX,
                 dirty_cache_redraws_reserved: 0,
                 dirty_cache_redraw_pixels_remaining: u64::MAX,
@@ -5280,13 +3916,8 @@ pub fn render_base<'gc>(
         }
 
         // When rendering it back, ensure we're only keeping the translation - scale/rotation is within the image already
-        //
-        // Snapping a cache to whole pixels is what Flash does, and it is right
-        // for a cache the content asked for. The AQW avatar caches are ours,
-        // not the content's: an avatar walking at sub-pixel speed would jump
-        // half a pixel every frame, which reads as the art shaking. Those draw
-        // at their true position instead -- the drift guard only reacts above
-        // 16px, so nothing else catches this.
+        // Snapping a cache to whole pixels is what Flash does, and it is right for a cache the
+        // content asked for.
         let pixel_snapping = if cache_info.aqw_auto_cache {
             PixelSnapping::Never
         } else {
@@ -5661,20 +4292,6 @@ pub trait TDisplayObject<'gc>:
             }
         }
 
-        // Growing an *empty* rect is meaningless, and doing it is not harmless:
-        // `Rectangle::INVALID` is the sentinel for "no content", `is_valid`
-        // recognises it by `x_min` alone, and a filter moves `x_min` off the
-        // sentinel. The empty rect then passes as a real one whose far corner
-        // sits at the sentinel plus the filter growth, and the first ancestor to
-        // union it inherits a bounding box millions of pixels wide.
-        //
-        // Measured 2026-08-12: an avatar with an empty slot -- `Blank.swf` hair,
-        // `unarmed.swf`, an unused pose -- carrying a glow produced
-        // `x_min=21851 x_max=134218297`, which is the sentinel 134217727 plus
-        // 570 twips of glow. Bounds that size are refused a cache, so the whole
-        // subtree renders vector every frame and every blend placement inside it
-        // becomes its own pass: one such item was emitting ~2490 complex blends
-        // per sweep window and holding the frame at ~68 ms.
         if include_own_filters && bounds.is_valid() {
             for mut filter in self.filters().iter().cloned() {
                 filter.scale(view_matrix.a, view_matrix.d);
@@ -5706,34 +4323,12 @@ pub trait TDisplayObject<'gc>:
     /// This does NOT invalidate the cache, as it's often used with other operations.
     /// It is the callers responsibility to do so.
     #[no_dynamic]
-    /// Sets the color transform of this object.
-    /// This invalidates any ancestor's cacheAsBitmap automatically.
     fn set_color_transform(self, color_transform: ColorTransform) {
-        // Every other visual property does this -- x, y, rotation, scale and
-        // perspective all tell ancestors to regenerate. Colour did not, and a
-        // cache bakes its descendants' colour into the texture: the object's
-        // own transform is re-applied when the cache is drawn, but a child's
-        // is not. Content that tints named child parts after a cached ancestor
-        // exists therefore keeps the untinted texture, and whether the tint
-        // survives comes down to which happened first. That reads as the same
-        // asset drawing in different colours from one instance to the next.
         let changed = self.base().set_color_transform(color_transform);
         if changed && aqw_flicker_probe_enabled() {
             note_colour_write(self, &color_transform);
         }
         if changed && let Some(parent) = self.parent() {
-            // Self-transform changes are handled when the cache is drawn, so
-            // only ancestors need telling -- matching the sibling setters.
-            //
-            // Exempting these from the redraw budget was tried and reverted:
-            // content animates colour (fades) every frame, so "the colour
-            // changed" is true almost always, and the exemption removed the
-            // budget rather than making an exception to it. The mark below is
-            // not that: the budget still applies, and a cache that loses the
-            // race still waits. What it stops is the *stale texture* standing
-            // in while it waits, which for colour is a visible flash in the old
-            // colour. Such a cache renders as vectors until it is admitted --
-            // the same escape the drift guard already takes for position.
             parent.invalidate_cached_bitmap();
         }
     }
@@ -6155,10 +4750,6 @@ pub trait TDisplayObject<'gc>:
         self.base().parent()
     }
 
-    /// Whether this object belongs to an AQW player-asset Loader that was
-    /// removed from the display list. These detached trees may remain strongly
-    /// referenced by game code, but should not consume frame time until they
-    /// are attached again.
     #[no_dynamic]
     fn is_in_detached_aqw_avatar_loader(self) -> bool {
         let mut current: Option<DisplayObject<'gc>> = Some(self);
@@ -6176,9 +4767,6 @@ pub trait TDisplayObject<'gc>:
         false
     }
 
-    /// Live variant of `is_in_detached_aqw_avatar_loader` that doesn't wait
-    /// for the one-frame grace period to confirm the detach is persistent.
-    /// See `LoaderDisplay::is_currently_parentless_aqw_avatar_loader`.
     #[no_dynamic]
     fn is_in_currently_detached_aqw_avatar_loader(self) -> bool {
         let mut current: Option<DisplayObject<'gc>> = Some(self);
@@ -6205,13 +4793,6 @@ pub trait TDisplayObject<'gc>:
         let parent_removed = had_parent && parent.is_none();
         let parent_added = !had_parent && parent.is_some();
 
-        // The new ancestor chain has never seen this object, and the old one
-        // just lost a child; both have frame work to find. Marking after the
-        // reparent walks the chain the object actually hangs from now.
-        // A removal reaches here before `on_parent_removed` has put the object
-        // on the orphan list, so this mark finds nothing to note. That is fine:
-        // `add_orphan_obj` makes the entry pending itself, which is the same
-        // thing the mark would have said.
         self.mark_subtree_needs_frame(context);
         if let Some(parent) = parent {
             parent.mark_subtree_needs_frame(context);
@@ -6228,8 +4809,6 @@ pub trait TDisplayObject<'gc>:
         }
     }
 
-    /// This method is called when an object without a parent is attached.
-    /// It may be overwritten to restore implementation-specific state.
     fn on_parent_added(self, _context: &mut UpdateContext<'gc>) {}
 
     /// This method is called when the parent is removed.
@@ -6533,7 +5112,6 @@ pub trait TDisplayObject<'gc>:
         self.base().cell.borrow().cache.is_some()
     }
 
-    /// Drop any rendered bitmap cache while preserving the object's cache preference.
     #[no_dynamic]
     fn clear_bitmap_cache(self) {
         if let Some(cache) = &mut *self.base().bitmap_cache_mut() {
@@ -6656,94 +5234,26 @@ pub trait TDisplayObject<'gc>:
     ///    as properties on the class
     fn construct_frame(self, _context: &mut UpdateContext<'gc>) {}
 
-    /// Record that a frame pass has work to find here, and make sure it can be
-    /// reached: a nested goto skips clean subtrees, so an ancestor that still
-    /// looks clean would hide this object from the walk.
-    ///
-    /// Stops at the first ancestor already marked, which is what keeps this
-    /// cheap on the hot mutation paths -- in a settled tree the parent is
-    /// almost always marked already.
-    /// Whether a frame pass may skip this subtree entirely.
-    ///
-    /// Only inside a nested goto. The ordinary frame always walks everything,
-    /// so a mark this scheme fails to set costs one frame of latency there
-    /// rather than leaving an object unconstructed forever.
     #[no_dynamic]
     fn can_skip_frame_pass(self, context: &UpdateContext<'gc>) -> bool {
         *context.aqw_nested_goto && !self.base().subtree_needs_frame() && !frame_skip_disabled()
     }
 
-    /// The subtree mark on its own, without the nested-goto gate above.
-    ///
-    /// Probe-only, and it must stay that way. **Honouring this mark in the
-    /// ordinary tick's orphan walk was built and disproved on 2026-08-07: it
-    /// fails `avm2/orphan_movie_complex`, `avm2/orphan_movie_reorder`,
-    /// `avm2/orphan_removeobject`, `avm2/avm2_catchup_dobj` and
-    /// `timeline/missing_frame_scripts`.** A periodic full walk to bound the
-    /// damage (every 24 ticks, staggered by address) did not save it either.
-    ///
-    /// The reason is structural rather than a missing mark somewhere. This flag
-    /// tracks *construction* -- `needs_frame_construction` is literally "does
-    /// `construct_frame` still have something to do" -- while the tick's orphan
-    /// walk runs three passes, and `enter_frame` has to advance every playing
-    /// timeline in the subtree. Nothing sets the mark for that, and nothing
-    /// should: inside a nested goto the mark is a verdict precisely because the
-    /// ordinary tick is the backstop that catches what it misses.
-    ///
-    /// A sound skip needs a *different* signal -- one that says no timeline
-    /// under here will advance, which means propagating a playing-descendant
-    /// count the way this mark propagates. That is new machinery, not a wider
-    /// read of this one. What it would be worth is measured: see the
-    /// `orph_clean_*` columns and `AQW_ORPHAN_POP`.
     #[no_dynamic]
     fn aqw_subtree_clean(self) -> bool {
         !self.base().subtree_needs_frame()
     }
 
-    /// Recompute this object's mark from its own pending work and its children's
-    /// marks, after a pass has walked it. Called by the frame-script pass, which
-    /// is the last one over the tree -- clearing in the construct pass would hide
-    /// the work from the pass that still has to run.
-    /// Whether `construct_frame` still has something to do for this object, so
-    /// that the subtree mark survives a pass that could not finish.
-    ///
-    /// Paired with `construct_frame`: the default is `false` because the default
-    /// `construct_frame` is a no-op, and a type that overrides one must override
-    /// the other. Answering `object2().is_none()` for everything is the trap --
-    /// types that never allocate an AVM2 object would pin the mark forever and
-    /// propagate it up, which measured out at ~60% of orphan visits.
     fn needs_frame_construction(self) -> bool {
         false
     }
 
     #[no_dynamic]
     fn settle_subtree_needs_frame(self, children_need: bool) {
-        // Deliberately does *not* keep the mark alive for an object that still
-        // has no AVM2 side. That looks like the safe thing and is the opposite:
-        // several types never allocate an `object2` at all (an empty
-        // `construct_frame`, or any object in an AVM1 movie), so the mark would
-        // never clear and would propagate up through `children_need` forever.
-        // Measured 2026-08-01: it pinned ~60% of orphan visits permanently
-        // dirty, defeating the skip.
-        //
-        // Nothing is lost, because the skip only applies inside a nested goto
-        // and the ordinary frame always walks the whole tree -- an object that
-        // does need constructing gets constructed there, within one frame.
         self.base()
             .set_subtree_needs_frame(children_need || self.needs_frame_construction());
     }
 
-    /// Mark this object's whole subtree, as well as the path to it.
-    ///
-    /// A goto re-runs the frame scripts of everything under the clip it acts
-    /// on, and those scripts are *discovered* by `construct_frame`
-    /// (`check_has_pending_script`) rather than being known in advance. Marking
-    /// only upwards would let the construct pass skip a descendant, so its
-    /// script would never be found and never run -- which is exactly what
-    /// `timeline/frame_script_cleanup_goto2` catches.
-    ///
-    /// Costs one walk of the gotoed clip's subtree, which the frame would have
-    /// walked anyway. The stage's other ~360k objects stay skippable.
     #[no_dynamic]
     fn mark_subtree_needs_frame_deep(self, context: &mut UpdateContext<'gc>) {
         self.mark_subtree_needs_frame(context);
@@ -6756,9 +5266,6 @@ pub trait TDisplayObject<'gc>:
 
     #[no_dynamic]
     fn mark_subtree_needs_frame(self, context: &mut UpdateContext<'gc>) {
-        // Always mark self first. A freshly created object is already marked
-        // while its brand new ancestors are not, so an early return on "self is
-        // marked" would leave the path to it clean and unreachable.
         self.base().set_subtree_needs_frame(true);
 
         let mut top: DisplayObject<'gc> = self;
@@ -6766,17 +5273,12 @@ pub trait TDisplayObject<'gc>:
         while let Some(current) = node {
             top = current;
             if current.base().subtree_needs_frame() {
-                // Already reachable, so whatever this walk would have told the
-                // orphan loops was told when that ancestor was marked.
                 return;
             }
             current.base().set_subtree_needs_frame(true);
             node = current.parent();
         }
 
-        // The walk ended at a parentless object. If that is not the stage, this
-        // subtree hangs off the orphan list, and the next nested goto owes that
-        // root a pass.
         if !matches!(top, DisplayObject::Stage(_)) {
             context.orphan_manager.note_orphan_root_dirty(top);
         }
@@ -6907,7 +5409,6 @@ pub trait TDisplayObject<'gc>:
     #[no_dynamic]
     fn pre_render(self, _context: &mut RenderContext<'_, 'gc>) {
         let this = self.base();
-        // Read before the clear below, which is the only place it survives to.
         if aqw_diagnostics_enabled()
             && this.cache_invalidated()
             && is_aqw_movie_url(self.movie().url())
@@ -7513,20 +6014,6 @@ bitflags! {
         /// `Sprite.constructChildren`).
         const MANUAL_FRAME_CONSTRUCT  = 1 << 16;
 
-        /// Whether this object, or anything below it, may have work for
-        /// `construct_frame` or `run_frame_scripts` to find.
-        ///
-        /// An explicit AVM2 goto runs a whole recursive frame, which walks the
-        /// entire stage. Content that gotos in an `enterFrame` handler pays that
-        /// walk once per goto: measured 2026-08-01 in AQW at ~2270 nested frames
-        /// per 48 rendered ones over a tree of ~360k objects, which was 86-89%
-        /// of the frame. Almost none of that tree can have changed between two
-        /// gotos in the same frame, so a subtree that is known clean is skipped.
-        ///
-        /// Set on creation and by every mutation a frame pass reacts to;
-        /// recomputed bottom-up as the passes walk. Only *consulted* inside a
-        /// nested goto -- the ordinary frame still walks everything, so a missed
-        /// mark costs at most a frame of latency instead of breaking the object.
         const SUBTREE_NEEDS_FRAME     = 1 << 17;
     }
 }
@@ -7770,15 +6257,11 @@ impl<'gc> DisplayObjectWeak<'gc> {
 mod env_flag_tests {
     use super::aqw_env_flag;
 
-    /// Set a variable, read the flag, restore. Serialised by the mutex below,
-    /// because the environment is process-wide and tests run in parallel.
     fn with_var(value: Option<&str>, default: bool) -> bool {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         const NAME: &str = "RUFFLE_AQW_ENV_FLAG_TEST";
         match value {
-            // SAFETY: no other thread touches this variable; the lock above
-            // keeps these tests from racing each other.
             Some(v) => unsafe { std::env::set_var(NAME, v) },
             None => unsafe { std::env::remove_var(NAME) },
         }
@@ -7793,9 +6276,6 @@ mod env_flag_tests {
         assert!(with_var(None, true));
     }
 
-    /// The regression this parser exists for: presence used to be the whole
-    /// test, so `NO_SOMETHING=0` switched the thing it names OFF, which is the
-    /// opposite of what it reads as.
     #[test]
     fn explicit_false_spellings_turn_the_flag_off() {
         for spelling in ["0", "false", "FALSE", "off", "Off", "no", " false ", "  0"] {
@@ -7827,7 +6307,6 @@ mod url_tests {
             "https://game.aq.com/game/gamefiles/Loader3.swf",
             "gamefiles"
         ));
-        // The path in front of the segment is free to move.
         assert!(url_path_has_segment(
             "https://cdn.example.com/GameFiles/items/Sword.swf",
             "gamefiles"
@@ -7836,7 +6315,6 @@ mod url_tests {
             "https://game.aq.com/game/gamefiles/items/Sword.swf?v=2",
             "items"
         ));
-        // A partial name is not a segment, and neither is a query value.
         assert!(!url_path_has_segment(
             "https://a/gamefiles2/x.swf",
             "gamefiles"

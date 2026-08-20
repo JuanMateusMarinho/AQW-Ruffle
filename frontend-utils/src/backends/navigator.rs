@@ -27,17 +27,6 @@ use tokio::net::TcpStream;
 use tracing::warn;
 use url::{ParseError, Url};
 
-/// Local-file substitutions for fetched URLs, from `RUFFLE_AQW_LOCAL_SWF`.
-///
-/// Format: `Name.swf=C:\path\to\other.swf`, `;`-separated for several. A
-/// request whose URL path ends in `Name.swf` (query ignored) is answered from
-/// the local file instead of the network.
-///
-/// This exists to compare two builds of the same content against one unchanged
-/// player -- the only way to tell "the content got slower" apart from "the
-/// player handles the new content worse". Every hit is logged, because a
-/// previous round of this experiment ran with the override silently inactive
-/// and the results were taken at face value.
 fn aqw_local_swf_override(url: &str) -> Option<std::path::PathBuf> {
     static RULES: std::sync::OnceLock<Vec<(String, std::path::PathBuf)>> =
         std::sync::OnceLock::new();
@@ -231,8 +220,6 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
     }
 
     fn fetch(&self, request: Request) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
-        // Serve a local file in place of a fetched one, to A/B two builds of
-        // the same content against one unchanged player.
         if let Some(path) = aqw_local_swf_override(request.url()) {
             let url = request.url().to_string();
             return Box::pin(async move {
@@ -249,10 +236,6 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
                     ),
                 }
 
-                // Keep the original URL on the response. Both the game's own
-                // logic and this fork's URL-keyed gates read it, so swapping in
-                // a `file://` URL would change behaviour beyond the swap and
-                // make the comparison worthless.
                 Ok(Box::new(Response {
                     url,
                     response_body: ResponseBody::File(contents),

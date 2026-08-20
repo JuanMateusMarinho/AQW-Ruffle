@@ -215,15 +215,8 @@ pub struct Avm2<'gc> {
     /// currently present on the display list. This list keeps track of that.
     broadcast_list: FnvHashMap<AvmString<'gc>, Vec<BroadcastListener<'gc>>>,
 
-    /// AQW player asset listeners temporarily removed from the active broadcast
-    /// lists while their Loader is detached from the display list.
     broadcast_list_suspended: FnvHashMap<AvmString<'gc>, Vec<BroadcastListener<'gc>>>,
 
-    /// Number of AQW avatar loaders currently in the one-frame "detach pending"
-    /// window (parent just removed, not yet suspended). While this is zero -
-    /// i.e. in any steady-state room - the per-listener detached-loader check in
-    /// `broadcast_event` is skipped entirely, so it costs nothing outside of map
-    /// transitions. Maintained by `LoaderDisplay`'s detach bookkeeping.
     #[collect(require_static)]
     aqw_pending_detach_count: u32,
 
@@ -444,12 +437,6 @@ impl<'gc> Avm2<'gc> {
     ///
     /// Attempts to register the same listener for the same event will also do
     /// nothing.
-    /// `(live listeners, suspended listeners, largest bucket, its event name)`.
-    ///
-    /// `broadcast_frame_entered` dispatches to the whole `enterFrame` bucket
-    /// every frame, and that call sits inside the stage's `enter_frame` -- so
-    /// its cost has been landing in `stage_enter_ms` and reading as tree-walk
-    /// time, even though it walks listeners rather than display objects.
     pub fn broadcast_stats(&self) -> (usize, usize, usize, String) {
         let live = self.broadcast_list.values().map(Vec::len).sum();
         let suspended = self.broadcast_list_suspended.values().map(Vec::len).sum();
@@ -475,8 +462,6 @@ impl<'gc> Avm2<'gc> {
         }
     }
 
-    /// Remove one object from a specific broadcast event after its last
-    /// listener for that event has been removed.
     pub fn unregister_broadcast_listener(
         &mut self,
         object_ptr: *const crate::avm2::object::ObjectPtr,
@@ -553,9 +538,6 @@ impl<'gc> Avm2<'gc> {
         self.broadcast_list.values().map(std::vec::Vec::len).sum()
     }
 
-    /// Whether any AQW avatar loader is in the one-frame detach-pending window.
-    /// When false, `broadcast_event` can skip its per-listener detached-loader
-    /// check entirely.
     pub fn aqw_has_pending_detach(&self) -> bool {
         self.aqw_pending_detach_count > 0
     }
@@ -636,20 +618,6 @@ impl<'gc> Avm2<'gc> {
 
         context.avm2.broadcast_list.entry(event_name).or_default();
 
-        // Walk by the listener's `order`, not by index. A handler can remove
-        // itself (or anything else) from this bucket -- `removeEventListener`
-        // drops the last listener for an event through
-        // `unregister_broadcast_listener` -- and every entry after the removed
-        // one then shifts down, so an index-based walk skips exactly one
-        // listener. That is what `avm2/movieclip_displayevents_looping`
-        // catches: its `delayed_destroy` unregisters during the `exitFrame`
-        // broadcast and the next watcher never hears the event.
-        //
-        // Orders are assigned from a monotonic counter and every path that
-        // touches a bucket preserves ascending order, so a `partition_point`
-        // finds the next unvisited entry no matter how the bucket moved.
-        // Capturing the counter up front keeps the upstream rule that
-        // listeners registered *during* a broadcast do not receive it.
         let order_limit = context.avm2.next_broadcast_listener_order;
         let mut next_order = 0u64;
 
@@ -667,26 +635,11 @@ impl<'gc> Avm2<'gc> {
             if let Some(object) = listener.object.upgrade(context.gc())
                 && object.is_of_type(on_type.inner_class_definition())
             {
-                // Skip AQW avatar-loader children the instant they're parentless,
-                // rather than waiting for the deferred suspend bookkeeping to
-                // catch up. Otherwise a listener like `AvatarMC.onEnterFrameWalk`
-                // can run with `this.stage == null` for one frame before it's
-                // suspended, throwing and leaving the avatar stuck (see
-                // `is_in_currently_detached_aqw_avatar_loader`).
-                //
-                // This only matters during the one-frame detach window; gate the
-                // per-listener tree walk on a global counter so it's free in any
-                // steady-state (e.g. a crowded room with stable avatars), where no
-                // loader is mid-detach.
                 let suspended = context.avm2.aqw_has_pending_detach()
                     && object.as_display_object().is_some_and(|display_object| {
                         display_object.is_in_currently_detached_aqw_avatar_loader()
                     });
                 if !suspended {
-                    // Attribute the handler's cost to its class. Measured
-                    // 2026-08-01: ~23 `enterFrame` listeners account for 96%
-                    // of the stage phase, so the expensive ones are few and
-                    // naming them is the whole question.
                     let probe = crate::display_object::aqw_diagnostics_enabled()
                         .then(std::time::Instant::now);
 
@@ -694,10 +647,6 @@ impl<'gc> Avm2<'gc> {
                     events::broadcast_event(&mut activation, object, event);
 
                     if let Some(started) = probe {
-                        // Record every call, not just slow ones. A 100us floor
-                        // made a build whose handlers were merely cheap look
-                        // like a build that barely called them, which is a
-                        // different diagnosis entirely.
                         let elapsed = started.elapsed().as_nanos() as u64;
                         let name = object.instance_class().name().local_name().to_string();
                         crate::display_object::aqw_note_listener_cost(name, elapsed);

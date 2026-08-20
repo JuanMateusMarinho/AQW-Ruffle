@@ -75,12 +75,6 @@ impl<'gc> LoaderDisplay<'gc> {
         self.parent().is_none() && self.0.aqw_was_detached.get() && self.contains_aqw_avatar_asset()
     }
 
-    /// Like `is_detached_aqw_avatar_loader`, but doesn't require the one-frame
-    /// grace period (`aqw_was_detached`) to have already elapsed. Used to skip
-    /// `Event.ENTER_FRAME` broadcast dispatch to a child the instant it's
-    /// parentless, closing the race where AQW's own frame scripts (e.g.
-    /// `AvatarMC.onEnterFrameWalk` -> `stopWalking`) read `this.stage` before
-    /// the deferred suspend/restore bookkeeping has caught up.
     pub fn is_currently_parentless_aqw_avatar_loader(self) -> bool {
         self.parent().is_none() && self.contains_aqw_avatar_asset()
     }
@@ -216,9 +210,6 @@ impl<'gc> TDisplayObject<'gc> for LoaderDisplay<'gc> {
     fn on_parent_removed(self, context: &mut UpdateContext<'gc>) {
         if self.movie().is_action_script_3() {
             if self.contains_aqw_avatar_asset() {
-                // AQW frequently removes and re-adds Loaders in the same frame
-                // while reordering players, monsters, rooms, and UI. Wait until
-                // the next frame before treating the removal as persistent.
                 if !self.0.aqw_detach_pending.replace(true) {
                     context.avm2.aqw_inc_pending_detach();
                 }

@@ -1199,9 +1199,6 @@ fn extract_maybe_array_sort_options<'gc>(
     Ok(out)
 }
 
-/// Extract side-effect-free numeric keys for the common single-field
-/// `sortOn` case. Returning `None` keeps getters, proxies, prototypes,
-/// coercions, and sealed traits on the fully generic path.
 fn numeric_dynamic_sort_keys<'gc>(
     activation: &mut Activation<'_, 'gc>,
     values: &[(usize, Value<'gc>)],

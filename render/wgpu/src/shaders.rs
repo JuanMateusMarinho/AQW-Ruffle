@@ -14,12 +14,7 @@ pub struct Shaders {
     pub bitmap_shader: wgpu::ShaderModule,
     pub gradient_shader: wgpu::ShaderModule,
     pub copy_shader: wgpu::ShaderModule,
-    /// `copy.wgsl` with a fixed Catmull-Rom resampling fragment stage; used for
-    /// scaled AQW presents (see `copy_sharp.wgsl`).
     pub copy_sharp_shader: wgpu::ShaderModule,
-    /// `copy_sharp.wgsl` plus positional scanlines and an aperture-grille
-    /// mask; used when the in-game AQW "CRT Filter" option is ON
-    /// (see `copy_crt.wgsl`).
     pub copy_crt_shader: wgpu::ShaderModule,
     pub alpha_mask_shader: wgpu::ShaderModule,
     pub blend_shaders: EnumMap<ComplexBlend, wgpu::ShaderModule>,
@@ -40,10 +35,6 @@ impl Shaders {
         );
         let copy_shader = make_shader(device, "copy.wgsl", include_str!("../shaders/copy.wgsl"));
         let copy_sharp_shader = {
-            // The sharpening strength is a process-wide startup setting, so it
-            // is baked into the shader source instead of costing the copy
-            // pipeline a uniform. An unmatched replace leaves the shader's own
-            // default of 0.5 in effect.
             let source = include_str!("../shaders/copy_sharp.wgsl").replace(
                 "const SHARPNESS: f32 = 0.5;",
                 &format!("const SHARPNESS: f32 = {:.4};", aqw_present_sharpness()),
@@ -51,8 +42,6 @@ impl Shaders {
             make_shader(device, "copy_sharp.wgsl", &source)
         };
         let copy_crt_shader = {
-            // Like copy_sharp, all knobs are process-wide startup settings
-            // baked into the source so the copy pipeline stays uniform-free.
             let source = include_str!("../shaders/copy_crt.wgsl")
                 .replace(
                     "const SHARPNESS: f32 = 0.5;",
@@ -234,9 +223,6 @@ impl Shaders {
     }
 }
 
-/// Cubic sharpness in `copy_sharp.wgsl` (0 = C 0.25, 1 = C 0.75), read once
-/// at startup and baked into the shader source. `RUFFLE_AQW_SHARPNESS`
-/// overrides (default 0.5 = exact Catmull-Rom).
 fn aqw_present_sharpness() -> f32 {
     std::env::var("RUFFLE_AQW_SHARPNESS")
         .ok()
@@ -246,17 +232,11 @@ fn aqw_present_sharpness() -> f32 {
         .unwrap_or(0.5)
 }
 
-/// Whether this process is running DragonFable, from the env the launcher
-/// (and the test scripts) set per game. DF's bright parchment art clips
-/// with the CRT tuning approved on AQW's darker palette, so a few CRT
-/// defaults bake lower there; explicit `RUFFLE_AQW_CRT_*` envs still win.
 fn artix_game_is_dragonfable() -> bool {
     std::env::var("ARTIX_RUFFLE_GAME").is_ok_and(|v| v == "df")
         || std::env::var("ARTIX_RUFFLE_GAME_ICON").is_ok_and(|v| v == "dragonfable")
 }
 
-/// CRT strength knobs (0..1), read once at startup and baked into
-/// `copy_crt.wgsl`.
 fn aqw_crt_env_strength(var: &str, default: f32) -> f32 {
     std::env::var(var)
         .ok()

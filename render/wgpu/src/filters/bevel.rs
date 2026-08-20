@@ -173,9 +173,6 @@ impl BevelFilter {
             source,
             &filter.inner_blur_filter(),
         );
-        // See GlowFilter: the blurred texture's UVs are computed against the
-        // texture actually sampled (a possibly padded blur target with the
-        // content at its origin, or the source sub-region when no blur ran).
         let (blurred_texture, blur_dims, blur_origin) = if let Some(blurred) = &blurred {
             blurred.ensure_cleared(draw_encoder);
             let texture = blurred.color_texture();

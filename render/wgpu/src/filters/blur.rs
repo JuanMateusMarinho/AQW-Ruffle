@@ -30,9 +30,6 @@ pub struct BlurFilter {
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
     vertex_buffer: wgpu::Buffer,
-    /// Vertices for the ping-pong passes (sampling the previous flip/flop
-    /// target). Written per `apply` because padded pool targets hold their
-    /// content in a logical sub-rectangle rather than spanning UV 0..1.
     pingpong_vertex_buffer: wgpu::Buffer,
     uniform_buffer: wgpu::Buffer,
     vertices_size: wgpu::BufferSize,
@@ -208,9 +205,6 @@ impl BlurFilter {
                 &descriptors.device,
             )
             .copy_from_slice(bytemuck::cast_slice(&[source.vertices()]));
-        // Ping-pong passes sample only the logical content region of the
-        // previous (possibly padded) target. flip and flop share dimensions,
-        // so one vertex set serves every pass.
         let pingpong_vertices = flip.filter_source().vertices();
         staging_belt
             .write_buffer(
@@ -251,9 +245,6 @@ impl BlurFilter {
                     (
                         flip.color_view(),
                         self.pingpong_vertex_buffer.slice(..),
-                        // The texel step is in the sampled texture's UV
-                        // space, which spans the allocated (padded)
-                        // dimensions — not the logical content size.
                         flip.color_texture().width() as f32,
                         flip.color_texture().height() as f32,
                     )

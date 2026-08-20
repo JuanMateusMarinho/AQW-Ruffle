@@ -247,17 +247,9 @@ impl QueueSyncHandle {
     }
 }
 
-/// Live GPU memory behind `BitmapHandle`s: bitmap caches, the `BitmapData`
-/// surfaces content draws into, and decoded SWF bitmaps.
-///
-/// Neither texture pool can see any of it. These textures belong to the
-/// handle and are freed only when its last clone drops, so a diagnostic that
-/// adds up the two pools can report a healthy total while this grows without
-/// bound — which is exactly the shape of the unaccounted commit growth.
 static BITMAP_TEXTURE_BYTES: AtomicI64 = AtomicI64::new(0);
 static BITMAP_TEXTURE_COUNT: AtomicI64 = AtomicI64::new(0);
 
-/// `(live textures, bytes)` currently held by `BitmapHandle`s.
 pub fn bitmap_texture_stats() -> (i64, i64) {
     (
         BITMAP_TEXTURE_COUNT.load(Ordering::Relaxed),
@@ -265,12 +257,6 @@ pub fn bitmap_texture_stats() -> (i64, i64) {
     )
 }
 
-/// Live bitmap textures grouped by dimensions, tracked only under the AQW
-/// diagnostics flag because it costs a lock on every texture birth and death.
-///
-/// The totals alone cannot say what is accumulating: a gigabyte is thousands
-/// of avatar-sized caches or a few hundred room-sized bitmaps, and those have
-/// nothing to do with each other. The shape names the source.
 fn bitmap_texture_sizes()
 -> &'static std::sync::Mutex<std::collections::HashMap<(u32, u32), (usize, u64)>> {
     static SIZES: OnceLock<std::sync::Mutex<std::collections::HashMap<(u32, u32), (usize, u64)>>> =
@@ -299,13 +285,6 @@ fn track_bitmap_texture(texture: &wgpu::Texture, bytes: i64, born: bool) {
     }
 }
 
-/// `(distinct sizes, bytes across all of them)`.
-///
-/// The pair the largest-buckets list cannot provide: a handful of sizes means
-/// a few repeated allocations, hundreds means the same content re-rasterized
-/// at dimensions that keep shifting. The byte total is also the control — if
-/// it does not come close to the reported live total, the tracking is wrong
-/// and the shape below it means nothing.
 pub fn bitmap_texture_buckets() -> (usize, u64) {
     let Ok(sizes) = bitmap_texture_sizes().lock() else {
         return (0, 0);
@@ -313,7 +292,6 @@ pub fn bitmap_texture_buckets() -> (usize, u64) {
     (sizes.len(), sizes.values().map(|(_, bytes)| bytes).sum())
 }
 
-/// The biggest live bitmap-texture buckets as `(width, height, count, bytes)`.
 pub fn bitmap_texture_largest(limit: usize) -> Vec<(u32, u32, usize, u64)> {
     let Ok(sizes) = bitmap_texture_sizes().lock() else {
         return Vec::new();
@@ -354,8 +332,6 @@ impl Drop for Texture {
 }
 
 impl Texture {
-    /// The only way to build one, so the accounting above cannot be bypassed
-    /// by a new call site.
     pub(crate) fn new(texture: wgpu::Texture) -> Self {
         let bytes = texture_bytes(&texture);
         BITMAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);

@@ -12,8 +12,6 @@ use std::cell::Cell;
 #[collect(no_drop)]
 pub enum Op<'gc> {
     Add {
-        /// Whether the two inputs to this op are both guaranteed to be
-        /// integers. This field is used in the optimizer.
         inputs_integral: bool,
     },
     AddI,
@@ -272,8 +270,6 @@ pub enum Op<'gc> {
     },
     PushNull,
     PushScope {
-        // Whether the input to this op is guaranteed to be not-null. This field
-        // is used in the optimizer.
         input_not_null: bool,
     },
     PushString {
@@ -335,7 +331,6 @@ pub enum Op<'gc> {
         index: u32,
     },
     Subtract {
-        /// See comment on `Op::Add`
         inputs_integral: bool,
     },
     SubtractI,

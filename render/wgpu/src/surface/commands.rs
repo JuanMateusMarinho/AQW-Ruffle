@@ -22,8 +22,6 @@ use std::sync::OnceLock;
 use swf::{BlendMode, Color, ColorTransform, Twips};
 use wgpu::Backend;
 
-/// Kill-switch: `RUFFLE_AQW_NO_BLEND_TARGET_SHRINK` restores full-surface
-/// complex blend targets, for field A/B without a rebuild.
 fn blend_target_shrink_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| {
@@ -31,27 +29,12 @@ fn blend_target_shrink_disabled() -> bool {
     })
 }
 
-/// MEASUREMENT ONLY -- `RUFFLE_AQW_BLEND_AS_NORMAL` demotes every complex blend
-/// to a plain one, which is visually wrong but keeps the art on screen.
-///
-/// A complex blend costs a render pass of its own to composite; a trivial one
-/// folds into the batched draw chunk. Toggling this therefore prices the
-/// compositing passes alone, with the per-blend target and its sub-render
-/// unchanged, which is what says whether collapsing those passes is worth
-/// building. Never a fix: it is the wrong blend maths.
 fn blend_measured_as_normal() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED
         .get_or_init(|| ruffle_render::backend::aqw_env_flag("RUFFLE_AQW_BLEND_AS_NORMAL", false))
 }
 
-/// MEASUREMENT ONLY -- `RUFFLE_AQW_SKIP_COMPLEX_BLEND` drops complex blends
-/// entirely: no target, no sub-render, no composite. The blended art simply
-/// does not appear.
-///
-/// This is the floor. Whatever frame time remains belongs to the rest of the
-/// scene, so it says how much of the budget attacking blends could ever
-/// recover -- and therefore whether any amount of that work reaches 24fps.
 fn blend_measured_skipped() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -59,28 +42,6 @@ fn blend_measured_skipped() -> bool {
     })
 }
 
-/// Composites multiply through GPU blend state instead of a pass of its own,
-/// wherever the destination is opaque. On by default;
-/// `RUFFLE_AQW_NO_MULTIPLY_FIXED_FUNCTION=1` restores the shader pass.
-///
-/// Unlike the two levers above this is not a deliberate lie: over an opaque
-/// destination the state is term-for-term the shader's own expression, derived
-/// in [`crate::blend::TrivialBlend::blend_state`]. Any visible difference is a
-/// defect, not a tradeoff.
-///
-/// Measured in a full Yulgar, 2026-08-14, matched on both occupancy and cache
-/// bakes: GPU submit **43.7 -> 25.3 ms/frame** against a 41.7ms budget, and
-/// process commit 4632 -> 3064 MB. Complex passes fell from 2054 to 897 per
-/// window. That is the whole prize available -- demoting *every* complex blend,
-/// art be damned, measured 26.3 -- because the multiply population is the map
-/// art, whose targets are large, while the overlay and hardlight left behind
-/// are avatar items with small ones. Counting passes underestimates this
-/// badly; the first estimate from pass share alone said 59% of the prize.
-///
-/// The soundness condition is that nothing takes the destination's opacity back
-/// after a multiply has composited onto it, which only Alpha and Erase can do.
-/// Both measured zero across the session, and `blend_modes` reports them, so a
-/// run where they appear is a run to look at this again.
 fn multiply_fixed_function() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -88,26 +49,6 @@ fn multiply_fixed_function() -> bool {
     })
 }
 
-/// MEASUREMENT ONLY -- `RUFFLE_AQW_TRIVIAL_BLEND_DIRECT` renders a trivial
-/// blend straight into the surface it sits in, instead of into a target of its
-/// own.
-///
-/// A trivial blend keeps every part of the complex machinery except the
-/// compositing pass: full-surface target, clear, sub-render, full-surface quad
-/// to draw it back. Nothing priced that, because `blend_alloc`/`blend_cover`
-/// were both gated on complex. Toggling this removes the whole apparatus, so
-/// the frame-time difference is what the apparatus costs.
-///
-/// Never a fix: the group is no longer flattened before the blend state
-/// applies, so `Add`/`Screen`/`Subtract` accumulate per child instead of once
-/// over the composited group, and a `Layer` loses both group alpha and the
-/// layer an `Alpha`/`Erase` child resolves against. Wrong image on purpose,
-/// same as `RUFFLE_AQW_BLEND_AS_NORMAL` -- and, like it, the art stays on
-/// screen, which is what makes the scene comparable at all.
-///
-/// It covers every trivial mode deliberately. Restricting it to `Layer` looked
-/// safer and measured nothing: `Layer` is 23 of 68266 trivial blends in a
-/// session, against 66551 `Add`.
 fn trivial_blend_measured_direct() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -539,19 +480,7 @@ pub enum Chunk {
         texture: PoolOrArcTexture,
         blend_mode: ChunkBlendMode,
         needs_stencil: bool,
-        /// Extent of the content drawn into `texture`, in surface pixels.
-        ///
-        /// The rest of `texture` is the clear colour, which is transparent for
-        /// every blend mode, and every complex blend shader discards on
-        /// `src.a <= 0`. So the pass can be scissored to this without changing
-        /// a pixel — see `Surface::draw_commands`.
         bounds: ContentBounds,
-        /// Footprint of `texture` in the target being composited into, as
-        /// `(x, y, width, height)`.
-        ///
-        /// The whole target unless the blend was sized to its content, in which
-        /// case the pass draws only this rect and `texture` covers exactly it —
-        /// so the unit quad doubles as the source's texture coordinate.
         rect: (u32, u32, u32, u32),
     },
 }
@@ -611,10 +540,6 @@ pub enum LayerRef<'a> {
 
 /// Replaces every blend with a RenderBitmap, with the subcommands rendered out to a temporary texture
 /// Every complex blend will be its own item, but every other draw will be chunked together
-///
-/// Also returns the extent of everything drawn, in target pixels, which is what
-/// lets a caller bound its own blend pass when these commands are themselves the
-/// contents of a blend.
 #[expect(clippy::too_many_arguments)]
 pub fn chunk_blends<'a>(
     commands: CommandList,
@@ -648,20 +573,8 @@ pub fn chunk_blends<'a>(
     .chunk_blends(commands)
 }
 
-/// Extent a command list will cover, without rendering any of it.
-///
-/// A blend target has to be sized before its contents are drawn, so the bounds
-/// the chunker accumulates as a side effect come too late. This walks the same
-/// geometry ahead of time: matrices are already in surface pixels, quad-shaped
-/// draws cover the unit square, and shapes carry their tessellated extent.
-///
-/// Conservative on purpose -- masks bound by their masker rather than the
-/// intersection, and anything unbounded poisons the result to the full surface,
-/// which just means a pass keeps its old full-size target.
 pub fn command_list_bounds(commands: &CommandList) -> ContentBounds {
     fn visit(commands: &CommandList, out: &mut ContentBounds, depth: u32) {
-        // Matches the recursion guard in `CommandList::execute`; a list too
-        // deep to render should not be measured either.
         if depth > 64 {
             *out = ContentBounds::UNBOUNDED;
             return;
@@ -692,10 +605,7 @@ pub fn command_list_bounds(commands: &CommandList) -> ContentBounds {
                 Command::Blend(inner, _) => visit(inner, out, depth + 1),
                 Command::RenderAlphaMask {
                     maskee_commands, ..
-                } => {
-                    // Output is `maskee.rgb * mask.a`, so the maskee bounds it.
-                    visit(maskee_commands, out, depth + 1)
-                }
+                } => visit(maskee_commands, out, depth + 1),
                 Command::PushMask
                 | Command::ActivateMask
                 | Command::DeactivateMask
@@ -727,17 +637,8 @@ struct WgpuCommandHandler<'a> {
     transforms: BufferBuilder,
     needs_stencil: bool,
     num_masks: i32,
-    /// Extent of everything drawn so far, in the commands' own (surface)
-    /// coordinates -- taken before `origin` is subtracted, so it stays
-    /// meaningful to whoever composites this target.
     content_bounds: ContentBounds,
-    /// Subtracted from every draw's translation, placing surface coordinates
-    /// inside a target that covers only part of the surface.
     origin: (f32, f32),
-    /// Whether the target these commands land in was cleared opaque. Purely
-    /// measurement: it says which multiply passes fixed-function blend state
-    /// could have handled. Nested naturally, since a blend renders its subtree
-    /// through a fresh handler over its own (transparent) target.
     dest_opaque: bool,
 }
 
@@ -822,10 +723,6 @@ impl<'a> WgpuCommandHandler<'a> {
         (result, content_bounds)
     }
 
-    /// Grows the content extent by a draw of `local_bounds` placed by `matrix`.
-    ///
-    /// `local_bounds` is the geometry in the draw's own space: the unit square
-    /// for everything quad-shaped, the mesh extent for shapes.
     fn note_bounds(&mut self, matrix: &Matrix, local_bounds: ContentBounds) {
         self.content_bounds.union_transformed(matrix, local_bounds);
     }
@@ -838,8 +735,6 @@ impl<'a> WgpuCommandHandler<'a> {
         command_builder: impl FnOnce(wgpu::DynamicOffset) -> DrawCommand,
     ) {
         self.note_bounds(&matrix, local_bounds);
-        // Bounds are recorded in surface coordinates above; only what the GPU
-        // draws is shifted into the target.
         let transform = Transforms {
             world_matrix: [
                 [matrix.a, matrix.b, 0.0, 0.0],
@@ -888,27 +783,15 @@ impl CommandHandler for WgpuCommandHandler<'_> {
         } else {
             self.nearest_layer
         };
-        // The mode the content asked for, kept before `BlendType` folds Normal
-        // and Layer together, so the trivial tally can tell the two apart.
         let builtin_mode = match &blend_mode {
             RenderBlendMode::Builtin(mode) => Some(*mode),
             RenderBlendMode::Shader(_) => None,
         };
         let blend_type = BlendType::from(blend_mode);
 
-        // We currently do not support shader blends in masks. In order not to
-        // break other parts of the scene, we just fall back to a normal blend.
-        //
-        // TODO Add support for shader blends in masks.
         let is_shader_blend_in_mask =
             self.num_masks > 0 && matches!(blend_type, BlendType::Shader(_));
-        // Whether this blend composites through a pass of its own, decided
-        // before any measurement demotion below so that toggling the
-        // measurement changes one thing and not two.
         let is_complex = matches!(blend_type, BlendType::Complex(_));
-        // Captured for the same reason as `is_complex`: the fold below moves
-        // this out of the complex path, and the tally has to keep reading the
-        // same population either way or the A/B has nothing to compare.
         let is_multiply = matches!(blend_type, BlendType::Complex(ComplexBlend::Multiply));
 
         if is_complex && blend_measured_skipped() {
@@ -918,12 +801,6 @@ impl CommandHandler for WgpuCommandHandler<'_> {
         let blend_type = if is_shader_blend_in_mask || (blend_measured_as_normal() && is_complex) {
             BlendType::Trivial(TrivialBlend::Normal)
         } else if is_multiply && self.dest_opaque && multiply_fixed_function() {
-            // Exact here and only here; the derivation is in `blend_state`.
-            //
-            // Verified against the reference images rather than by algebra
-            // alone: `visual/blend_modes/multiply` and both `acid-blend` tests
-            // exercise this path (proven by folding to the wrong state, which
-            // fails exactly those three) and pass unchanged with it.
             BlendType::Trivial(TrivialBlend::Multiply)
         } else {
             blend_type
@@ -935,31 +812,6 @@ impl CommandHandler for WgpuCommandHandler<'_> {
             return;
         }
 
-        // Every blend composites through its own render target. Sized to the
-        // whole surface that is by far the biggest thing this renderer holds --
-        // a crowded room keeps hundreds alive at once, measured at
-        // 843 x 1600x841 = 4.3GB, which is what pushes VRAM past the OS grant
-        // and starts the paging that collapses the frame rate. Sizing it to
-        // the content instead is the same picture in a fraction of the memory,
-        // since everything outside the content is transparent either way.
-        //
-        // Trivial blends were left out of this when it was written, on the
-        // assumption that skipping the compositing pass made them the cheap
-        // half. It does not: the target, its clear and the quad that draws it
-        // back are identical either way. Measured alone in an empty room, they
-        // took 38 full-surface targets per frame -- 109.7 Mpx, every one of
-        // them holding under 1% content -- and removing that apparatus was
-        // worth 4.0ms of a 41.7ms frame, 687MB of pool retention and 1.2GB of
-        // process commit, with both arms matched on the scene.
-        //
-        // Sound for the same reason as the complex case, and for all four
-        // modes: outside the content the source is transparent, and Normal,
-        // Add, Subtract and Screen all leave the destination untouched where
-        // the source is zero. This drops fill, not result.
-        //
-        // Measured ahead of drawing, because the target has to exist first.
-        // PixelBender keeps the full-size target: the shader is arbitrary code,
-        // with no guarantee it reads only where the content is.
         let bounded =
             !matches!(blend_type, BlendType::Shader(_)) && !blend_target_shrink_disabled();
         let rect = bounded
@@ -991,8 +843,6 @@ impl CommandHandler for WgpuCommandHandler<'_> {
         }
         let alloc_px = surface_width as u64 * surface_height as u64;
         let full_px = self.width as u64 * self.height as u64;
-        // Outside the complex arm on purpose: once the fold claims a multiply
-        // it never reaches there, and this is the count the fold is judged by.
         crate::blend::note_multiply_dest(is_multiply, self.dest_opaque, alloc_px);
 
         let surface = Surface::new(
@@ -1017,20 +867,10 @@ impl CommandHandler for WgpuCommandHandler<'_> {
             self.texture_pool,
         );
         target.ensure_cleared(self.draw_encoder);
-        // Recorded in surface coordinates, so it carries over untransformed
-        // however the target was sized.
         let blend_bounds = target.content_bounds();
 
         match blend_type {
             BlendType::Trivial(blend_mode) => {
-                // What this cost, at the only point where both halves are
-                // known: the target is sized and the subtree has been drawn, so
-                // its real extent is settled. `blend_bounds` is in the
-                // commands' coordinates, so it is shifted into the target's
-                // before being clipped against it -- the same move the complex
-                // pass makes before scissoring. The complex path reports the
-                // same pair from `note_blend_coverage`/`note_blend_alloc`,
-                // which makes the two directly comparable.
                 crate::blend::note_trivial_blend(builtin_mode);
                 crate::blend::note_trivial_blend_target(
                     blend_bounds
@@ -1040,16 +880,6 @@ impl CommandHandler for WgpuCommandHandler<'_> {
                     full_px,
                 );
                 let transform = Transform {
-                    // The target covers `surface_origin` onwards in the
-                    // commands' coordinate space, and `add_to_current`
-                    // subtracts this handler's own origin from whatever it is
-                    // given, so the quad has to be placed in that same space.
-                    // A bare scale put it at the origin of the space instead,
-                    // which was only ever right because a trivial target
-                    // started exactly where its parent did -- true until this
-                    // function started sizing them to their content, and
-                    // already wrong before that for one nested inside a
-                    // content-sized complex target.
                     matrix: Matrix::create_box(
                         target.width() as f32,
                         target.height() as f32,
@@ -1087,9 +917,6 @@ impl CommandHandler for WgpuCommandHandler<'_> {
                             ],
                             label: None,
                         });
-                // The matrix covers the whole surface, but only `blend_bounds`
-                // of it was actually drawn into; carry that up rather than
-                // letting a nested blend widen an enclosing one to full screen.
                 self.add_to_current(
                     transform.matrix,
                     transform.color_transform,
@@ -1132,14 +959,9 @@ impl CommandHandler for WgpuCommandHandler<'_> {
                     blend_mode: chunk_blend_mode,
                     needs_stencil: self.num_masks > 0,
                     bounds: blend_bounds,
-                    // Where this target sits in the target being composited
-                    // into. The pass draws exactly this rect, so the unit quad
-                    // doubles as the source texture's coordinate.
                     rect: rect.unwrap_or((0, 0, self.width, self.height)),
                 });
                 self.needs_stencil = self.num_masks > 0;
-                // The blend writes wherever its source is opaque, so this chunk
-                // contributes the same extent to any enclosing blend.
                 self.content_bounds.union_pixels(blend_bounds);
             }
         }
@@ -1161,8 +983,6 @@ impl CommandHandler for WgpuCommandHandler<'_> {
                 texture.texture.height() as f32,
             );
         }
-        // The texture size is already folded into `matrix`, so the drawn
-        // geometry is the unit quad.
         self.add_to_current(
             matrix,
             transform.color_transform,
@@ -1200,8 +1020,6 @@ impl CommandHandler for WgpuCommandHandler<'_> {
     }
 
     fn render_shape(&mut self, shape: ShapeHandle, transform: Transform) {
-        // Tessellated vertices are in pixels, same as the matrix, so the mesh
-        // extent is the local geometry.
         let mesh_bounds = as_mesh(&shape).bounds;
         self.add_to_current(
             transform.matrix,
@@ -1301,8 +1119,6 @@ impl CommandHandler for WgpuCommandHandler<'_> {
         );
         maskee.ensure_cleared(self.draw_encoder);
         let matrix = Matrix::scale(maskee.width() as f32, maskee.height() as f32);
-        // `alpha_mask.wgsl` outputs `maskee.rgb * mask.a`, so nothing can show
-        // outside the maskee's own extent. Same coordinate system, no transform.
         let maskee_bounds = maskee.content_bounds();
         let maskee = maskee.take_color_texture();
 

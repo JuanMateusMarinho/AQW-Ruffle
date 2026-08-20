@@ -18,8 +18,6 @@ extern crate num_derive;
 #[macro_use]
 mod avm1;
 mod avm2;
-// Exposed for native embedders that script the loaded movie (calling AS3 methods /
-// reading properties on game objects). Generic engine surface, not content-specific.
 pub use avm2::{
     Activation as Avm2Activation, FunctionArgs as Avm2FunctionArgs, Value as Avm2Value,
 };

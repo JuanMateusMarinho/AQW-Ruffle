@@ -31,14 +31,9 @@ use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 thread_local! {
-    /// How many button framescript passes are on the stack right now.
     static FRAMESCRIPT_PASS_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
-/// Whether a button is currently running its whole-stage construct and
-/// framescript pass. Frame scripts reached during one are running out of turn:
-/// the clip that placed the button is mid-way through constructing it, so the
-/// field it holds that child in is still unwritten.
 pub(super) fn in_framescript_pass() -> bool {
     FRAMESCRIPT_PASS_DEPTH.with(|depth| depth.get() > 0)
 }
@@ -456,11 +451,6 @@ impl<'gc> TDisplayObject<'gc> for Avm2Button<'gc> {
         }
     }
 
-    /// Conservative: a button constructs its *state* children, which are not on
-    /// the render list, so the subtree walk never sees them and cannot report
-    /// them through `children_need`. Skipping a button would leave the states of
-    /// the ones it is not currently showing unconstructed
-    /// (`avm2/button_nested_frame_simple`). Buttons are few; never skip one.
     fn needs_frame_construction(self) -> bool {
         self.movie().is_action_script_3()
     }
@@ -547,31 +537,9 @@ impl<'gc> TDisplayObject<'gc> for Avm2Button<'gc> {
                 self.set_state(context, ButtonState::Up);
 
                 if has_movie_clip_state && self.movie().version() > 9 {
-                    // This runs a whole-stage construct and frame-script pass
-                    // from inside one button's construction, to reproduce the
-                    // order Flash is observed to use.
-                    //
-                    // When the button is itself being constructed from an
-                    // ancestor's `Sprite.constructChildren`, that pass reaches
-                    // clips whose current frame is only half-built: the
-                    // ancestor placing this button has not finished
-                    // constructing it, so the ancestor's own field for it is
-                    // still null. Running the ancestor's frame script there
-                    // hands it a null child, and in AVM2 a frame script that
-                    // throws abandons everything after the throw -- including
-                    // the `stop()` that authored frames end on, which is why
-                    // an AQW cutscene then plays through its own pauses.
-                    //
-                    // Two shapes of fix are already ruled out here, both tried
-                    // on 2026-08-03 against expectations captured from the real
-                    // player. Skipping the pass when nested fails ten tests,
-                    // `avm2/button_nested_frame` among them. Narrowing it to
-                    // the button's own states -- `self.run_frame_scripts`
-                    // instead of the stage's -- fails seven. Flash runs this
-                    // pass, over the whole stage. Whatever diverges is in what
-                    // the stage can see while it runs, not in whether or how
-                    // widely it runs, so this only measures.
-                    // Nearest ancestor still inside its own `constructChildren`.
+                    // This runs a whole-stage construct and frame-script pass from inside one
+                    // button's construction, to reproduce the order Flash is observed to use.
+                    // Flash runs this pass, over the whole stage.
                     let constructing = {
                         let mut node = self.avm2_parent();
                         loop {
@@ -590,21 +558,6 @@ impl<'gc> TDisplayObject<'gc> for Avm2Button<'gc> {
                         }
                     };
 
-                    // The clip that placed the one being constructed is the one
-                    // whose framescript this pass pulls forward, and whose field
-                    // for that child is still unwritten.
-                    //
-                    // `fresh` is the predicate that actually decides a script
-                    // runs, so it answers the open question -- but only if it is
-                    // sampled at the right instant. Sampling it once, before the
-                    // pass, said `false` on every occurrence while the script
-                    // demonstrably ran: the pass has two halves, and the stage
-                    // construct is free to queue the script that the stage
-                    // framescript walk then runs. So sample on both sides of
-                    // that construct. `false -> true` means the construct half
-                    // is what makes it pending, and Flash must be deferring
-                    // exactly that; `false -> false` means the script is reached
-                    // by neither half and the hypothesis is dead.
                     let placer = constructing
                         .and_then(|clip| clip.avm2_parent())
                         .and_then(|parent| parent.as_movie_clip());
@@ -746,10 +699,6 @@ impl<'gc> TDisplayObject<'gc> for Avm2Button<'gc> {
             bounds = bounds.union(&child.render_bounds_with_transform(&matrix, true, view_matrix));
         }
 
-        // See the note on the same guard in `DisplayObject::
-        // render_bounds_with_transform`: growing `Rectangle::INVALID` moves
-        // `x_min` off the sentinel that marks it empty, and it then reads as a
-        // real rectangle reaching to the far end of the coordinate space.
         if include_own_filters && bounds.is_valid() {
             for mut filter in self.filters().iter().cloned() {
                 filter.scale(view_matrix.a, view_matrix.d);

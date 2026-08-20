@@ -204,20 +204,11 @@ pub fn run_copy_pipeline(
     globals: &Globals,
     sample_count: u32,
     smooth: bool,
-    // Selects the Catmull-Rom copy shader (`copy_sharp.wgsl`) instead of the
-    // plain sampled copy for scaled AQW presents. Only valid for unpadded
-    // inputs (the shader clamps its neighborhood to the allocated texture).
     sharp: bool,
-    // Selects the CRT present shader (`copy_crt.wgsl`, Catmull-Rom +
-    // scanlines + phosphor mask); takes precedence over `sharp`. Present-only
-    // (same unpadded-input requirement as `sharp`).
     crt: bool,
     input_uv_scale: (f32, f32),
     encoder: &mut CommandEncoder,
 ) {
-    // Padded pool textures hold their logical content in the top-left
-    // sub-region; scale the quad's UVs so only that region is sampled.
-    // `(1, 1)` (unpadded input) keeps the shared identity uniform.
     let scaled_transforms = if input_uv_scale != (1.0, 1.0) {
         Some(create_buffer_with_data(
             &descriptors.device,

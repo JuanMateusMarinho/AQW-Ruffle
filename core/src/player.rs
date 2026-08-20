@@ -7,7 +7,9 @@ use crate::avm1::Value;
 use crate::avm1::VariableDumper;
 use crate::avm1::{Activation, ActivationIdentifier};
 use crate::avm2::object::EventObject as Avm2EventObject;
-use crate::avm2::{Activation as Avm2Activation, Avm2, CallStack, SharedObjectObject, TObject as _};
+use crate::avm2::{
+    Activation as Avm2Activation, Avm2, CallStack, SharedObjectObject, TObject as _,
+};
 use crate::backend::navigator::ErrorResponse;
 use crate::backend::navigator::FetchReason;
 use crate::backend::navigator::OwnedFuture;
@@ -85,14 +87,7 @@ pub const FALLBACK_DEVICE_FONT: &[u8] = include_bytes!("../assets/notosans.subse
 
 const AQW_DIRTY_CACHE_REDRAWS_PER_FRAME: u32 = 8;
 const AQW_DIRTY_CACHE_REDRAW_PIXELS_PER_FRAME: u64 = 6_000_000;
-/// Per-frame quota for *small* dirty AQW cache redraws (below the large-cache
-/// defer thresholds). Generous enough that normal play (a handful of animating
-/// filtered clips) never hits it; an FX storm (fireworks, ultra skill spam)
-/// gets throttled into deferral instead of melting FPS. Field-tunable via
-/// `RUFFLE_AQW_SMALL_REDRAW_CAP=N` (`0` disables the cap).
 const AQW_SMALL_CACHE_REDRAWS_PER_FRAME: u32 = 32;
-/// Per-frame quota for aged redraws (caches starved by the budget for ~1s).
-/// Disable with `RUFFLE_AQW_NO_CACHE_AGING`.
 const AQW_AGED_CACHE_REDRAWS_PER_FRAME: u32 = 2;
 
 fn aqw_small_cache_redraw_budget() -> u32 {
@@ -120,12 +115,6 @@ fn aqw_aged_cache_redraw_budget() -> u32 {
     })
 }
 
-/// Per-frame *screen-pixel* budget for small dirty cache redraws. The count
-/// quota bounds how many; this bounds how much GPU fill/filter work they add
-/// up to. Deliberately not scaled by the view matrix: in fullscreen each
-/// redraw covers 4-6x the pixels of its windowed self, and admitting a
-/// windowed count of them is what collapsed crowded-room FPS. Field-tunable
-/// via `RUFFLE_AQW_SMALL_REDRAW_PIXEL_CAP=N` (`0` disables the pixel budget).
 const AQW_SMALL_CACHE_REDRAW_PIXELS_PER_FRAME: u64 = 1_500_000;
 
 fn aqw_small_cache_redraw_pixel_budget() -> u64 {
@@ -1869,8 +1858,6 @@ impl Player {
                         if let Some(down_object) = context.mouse_data.pressed(button) {
                             if button == MouseButton::Left {
                                 new_cursor = down_object.mouse_cursor(context);
-                                // AQW: clicks on the injected "CRT Filter"
-                                // Options row (no AVM2 listeners of its own).
                                 crate::display_object::aqw_crt_maybe_toggle(
                                     context,
                                     down_object.as_displayobject(),
@@ -1947,15 +1934,9 @@ impl Player {
                 refresh
             };
 
-            // Settled on a target for this event, so the AQW cursor can be
-            // decided. Cheap enough to redo every time: mouse moves are already
-            // coalesced to one per tick, and the walk stops at the first
-            // constructed ancestor that names itself a monster.
             let hovered = context.mouse_data.hovered;
-            AQW_POINTER_ON_ENEMY.store(
-                aqw_enemy_under_pointer(context, hovered),
-                Ordering::Relaxed,
-            );
+            AQW_POINTER_ON_ENEMY
+                .store(aqw_enemy_under_pointer(context, hovered), Ordering::Relaxed);
 
             Self::run_actions(context);
             needs_render
@@ -2098,10 +2079,6 @@ impl Player {
             // TODO: Is this order correct?
             run_all_phases_avm2(context);
             Avm1::run_frame(context);
-            // Artix "CRT Filter" option row injected into the game's own
-            // options menu (no-op outside AQW/DragonFable; kill-switch
-            // RUFFLE_AQW_NO_CRT_MENU). After both AVMs' frame phases so
-            // freshly built panels are fully constructed when scanned.
             crate::display_object::aqw_crt_menu_tick(context);
             AudioManager::update_sounds(context);
             LocalConnections::update_connections(context);
@@ -2133,22 +2110,8 @@ impl Player {
             let stage = gc_root.stage;
 
             let mut cache_draws = vec![];
-            // Under VRAM pressure the valve brakes the redraw quotas. Large
-            // redraws (map-sized targets) are the real VRAM movers, so they're
-            // cut first; small combat FX keep refreshing under soft pressure -
-            // with padded cache textures an admitted small redraw mostly reuses
-            // its allocation, and starving them leaves weapon art visibly
-            // detached at its stale anchor mid-swing. Hard pressure throttles
-            // small FX too (stale but bounded), still leaving a trickle.
             let vram_pressure = crate::display_object::aqw_vram_pressure();
             let no_defer = crate::display_object::redraw_defer_disabled();
-            // Note: both pixel budgets below are deliberately in *screen*
-            // pixels, NOT scaled by the view matrix. They bound actual GPU
-            // fill/filter work per frame, which is what crowded fullscreen
-            // rooms run out of. (Only the large/small *classification* is
-            // view-scale-normalized, in `display_object::render_base`; the
-            // one-oversized-per-frame reserve keeps the fullscreen map
-            // refreshing even though it alone can approach the budget.)
             let mut render_context = RenderContext {
                 renderer: this.renderer.deref_mut(),
                 commands: CommandList::new(),
@@ -2158,8 +2121,6 @@ impl Player {
                 transform_stack: &mut this.transform_stack,
                 is_offscreen: false,
                 use_bitmap_cache: true,
-                // Moot here -- the exemption only reads this while caching is
-                // off -- but it is the bake's flag, and the bake is below.
                 cache_filtered_children: false,
                 dirty_cache_redraws_remaining: match vram_pressure {
                     _ if no_defer => u32::MAX,
@@ -3339,27 +3300,15 @@ fn run_mouse_pick<'gc>(
     })
 }
 
-/// Whether the pointer is resting on something AQW would have you attack.
-///
-/// This is a flag rather than a `MouseCursor` because the game never asks for
-/// one: it leaves the plain arrow up over a monster, so the shape has to be
-/// decided from what the pick landed on. `MouseCursor` also mirrors the AS3
-/// constants one for one, and those have no attack shape to mirror.
 static AQW_POINTER_ON_ENEMY: AtomicBool = AtomicBool::new(false);
 
-/// Read by the desktop shell, which draws its own cursor art.
 pub fn aqw_pointer_on_enemy() -> bool {
     AQW_POINTER_ON_ENEMY.load(Ordering::Relaxed)
 }
 
-/// `RUFFLE_AQW_NO_ENEMY_CURSOR=1` stops looking, leaving the pointer at
-/// whatever the content asked for.
 static AQW_ENEMY_CURSOR_OFF: LazyLock<bool> =
     LazyLock::new(|| crate::display_object::aqw_env_flag("RUFFLE_AQW_NO_ENEMY_CURSOR", false));
 
-/// Name what the pointer is resting on, the first time each chain turns up.
-/// When the sword fails to appear this is the whole story: either `MonsterMC`
-/// never showed up in the chain, or it did and `isMonster` said no.
 fn aqw_log_hover_chain(chain: &str, is_monster: Option<bool>) {
     thread_local! {
         static LAST: RefCell<String> = const { RefCell::new(String::new()) };
@@ -3379,12 +3328,6 @@ fn aqw_log_hover_chain(chain: &str, is_monster: Option<bool>) {
     });
 }
 
-/// Is the hovered object part of a monster?
-///
-/// AQW hangs monsters and NPCs off the same `MonsterMC` chassis and tells them
-/// apart with `isMonster`, so matching the class alone would put a sword over
-/// every shopkeeper. The pick lands somewhere inside the loaded avatar art, so
-/// the chassis has to be walked up to.
 fn aqw_enemy_under_pointer<'gc>(
     context: &mut UpdateContext<'gc>,
     hovered: Option<InteractiveObject<'gc>>,

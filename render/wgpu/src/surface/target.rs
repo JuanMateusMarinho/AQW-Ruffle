@@ -10,8 +10,6 @@ use crate::utils::run_copy_pipeline;
 use std::cell::{Cell, OnceCell};
 use std::sync::{Arc, OnceLock};
 
-/// Kill-switch: `RUFFLE_AQW_NO_FILTER_PAD` restores exact-size filter render
-/// targets, for field A/B without a rebuild.
 fn filter_pad_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED
@@ -208,20 +206,12 @@ pub struct CommandTarget {
     depth: OnceCell<StencilBuffer>,
     globals: Arc<Globals>,
     size: wgpu::Extent3d,
-    /// Dimensions of the GPU textures actually backing this target. Equal to
-    /// `size` unless the target was created with `pad_to_bucket`, in which
-    /// case the textures come from coarse pool buckets and the logical
-    /// content occupies only the top-left `size` region.
     alloc_size: wgpu::Extent3d,
     format: wgpu::TextureFormat,
     sample_count: u32,
     whole_frame_bind_group: OnceCell<(wgpu::Buffer, wgpu::BindGroup)>,
     color_needs_clear: OnceCell<bool>,
     render_target_mode: RenderTargetMode,
-    /// Extent of the commands drawn into this target, in its pixel space.
-    ///
-    /// Filled in by `Surface::draw_commands` once the command list has been
-    /// chunked. Stays empty for targets nothing was drawn into.
     content_bounds: Cell<ContentBounds>,
 }
 
@@ -238,11 +228,6 @@ impl CommandTarget {
     ) -> Self {
         let globals = pool.get_globals(descriptors, size.width, size.height);
 
-        // Only fully-pooled, single-sampled fresh targets may be padded:
-        // manual textures (ExistingWithColor) and MSAA resolve pairs must
-        // keep attachment dimensions exact, and FreshWithTexture blits the
-        // prior contents 1:1. Callers of padded targets write through a
-        // logical-size viewport and read back only the logical UV sub-rect.
         let alloc_size = if pad_to_bucket
             && sample_count == 1
             && matches!(render_target_mode, RenderTargetMode::FreshWithColor(_))
@@ -367,10 +352,6 @@ impl CommandTarget {
     }
 
     pub fn set_content_bounds(&self, bounds: ContentBounds) {
-        // Only a target cleared to a flat colour holds nothing but what was
-        // just drawn into it. `FreshWithTexture` starts as a copy of an earlier
-        // texture, so its real content is whatever that held -- the commands
-        // alone do not bound it.
         self.content_bounds.set(
             if matches!(self.render_target_mode, RenderTargetMode::FreshWithColor(_)) {
                 bounds
@@ -392,9 +373,6 @@ impl CommandTarget {
         self.alloc_size != self.size
     }
 
-    /// UV scale mapping the logical content region into the allocated
-    /// texture, for consumers that sample this target with a whole-texture
-    /// quad. `(1, 1)` for unpadded targets.
     pub fn copy_uv_scale(&self) -> (f32, f32) {
         (
             self.size.width as f32 / self.alloc_size.width as f32,
@@ -402,9 +380,6 @@ impl CommandTarget {
         )
     }
 
-    /// A `FilterSource` addressing only the logical content region of this
-    /// target's color texture. Equivalent to `for_entire_texture` on
-    /// unpadded targets.
     pub fn filter_source(&self) -> FilterSource<'_> {
         FilterSource {
             texture: self.color_texture(),
@@ -413,9 +388,6 @@ impl CommandTarget {
         }
     }
 
-    /// Confine a render pass writing into this target to the logical content
-    /// region. No-op for unpadded targets (the viewport already spans the
-    /// whole attachment).
     pub fn set_content_viewport(&self, render_pass: &mut wgpu::RenderPass<'_>) {
         if self.is_padded() {
             render_pass.set_viewport(
@@ -487,7 +459,6 @@ impl CommandTarget {
     ) -> Option<wgpu::RenderPassDepthStencilAttachment<'_>> {
         let new_buffer = self.depth.get().is_none();
         let stencil = self.depth.get_or_init(|| {
-            // Must match the color attachment's (possibly padded) dimensions.
             StencilBuffer::new(descriptors, self.sample_count, self.alloc_size, pool)
         });
         Some(wgpu::RenderPassDepthStencilAttachment {
@@ -504,13 +475,6 @@ impl CommandTarget {
         })
     }
 
-    /// Snapshots this target's colour into a buffer the blend shaders can read
-    /// as `dst`, since a pass cannot sample the attachment it writes.
-    ///
-    /// `region` limits the copy to `(x, y, width, height)`; the caller must
-    /// then read back only within that rect, because the rest of the buffer
-    /// keeps whatever a previous blend on this target left there. Passing
-    /// `None` copies the whole surface.
     pub fn update_blend_buffer(
         &self,
         descriptors: &Descriptors,

@@ -51,13 +51,8 @@ pub struct GuiController {
     /// If this is set, we should not render the main menu.
     no_gui: bool,
     theme_controller: ThemeController,
-    /// Artwork standing in for the system cursors, built once at startup.
     artix_cursors: Option<ArtixCursors>,
-    /// The custom cursor currently pushed to the window. `set_cursor` on every
-    /// frame flickers on Windows, so we only push it when it changes.
     applied_cursor: Option<CustomCursor>,
-    /// egui pushes its own cursor only when its icon changes — and that clobbers
-    /// ours, so we watch for it and re-apply.
     last_egui_cursor: Option<egui::CursorIcon>,
 }
 
@@ -208,8 +203,6 @@ impl GuiController {
         })
     }
 
-    /// Build the custom cursors. Separate from `new` because creating them needs
-    /// the `ActiveEventLoop`, which only the application handler holds.
     pub fn init_custom_cursors(&mut self, event_loop: &ActiveEventLoop) {
         let Some(set) = crate::artix::custom_cursors() else {
             return;
@@ -227,8 +220,6 @@ impl GuiController {
                 None
             }
         };
-        // All or nothing: a set missing one shape would fall back to a system
-        // cursor for it, and the two styles side by side look like a bug.
         if let (Some(arrow), Some(hand), Some(text), Some(attack)) = (
             build(&set.arrow),
             build(&set.hand),
@@ -358,11 +349,6 @@ impl GuiController {
         }
     }
 
-    /// Forward CRT barrel warp in movie-area window coordinates. The CRT
-    /// present shader shows the content of warp(uv) at screen uv, so a
-    /// click at uv is aiming at warp(uv) — the SAME function (and shared
-    /// strength constant) maps mouse coordinates. No-op when the filter is
-    /// off.
     fn crt_warp_window_position(&self, x: f64, y: f64) -> (f64, f64) {
         let k = f64::from(ruffle_render::backend::aqw_crt_warp_strength());
         if k <= 0.0 || !ruffle_render::backend::aqw_crt_filter_enabled() {
@@ -379,9 +365,6 @@ impl GuiController {
         (((cx * f) + 1.0) * 0.5 * w, ((cy * f) + 1.0) * 0.5 * h)
     }
 
-    /// Fraction of the movie-area width the 4:3 tube occupies, or `None` when
-    /// the squeeze is off or the window is already 4:3-or-narrower (nothing to
-    /// squeeze). Mirrors the shader's `content_frac`.
     fn crt_aspect_43_content_frac(&self) -> Option<f64> {
         if !ruffle_render::backend::aqw_crt_aspect_43_enabled()
             || !ruffle_render::backend::aqw_crt_filter_enabled()
@@ -397,10 +380,6 @@ impl GuiController {
         (frac < 1.0).then_some(frac)
     }
 
-    /// Forward 4:3 squeeze in movie-area window coordinates: the present shows
-    /// the content of the centred 4:3 region at screen `x`, so a click at `x`
-    /// is aiming at the squeezed coordinate. The SAME map the shader applies
-    /// to `uv.x`. Runs before the warp, matching the shader's order.
     fn crt_squeeze_window_position(&self, x: f64, y: f64) -> (f64, f64) {
         let Some(frac) = self.crt_aspect_43_content_frac() else {
             return (x, y);
@@ -410,7 +389,6 @@ impl GuiController {
         (((x / w - margin) / frac) * w, y)
     }
 
-    /// Inverse of [`Self::crt_squeeze_window_position`].
     fn crt_unsqueeze_window_position(&self, x: f64, y: f64) -> (f64, f64) {
         let Some(frac) = self.crt_aspect_43_content_frac() else {
             return (x, y);
@@ -420,9 +398,6 @@ impl GuiController {
         ((x / w * frac + margin) * w, y)
     }
 
-    /// Inverse of [`Self::crt_warp_window_position`] (fixed-point
-    /// iteration; the warp is gentle so two rounds converge well below a
-    /// pixel).
     fn crt_unwarp_window_position(&self, x: f64, y: f64) -> (f64, f64) {
         let k = f64::from(ruffle_render::backend::aqw_crt_warp_strength());
         if k <= 0.0 || !ruffle_render::backend::aqw_crt_filter_enabled() {
@@ -446,14 +421,7 @@ impl GuiController {
     }
 
     pub fn window_to_movie_position(&self, position: PhysicalPosition<f64>) -> (f64, f64) {
-        // When the renderer supersamples, it reports an N× viewport to the player, so
-        // stage hit-testing expects window coordinates scaled up by the same N.
-        // (No-op at N=1 — click-to-move in AQW must land on the right cell.)
-        // Reads the factor currently in effect — the renderer may gate SSAA off
-        // for large windows — so clicks track whatever is actually rendering.
         let ss = f64::from(aqw_current_supersample());
-        // Present order is squeeze -> warp, so window -> movie applies the same:
-        // squeeze first, then warp.
         let (sx, sy) =
             self.crt_squeeze_window_position(position.x, position.y - self.height_offset());
         let (wx, wy) = self.crt_warp_window_position(sx, sy);
@@ -462,7 +430,6 @@ impl GuiController {
 
     pub fn movie_to_window_position(&self, x: f64, y: f64) -> PhysicalPosition<f64> {
         let ss = f64::from(aqw_current_supersample());
-        // Inverse of window -> movie: undo the warp, then the squeeze.
         let (ux, uy) = self.crt_unwarp_window_position(x / ss, y / ss);
         let (sx, sy) = self.crt_unsqueeze_window_position(ux, uy);
         PhysicalPosition::new(sx, sy + self.height_offset())
@@ -492,12 +459,6 @@ impl GuiController {
                 return;
             }
             Err(e @ (SurfaceError::OutOfMemory | SurfaceError::Other)) => {
-                // Vulkan can return a generic acquire failure from inside a
-                // window-message callback (modal resize/move loop, DPI change)
-                // that clears by the next frame, and OOM here is as transient
-                // as it is in the AQW render path (the VRAM valve drains it).
-                // Neither is worth killing the game over: treat both like
-                // Lost/Outdated — reconfigure and skip this frame.
                 tracing::error!(
                     "Surface acquire failed: {e:?}; reconfiguring and skipping a frame"
                 );
@@ -547,10 +508,6 @@ impl GuiController {
         self.egui_winit
             .handle_platform_output(&self.window, full_output.platform_output);
 
-        // egui just pushed its own icon if it changed, so re-apply ours over it.
-        // On release we hand the cursor back: either egui already pushed the icon
-        // it wants this frame, or it didn't change, in which case it's the
-        // default it drew the movie area with.
         if desired_cursor != self.applied_cursor || (desired_cursor.is_some() && egui_pushed_cursor)
         {
             match &desired_cursor {

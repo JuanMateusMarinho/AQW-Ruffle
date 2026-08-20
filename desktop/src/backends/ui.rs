@@ -183,10 +183,6 @@ impl DesktopUiBackend {
         }
     }
 
-    /// Which piece of custom artwork should stand in for the system cursor, if
-    /// any. A monster under the pointer beats the arrow and the hand -- that
-    /// shape is the whole point of it -- but not the I-beam, which only comes
-    /// up over a text field, where the click is going to the field either way.
     pub fn artix_cursor(&self) -> Option<CursorKind> {
         if !self.cursor_visible {
             return None;
