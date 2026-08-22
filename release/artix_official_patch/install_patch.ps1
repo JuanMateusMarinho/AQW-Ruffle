@@ -335,7 +335,7 @@ app.artixRuffleGames = {
 	aqw: {
 		exe: 'AQW.exe',
 		icon: 'aqw',
-		title: 'Artix Entertainment - AdventureQuest Worlds V3.0',
+		title: 'Artix Entertainment - AdventureQuest Worlds V3.1',
 		swfURL: 'https://game.aq.com/game/gamefiles/Loader3.swf',
 		baseURL: 'https://game.aq.com/game/gamefiles/',
 		width: '960',

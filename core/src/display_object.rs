@@ -195,9 +195,25 @@ pub(crate) fn script_requeue_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_SCRIPT_REQUEUE", false))
 }
+/// Deferring a cache redraw composes the previous texture at the previous
+/// anchor, so the art on screen stops animating and sits where it used to be.
+/// Nothing upstream does this, which is why the artefact is ours alone.
 pub(crate) fn redraw_defer_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_REDRAW_DEFER", false))
+    *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_REDRAW_DEFER", true))
+}
+
+/// When deferral is turned back on, this bounds how old the composed texture
+/// may get. The budget escape alone allowed 24 frames - a full second of a
+/// frozen, displaced picture.
+pub(crate) fn aqw_defer_max_stale_frames() -> u32 {
+    static FRAMES: OnceLock<u32> = OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("RUFFLE_AQW_DEFER_MAX_STALE_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(2)
+    })
 }
 
 pub(crate) fn aqw_defer_eligible_frames() -> u32 {
@@ -2154,6 +2170,8 @@ pub(crate) static AQW_ORPHAN_CLEAN_VISITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static AQW_ORPHAN_DIRTY_VISITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_SCRIPT_REARM_SKIPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 pub(crate) static AQW_ORPHAN_CLEAN_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static AQW_ORPHAN_DIRTY_NS: std::sync::atomic::AtomicU64 =
@@ -2555,7 +2573,97 @@ fn aqw_cache_budget_mb() -> u64 {
     })
 }
 
+pub(crate) static AQW_TIMELINE_STALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn aqw_stall_probe_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_STALL_PROBE", false))
+}
+
+thread_local! {
+    /// ptr -> (last frame seen, ticks stalled, ticks since we last reported it)
+    static AQW_STALL_STATE: RefCell<std::collections::HashMap<usize, (u16, u16, u16)>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// Looks for on-stage avatar art whose timeline is standing still, and names
+/// whatever in this fork could be holding it: the throttle, either freeze, the
+/// frame-skip mark, or the orphan list.
+fn aqw_report_timeline_stalls(context: &mut UpdateContext<'_>) {
+    fn visit<'gc>(node: DisplayObject<'gc>, context: &UpdateContext<'gc>, budget: &mut u32) {
+        if *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+
+        if let Some(clip) = node.as_movie_clip()
+            && clip.playing()
+            && clip.header_frames() > 1
+            && is_aqw_movie_url(clip.movie().url())
+        {
+            let ptr = node.as_ptr() as usize;
+            let frame = clip.current_frame();
+            let report = AQW_STALL_STATE.with(|state| {
+                let mut state = state.borrow_mut();
+                let entry = state.entry(ptr).or_insert((frame, 0, 0));
+                if entry.0 == frame {
+                    entry.1 = entry.1.saturating_add(1);
+                } else {
+                    entry.0 = frame;
+                    entry.1 = 0;
+                }
+                entry.2 = entry.2.saturating_add(1);
+                if entry.1 >= 8 && entry.2 >= 48 {
+                    entry.2 = 0;
+                    Some(entry.1)
+                } else {
+                    None
+                }
+            });
+            if let Some(stalled) = report {
+                AQW_TIMELINE_STALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let class = node
+                    .object2()
+                    .map(|o| {
+                        use crate::avm2::object::TObject;
+                        o.instance_class().name().local_name().to_string()
+                    })
+                    .unwrap_or_else(|| "<unconstructed>".to_string());
+                tracing::warn!(
+                    target: "aqw_diag",
+                    class = class.as_str(),
+                    stalled_ticks = stalled,
+                    frame,
+                    total_frames = clip.header_frames(),
+                    on_stage = clip.is_on_stage(context),
+                    frozen = clip.aqw_orphan_frozen(),
+                    frozen_inert = clip.aqw_orphan_frozen_inert(),
+                    subtree_needs_frame = !node.aqw_subtree_clean(),
+                    parent = node.parent().is_some(),
+                    visible = node.visible(),
+                    movie = url_basename(node.movie().url()),
+                    "AQW timeline stalled"
+                );
+            }
+        }
+
+        if let Some(container) = node.as_container() {
+            for child in container.iter_render_list() {
+                visit(child, context, budget);
+            }
+        }
+    }
+
+    let mut budget = 20000u32;
+    let stage: DisplayObject<'_> = context.stage.into();
+    visit(stage, context, &mut budget);
+}
+
 pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
+    if aqw_stall_probe_enabled() {
+        aqw_report_timeline_stalls(context);
+    }
     let diagnostics = aqw_diagnostics_enabled();
     let budget_mb = aqw_cache_budget_mb();
     aqw_report_gates(context);
@@ -2647,6 +2755,8 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         let orph_dirty_visits = AQW_ORPHAN_DIRTY_VISITS.swap(0, Ordering::Relaxed);
         let orph_clean_ms = AQW_ORPHAN_CLEAN_NS.swap(0, Ordering::Relaxed) / 1_000_000;
         let orph_dirty_ms = AQW_ORPHAN_DIRTY_NS.swap(0, Ordering::Relaxed) / 1_000_000;
+        let script_rearm_skip = AQW_SCRIPT_REARM_SKIPPED.swap(0, Ordering::Relaxed);
+        let timeline_stalls = AQW_TIMELINE_STALLS.swap(0, Ordering::Relaxed);
         let aqw_hook_ms = AQW_HOOK_NS.swap(0, Ordering::Relaxed) / 1_000_000;
         let aqw_clips = AQW_HOOK_CLIPS.swap(0, Ordering::Relaxed);
         let aqw_playing = AQW_CLIPS_ADVANCED.swap(0, Ordering::Relaxed);
@@ -2831,7 +2941,7 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
              invalidate_depth={invalidate_depth} dirty_origin={dirty_origin} \
              orph_probe_out={orph_probe_out} \
              orph_clean_visits={orph_clean_visits} orph_dirty_visits={orph_dirty_visits} \
-             orph_clean_ms={orph_clean_ms} orph_dirty_ms={orph_dirty_ms} \
+             orph_clean_ms={orph_clean_ms} orph_dirty_ms={orph_dirty_ms}              script_rearm_skip={script_rearm_skip} timeline_stalls={timeline_stalls} \
              vram_mb={vram_mb} vram_budget_mb={vram_budget_mb} \
              vram_pressure={vram_pressure} \
              pool_allocs={pool_allocs} pool_free={pool_free} pool_mb={pool_mb} \
@@ -3620,6 +3730,11 @@ pub fn render_base<'gc>(
                         {
                             can_redraw_cache = true;
                             admitted_aged = true;
+                        }
+                        if !can_redraw_cache
+                            && cache.deferred_frames >= aqw_defer_max_stale_frames()
+                        {
+                            can_redraw_cache = true;
                         }
 
                         if can_redraw_cache {

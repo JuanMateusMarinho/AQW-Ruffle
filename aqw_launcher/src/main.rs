@@ -69,7 +69,7 @@ mod windows_launcher {
     const WM_MOUSELEAVE: u32 = 0x02A3;
     const AQW_SWF_URL: &str = "https://game.aq.com/game/gamefiles/Loader3.swf";
     const AQW_BASE_URL: &str = "https://game.aq.com/game/gamefiles/";
-    const AQW_WINDOW_TITLE: &str = "Artix Entertainment - AdventureQuest Worlds V3.0";
+    const AQW_WINDOW_TITLE: &str = "Artix Entertainment - AdventureQuest Worlds V3.1";
     const AQW_DESIGN_NOTES_URL: &str = "https://www.aq.com/gamedesignnotes/";
     const AQW_YOUTUBE_RECENT_URL: &str =
         "https://www.youtube.com/channel/UC0vYUqgESNR3sqEPiJ4SpeA/recent";

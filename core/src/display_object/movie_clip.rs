@@ -179,6 +179,17 @@ fn aqw_subtree_will_advance<'gc>(obj: DisplayObject<'gc>, budget: &mut u32) -> O
     Some(false)
 }
 
+/// `check_has_pending_script` re-arms the flag from the timeline every frame,
+/// but `run_local_frame_scripts` only fires a script whose frame has not run
+/// yet. A stopped clip parked on a frame that owns a script therefore stays
+/// "pending" forever: the arm never fires and never clears.
+fn aqw_script_rearm_fix_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        crate::display_object::aqw_env_flag("RUFFLE_AQW_NO_SCRIPT_REARM_FIX", false)
+    })
+}
+
 fn aqw_crt_menu_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| crate::display_object::aqw_env_flag("RUFFLE_AQW_NO_CRT_MENU", false))
@@ -3436,7 +3447,20 @@ impl<'gc> MovieClip<'gc> {
     }
 
     fn check_has_pending_script(self, context: &mut UpdateContext<'gc>) {
-        let has_pending_script = self.has_frame_script(self.0.current_frame.get());
+        let frame = self.0.current_frame.get();
+        let mut has_pending_script = self.has_frame_script(frame);
+        if has_pending_script
+            && !aqw_script_rearm_fix_disabled()
+            && self.last_queued_script_frame() == Some(frame)
+        {
+            has_pending_script = false;
+            crate::display_object::AQW_SCRIPT_REARM_SKIPPED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Arming used to mark the subtree as needing a frame on the way out,
+            // and the nested-goto pass reads that mark to decide what it may
+            // skip. Withhold the arm, keep the mark.
+            self.mark_subtree_needs_frame(context);
+        }
         self.set_has_pending_script(context, has_pending_script);
     }
 
