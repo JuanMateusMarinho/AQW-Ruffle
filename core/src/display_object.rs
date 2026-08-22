@@ -195,17 +195,11 @@ pub(crate) fn script_requeue_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_SCRIPT_REQUEUE", false))
 }
-/// Deferring a cache redraw composes the previous texture at the previous
-/// anchor, so the art on screen stops animating and sits where it used to be.
-/// Nothing upstream does this, which is why the artefact is ours alone.
 pub(crate) fn redraw_defer_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_REDRAW_DEFER", true))
 }
 
-/// When deferral is turned back on, this bounds how old the composed texture
-/// may get. The budget escape alone allowed 24 frames - a full second of a
-/// frozen, displaced picture.
 pub(crate) fn aqw_defer_max_stale_frames() -> u32 {
     static FRAMES: OnceLock<u32> = OnceLock::new();
     *FRAMES.get_or_init(|| {
@@ -2587,9 +2581,7 @@ thread_local! {
         RefCell::new(std::collections::HashMap::new());
 }
 
-/// Looks for on-stage avatar art whose timeline is standing still, and names
-/// whatever in this fork could be holding it: the throttle, either freeze, the
-/// frame-skip mark, or the orphan list.
+/// Names whatever could be holding a visible clip's timeline still.
 fn aqw_report_timeline_stalls(context: &mut UpdateContext<'_>) {
     fn visit<'gc>(node: DisplayObject<'gc>, context: &UpdateContext<'gc>, budget: &mut u32) {
         if *budget == 0 {
