@@ -197,7 +197,7 @@ pub(crate) fn script_requeue_disabled() -> bool {
 }
 pub(crate) fn redraw_defer_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_REDRAW_DEFER", true))
+    *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_REDRAW_DEFER", false))
 }
 
 pub(crate) fn aqw_defer_max_stale_frames() -> u32 {
@@ -206,7 +206,7 @@ pub(crate) fn aqw_defer_max_stale_frames() -> u32 {
         std::env::var("RUFFLE_AQW_DEFER_MAX_STALE_FRAMES")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(2)
+            .unwrap_or(1)
     })
 }
 
