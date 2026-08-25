@@ -247,6 +247,44 @@ impl QueueSyncHandle {
     }
 }
 
+/// Which allocation site a `Texture` came from. Every `BitmapHandle` texture lands in the
+/// same byte total, which cannot tell content bitmaps apart from bitmap caches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextureOrigin {
+    /// Bitmaps decoded from the movie, and `BitmapData` the content draws into.
+    Content = 0,
+    /// Backing store for a `BitmapCache`, via `create_empty_texture`.
+    Cache = 1,
+    /// Results of `render_offscreen`.
+    Offscreen = 2,
+    /// Context3D and PixelBender.
+    Other = 3,
+}
+
+pub const TEXTURE_ORIGINS: usize = 4;
+static ORIGIN_BYTES: [AtomicI64; TEXTURE_ORIGINS] = [
+    AtomicI64::new(0),
+    AtomicI64::new(0),
+    AtomicI64::new(0),
+    AtomicI64::new(0),
+];
+static ORIGIN_COUNT: [AtomicI64; TEXTURE_ORIGINS] = [
+    AtomicI64::new(0),
+    AtomicI64::new(0),
+    AtomicI64::new(0),
+    AtomicI64::new(0),
+];
+
+/// Live bytes and texture count per origin.
+pub fn bitmap_texture_by_origin() -> [(i64, i64); TEXTURE_ORIGINS] {
+    std::array::from_fn(|i| {
+        (
+            ORIGIN_COUNT[i].load(Ordering::Relaxed),
+            ORIGIN_BYTES[i].load(Ordering::Relaxed),
+        )
+    })
+}
+
 static BITMAP_TEXTURE_BYTES: AtomicI64 = AtomicI64::new(0);
 static BITMAP_TEXTURE_COUNT: AtomicI64 = AtomicI64::new(0);
 
@@ -320,6 +358,7 @@ pub struct Texture {
     bind_linear: OnceCell<BitmapBinds>,
     bind_nearest: OnceCell<BitmapBinds>,
     copy_count: Cell<u8>,
+    origin: TextureOrigin,
 }
 
 impl Drop for Texture {
@@ -327,21 +366,26 @@ impl Drop for Texture {
         let bytes = texture_bytes(&self.texture);
         BITMAP_TEXTURE_BYTES.fetch_sub(bytes, Ordering::Relaxed);
         BITMAP_TEXTURE_COUNT.fetch_sub(1, Ordering::Relaxed);
+        ORIGIN_BYTES[self.origin as usize].fetch_sub(bytes, Ordering::Relaxed);
+        ORIGIN_COUNT[self.origin as usize].fetch_sub(1, Ordering::Relaxed);
         track_bitmap_texture(&self.texture, bytes, false);
     }
 }
 
 impl Texture {
-    pub(crate) fn new(texture: wgpu::Texture) -> Self {
+    pub(crate) fn new(texture: wgpu::Texture, origin: TextureOrigin) -> Self {
         let bytes = texture_bytes(&texture);
         BITMAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
         BITMAP_TEXTURE_COUNT.fetch_add(1, Ordering::Relaxed);
+        ORIGIN_BYTES[origin as usize].fetch_add(bytes, Ordering::Relaxed);
+        ORIGIN_COUNT[origin as usize].fetch_add(1, Ordering::Relaxed);
         track_bitmap_texture(&texture, bytes, true);
         Self {
             texture,
             bind_linear: Default::default(),
             bind_nearest: Default::default(),
             copy_count: Cell::new(0),
+            origin,
         }
     }
 

@@ -482,7 +482,7 @@ pub(super) fn run_pixelbender_shader_impl(
                             extent,
                         );
 
-                        BitmapHandle(Arc::new(Texture::new(fresh_texture)))
+                        BitmapHandle(Arc::new(Texture::new(fresh_texture, crate::TextureOrigin::Other)))
                     });
                     *texture = Some(cached_fresh_handle.clone().into());
                 }

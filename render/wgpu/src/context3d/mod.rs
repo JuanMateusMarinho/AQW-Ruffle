@@ -110,7 +110,7 @@ impl WgpuContext3D {
                 usage: wgpu::TextureUsages::COPY_SRC,
             });
 
-            BitmapHandle(Arc::new(Texture::new(dummy_texture)))
+            BitmapHandle(Arc::new(Texture::new(dummy_texture, crate::TextureOrigin::Other)))
         };
 
         let back_buffer_raw_texture_handle = make_dummy_handle();
@@ -639,18 +639,19 @@ impl Context3D for WgpuContext3D {
                     // which is what the Stage rendering code expects. In multisample mode,
                     // this is our resolve texture.
                     self.back_buffer_raw_texture_handle =
-                        BitmapHandle(Arc::new(Texture::new(back_buffer_resolve_texture.unwrap())));
+                        BitmapHandle(Arc::new(Texture::new(back_buffer_resolve_texture.unwrap(), crate::TextureOrigin::Other)));
                     self.front_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture::new(
                         front_buffer_resolve_texture.unwrap(),
+                        crate::TextureOrigin::Other,
                     )));
                 } else {
                     // In non-multisample mode, we don't have a separate resolve buffer,
                     // so our main texture gets used as the raw texture handle.
 
                     self.back_buffer_raw_texture_handle =
-                        BitmapHandle(Arc::new(Texture::new(back_buffer_texture)));
+                        BitmapHandle(Arc::new(Texture::new(back_buffer_texture, crate::TextureOrigin::Other)));
                     self.front_buffer_raw_texture_handle =
-                        BitmapHandle(Arc::new(Texture::new(front_buffer_texture)));
+                        BitmapHandle(Arc::new(Texture::new(front_buffer_texture, crate::TextureOrigin::Other)));
                     self.current_texture_resolve_view = None;
                 }
 

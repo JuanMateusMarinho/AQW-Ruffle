@@ -25,6 +25,36 @@ pub struct BitmapCacheEntry {
     pub filters: Vec<Filter>,
 }
 
+/// Breakdown of the cache-bake half of a frame's encode. `total_ms` covers the whole
+/// loop and the rest are its parts, so their sum should track it. `nested_ms` is time in
+/// recursive `draw_commands` calls and is a subset of `chunk_ms`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BakeProfile {
+    pub total_ms: u64,
+    /// `Surface::new` per entry: sample-count query plus pipeline lookup.
+    pub surface_ms: u64,
+    /// `CommandTarget::new`: pool acquire, globals, clear.
+    pub target_ms: u64,
+    /// `chunk_blends`: walking the command list and building chunks.
+    pub chunk_ms: u64,
+    /// Recording the render passes.
+    pub pass_ms: u64,
+    /// Staging-belt transform uploads.
+    pub belt_ms: u64,
+    /// Filter application and the copy back into the cache texture.
+    pub filter_ms: u64,
+    /// Mid-loop flushes, which are real GPU submits.
+    pub flush_ms: u64,
+    pub flushes: u64,
+    pub nested_ms: u64,
+    pub nested_calls: u64,
+    /// Wall time between consecutive presented frames. Buckets straddle the 41.7 ms
+    /// target of 24 fps: <=35, <=45, <=60, >60 ms.
+    pub frame_min_ms: u64,
+    pub frame_max_ms: u64,
+    pub frame_hist: [u64; 4],
+}
+
 pub trait RenderBackend: Any {
     fn viewport_dimensions(&self) -> ViewportDimensions;
     // Do not call this method directly - use `player.set_viewport_dimensions`,
@@ -100,6 +130,11 @@ pub trait RenderBackend: Any {
         None
     }
 
+    /// Live (count, bytes) per allocation site: content, cache, offscreen, other.
+    fn bitmap_texture_by_origin(&self) -> [(i64, i64); 4] {
+        [(0, 0); 4]
+    }
+
     fn bitmap_texture_largest(&self, _limit: usize) -> Vec<(u32, u32, usize, u64)> {
         Vec::new()
     }
@@ -134,6 +169,11 @@ pub trait RenderBackend: Any {
 
     fn take_render_timings(&mut self) -> (u64, u64, u64, u64) {
         (0, 0, 0, 0)
+    }
+
+    /// Where the time inside the bitmap-cache bake loop went, in ms per window.
+    fn take_bake_profile(&mut self) -> BakeProfile {
+        BakeProfile::default()
     }
 
     fn submit_frame(

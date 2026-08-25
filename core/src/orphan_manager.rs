@@ -27,9 +27,53 @@ pub struct OrphanManager<'gc> {
 
     #[collect(require_static)]
     next_orphan_order: u64,
+
+    /// Objects carrying cache textures, with the tick they were last seen drawn. Nothing
+    /// draws a detached subtree, so the textures inside one are dead weight.
+    detached: Vec<(DisplayObjectWeak<'gc>, u64)>,
 }
 
+/// Cap, so a runaway registry cannot itself become a leak.
+const MAX_DETACHED_TRACKED: usize = 32768;
+
 impl<'gc> OrphanManager<'gc> {
+    pub fn note_detached(&mut self, dobj: DisplayObject<'gc>, tick: u64) {
+        if !matches!(
+            dobj,
+            DisplayObject::MovieClip(_) | DisplayObject::LoaderDisplay(_) | DisplayObject::Bitmap(_)
+        ) {
+            // Only these can be downgraded; anything else is reached as a descendant of
+            // one of them instead.
+            return;
+        }
+        if self.detached.len() >= MAX_DETACHED_TRACKED {
+            return;
+        }
+        self.detached.push((dobj.downgrade(), tick));
+    }
+
+    pub fn note_cached_weak(&mut self, dobj: DisplayObjectWeak<'gc>, tick: u64) {
+        if self.detached.len() >= MAX_DETACHED_TRACKED {
+            return;
+        }
+        self.detached.push((dobj, tick));
+    }
+
+    pub fn take_detached(&mut self) -> Vec<(DisplayObjectWeak<'gc>, u64)> {
+        std::mem::take(&mut self.detached)
+    }
+
+    pub fn put_detached(&mut self, entries: Vec<(DisplayObjectWeak<'gc>, u64)>) {
+        self.detached = entries;
+    }
+
+    pub fn upgrade_detached(
+        dobj: DisplayObjectWeak<'gc>,
+        mc: &Mutation<'gc>,
+    ) -> Option<DisplayObject<'gc>> {
+        dobj.upgrade(mc)
+    }
+
     fn orphans_mut(&mut self) -> &mut Vec<DisplayObjectWeak<'gc>> {
         Rc::make_mut(&mut self.orphans)
     }
@@ -132,6 +176,23 @@ impl<'gc> OrphanManager<'gc> {
         self.orphans.len()
     }
 
+    /// Every registered object that currently has no parent, including the ones
+    /// `each_orphan_obj` skips: art inside a detached AQW avatar loader is excluded from
+    /// orphan processing, but still holds cache textures.
+    pub fn each_detached_obj(
+        context: &mut UpdateContext<'gc>,
+        mut f: impl FnMut(DisplayObject<'gc>, &mut UpdateContext<'gc>),
+    ) {
+        let orphan_objs: Rc<_> = context.orphan_manager.orphans.clone();
+        for orphan in orphan_objs.iter() {
+            if let Some(dobj) = orphan.upgrade(context.gc())
+                && dobj.parent().is_none()
+            {
+                f(dobj, context);
+            }
+        }
+    }
+
     pub fn each_orphan_obj(
         context: &mut UpdateContext<'gc>,
         mut f: impl FnMut(DisplayObject<'gc>, &mut UpdateContext<'gc>),
@@ -201,6 +262,7 @@ impl<'gc> Default for OrphanManager<'gc> {
             pending: Vec::new(),
             listed: HashMap::new(),
             next_orphan_order: 0,
+            detached: Vec::new(),
         }
     }
 }

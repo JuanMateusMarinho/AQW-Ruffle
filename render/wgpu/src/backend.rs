@@ -11,7 +11,8 @@ use crate::target::{MaybeOwnedBuffer, TextureTarget};
 use crate::target::{RenderTargetFrame, TextureBufferInfo};
 use crate::utils::{BufferDimensions, run_copy_pipeline};
 use crate::{
-    Descriptors, Error, QueueSyncHandle, RenderTarget, SwapChainTarget, Texture, as_texture,
+    Descriptors, Error, QueueSyncHandle, RenderTarget, SwapChainTarget, Texture, TextureOrigin,
+    as_texture,
     format_list, get_backend_names,
 };
 use image::imageops::FilterType;
@@ -41,6 +42,68 @@ use wgpu::SubmissionIndex;
 pub(crate) fn aqw_diagnostics_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| ruffle_render::backend::aqw_env_flag("RUFFLE_AQW_DIAGNOSTICS", false))
+}
+
+/// Per-stage timings for the cache-bake loop. They fire per bake, and per chunk within
+/// one, so they get their own switch rather than the general diagnostics flag.
+pub(crate) fn bake_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| ruffle_render::backend::aqw_env_flag("RUFFLE_AQW_BAKE_PROFILE", false))
+}
+
+pub(crate) mod bake_profile {
+    use std::cell::Cell;
+    use std::sync::atomic::AtomicU64;
+
+    pub(crate) static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static SURFACE_NS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static TARGET_NS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static CHUNK_NS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static PASS_NS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static BELT_NS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static FILTER_NS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static FLUSH_NS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static FLUSHES: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static NESTED_NS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static NESTED_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static FRAME_MIN_NS: AtomicU64 = AtomicU64::new(u64::MAX);
+    pub(crate) static FRAME_MAX_NS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static FRAME_HIST: [AtomicU64; 4] =
+        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+    thread_local! {
+        /// Start of the previous presented frame, for the inter-frame interval.
+        pub(crate) static LAST_FRAME: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+    }
+
+    /// Records the gap since the previous frame. Called once per presented frame.
+    pub(crate) fn note_frame_interval(now: std::time::Instant) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if let Some(prev) = LAST_FRAME.replace(Some(now)) {
+            let ns = now.duration_since(prev).as_nanos() as u64;
+            FRAME_MAX_NS.fetch_max(ns, Relaxed);
+            FRAME_MIN_NS.fetch_min(ns, Relaxed);
+            let ms = ns / 1_000_000;
+            let bucket = if ms <= 35 {
+                0
+            } else if ms <= 45 {
+                1
+            } else if ms <= 60 {
+                2
+            } else {
+                3
+            };
+            FRAME_HIST[bucket].fetch_add(1, Relaxed);
+        }
+    }
+
+    thread_local! {
+        /// True only while the bake loop is running, so the shared `draw_commands`
+        /// path can tell a bake apart from the main scene it also serves.
+        pub(crate) static IN_BAKE: Cell<bool> = const { Cell::new(false) };
+        /// Recursion depth of `draw_commands`; blend and mask chunks re-enter it.
+        pub(crate) static DEPTH: Cell<u32> = const { Cell::new(0) };
+    }
 }
 
 static RENDER_ENCODE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -735,6 +798,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         cache_entries: Vec<BitmapCacheEntry>,
     ) {
         let encode_started = std::time::Instant::now();
+        if bake_profile_enabled() {
+            bake_profile::note_frame_interval(encode_started);
+        }
         let frame_output = match self.target.get_next_texture() {
             Ok(frame) => frame,
             Err(e) => {
@@ -787,8 +853,15 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             }
         }
 
+        let bake_prof = bake_profile_enabled();
+        let bake_started = (bake_prof && !cache_entries.is_empty())
+            .then(std::time::Instant::now);
+        if bake_started.is_some() {
+            bake_profile::IN_BAKE.with(|f| f.set(true));
+        }
         for entry in cache_entries {
             let texture = as_texture(&entry.handle);
+            let surface_started = bake_prof.then(std::time::Instant::now);
             let surface = Surface::new(
                 &self.descriptors,
                 self.surface.quality(),
@@ -796,6 +869,12 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 texture.texture.height(),
                 wgpu::TextureFormat::Rgba8Unorm,
             );
+            if let Some(started) = surface_started {
+                bake_profile::SURFACE_NS.fetch_add(
+                    started.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
             if entry.filters.is_empty() {
                 surface.draw_commands(
                     RenderTargetMode::ExistingWithColor(
@@ -840,6 +919,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     LayerRef::None,
                     &mut self.offscreen_texture_pool,
                 );
+                let filter_started = bake_prof.then(std::time::Instant::now);
                 for filter in entry.filters {
                     target = self.descriptors.filters.apply(
                         &self.descriptors,
@@ -864,11 +944,34 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     target.copy_uv_scale(),
                     &mut self.active_frame.command_encoder,
                 );
+                if let Some(started) = filter_started {
+                    bake_profile::FILTER_NS.fetch_add(
+                        started.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
             }
             // Periodically flush GPU work to prevent OOM when many cache entries
             // accumulate (e.g. when a large container's cacheAsBitmap is skipped
             // but its hundreds of children each have their own bitmap caches).
+            let flush_started = bake_prof.then(std::time::Instant::now);
+            let draws_before = self.active_frame.draws_since_flush;
             self.active_frame.maybe_flush(&self.descriptors);
+            if let Some(started) = flush_started {
+                use std::sync::atomic::Ordering::Relaxed;
+                bake_profile::FLUSH_NS.fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
+                // `maybe_flush` only resets the counter when it actually submitted.
+                if self.active_frame.draws_since_flush <= draws_before {
+                    bake_profile::FLUSHES.fetch_add(1, Relaxed);
+                }
+            }
+        }
+        if let Some(started) = bake_started {
+            bake_profile::IN_BAKE.with(|f| f.set(false));
+            bake_profile::TOTAL_NS.fetch_add(
+                started.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
 
         let crt = ruffle_render::backend::aqw_crt_filter_enabled();
@@ -1008,7 +1111,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             extent,
         );
 
-        let handle = BitmapHandle(Arc::new(Texture::new(texture)));
+        let handle = BitmapHandle(Arc::new(Texture::new(texture, TextureOrigin::Content)));
 
         Ok(handle)
     }
@@ -1164,6 +1267,10 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         Some(crate::bitmap_texture_stats())
     }
 
+    fn bitmap_texture_by_origin(&self) -> [(i64, i64); 4] {
+        crate::bitmap_texture_by_origin()
+    }
+
     fn bitmap_texture_largest(&self, limit: usize) -> Vec<(u32, u32, usize, u64)> {
         crate::bitmap_texture_largest(limit)
     }
@@ -1204,6 +1311,30 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             RENDER_FRAMES.swap(0, Ordering::Relaxed),
             process_commit_mb(),
         )
+    }
+
+    fn take_bake_profile(&mut self) -> ruffle_render::backend::BakeProfile {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ms = |counter: &std::sync::atomic::AtomicU64| counter.swap(0, Relaxed) / 1_000_000;
+        ruffle_render::backend::BakeProfile {
+            total_ms: ms(&bake_profile::TOTAL_NS),
+            surface_ms: ms(&bake_profile::SURFACE_NS),
+            target_ms: ms(&bake_profile::TARGET_NS),
+            chunk_ms: ms(&bake_profile::CHUNK_NS),
+            pass_ms: ms(&bake_profile::PASS_NS),
+            belt_ms: ms(&bake_profile::BELT_NS),
+            filter_ms: ms(&bake_profile::FILTER_NS),
+            flush_ms: ms(&bake_profile::FLUSH_NS),
+            flushes: bake_profile::FLUSHES.swap(0, Relaxed),
+            nested_ms: ms(&bake_profile::NESTED_NS),
+            nested_calls: bake_profile::NESTED_CALLS.swap(0, Relaxed),
+            frame_min_ms: match bake_profile::FRAME_MIN_NS.swap(u64::MAX, Relaxed) {
+                u64::MAX => 0,
+                ns => ns / 1_000_000,
+            },
+            frame_max_ms: bake_profile::FRAME_MAX_NS.swap(0, Relaxed) / 1_000_000,
+            frame_hist: std::array::from_fn(|i| bake_profile::FRAME_HIST[i].swap(0, Relaxed)),
+        }
     }
 
     fn apply_filter(
@@ -1349,7 +1480,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                             | wgpu::TextureUsages::RENDER_ATTACHMENT
                             | wgpu::TextureUsages::COPY_SRC,
                     });
-                BitmapHandle(Arc::new(Texture::new(texture)))
+                BitmapHandle(Arc::new(Texture::new(texture, TextureOrigin::Offscreen)))
             }
         };
 
@@ -1501,7 +1632,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     | wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::COPY_SRC,
             });
-        Ok(BitmapHandle(Arc::new(Texture::new(texture))))
+        Ok(BitmapHandle(Arc::new(Texture::new(texture, TextureOrigin::Cache))))
     }
 
     fn resolve_sync_handle(

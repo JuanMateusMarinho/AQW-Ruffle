@@ -155,6 +155,15 @@ const AQW_ORPHAN_INERT_GRACE_TICKS: u16 = 24;
 
 const AQW_ORPHAN_INERT_REPROBE_TICKS: u16 = 16;
 
+/// Caps the re-probe backoff, so a subtree that wakes up is still noticed within about
+/// ten seconds.
+const AQW_INERT_BACKOFF_MAX: u8 = 4;
+
+/// How often a long-detached subtree is revisited to drop cache textures, and how many
+/// may be dropped per visit.
+const AQW_CACHE_RELEASE_PERIOD_TICKS: u16 = 256;
+const AQW_CACHE_RELEASE_BUDGET: u32 = 64;
+
 fn aqw_subtree_will_advance<'gc>(obj: DisplayObject<'gc>, budget: &mut u32) -> Option<bool> {
     if *budget == 0 {
         return None;
@@ -883,6 +892,9 @@ pub struct MovieClipData<'gc> {
     aqw_timeline_divisor: Cell<u8>,
     aqw_skip_timeline_frame: Cell<bool>,
     aqw_orphan_ticks: Cell<u16>,
+    /// How many times in a row the inert probe has come back inert. The probe walks the
+    /// whole subtree whenever the answer is inert; it only exits early on a positive.
+    aqw_inert_streak: Cell<u8>,
     aqw_orphan_freeze: Cell<u8>,
 
     /// Force enable button mode, which causes all mouse-related events to
@@ -937,6 +949,7 @@ impl<'gc> MovieClipData<'gc> {
             aqw_timeline_divisor: Cell::new(0),
             aqw_skip_timeline_frame: Cell::new(false),
             aqw_orphan_ticks: Cell::new(0),
+            aqw_inert_streak: Cell::new(0),
             aqw_orphan_freeze: Cell::new(0),
             queued_goto_frame: Cell::new(None),
             drop_target: Lock::new(None),
@@ -3612,13 +3625,28 @@ impl<'gc> MovieClip<'gc> {
         }
         let ticks = self.0.aqw_orphan_ticks.get().saturating_add(1);
         self.0.aqw_orphan_ticks.set(ticks);
+        // Rechecked periodically rather than once, so caches that appear after the first
+        // pass still get collected.
+        if ticks >= super::aqw_cache_release_idle_ticks()
+            && ticks.is_multiple_of(AQW_CACHE_RELEASE_PERIOD_TICKS)
+            && !super::aqw_idle_cache_release_disabled()
+        {
+            let mut budget = AQW_CACHE_RELEASE_BUDGET;
+            super::aqw_release_subtree_caches(self.into(), &mut budget);
+        }
         if ticks < AQW_ORPHAN_INERT_GRACE_TICKS {
             return false;
         }
         match self.0.aqw_orphan_freeze.get() {
             1 => true,
             2 if !ticks.is_multiple_of(64) => false,
-            3 if !ticks.is_multiple_of(AQW_ORPHAN_INERT_REPROBE_TICKS) => true,
+            3 if !ticks.is_multiple_of(
+                AQW_ORPHAN_INERT_REPROBE_TICKS
+                    << self.0.aqw_inert_streak.get().min(AQW_INERT_BACKOFF_MAX),
+            ) =>
+            {
+                true
+            }
             _ => {
                 let mut budget = 128u32;
                 if ticks >= AQW_ORPHAN_FREEZE_GRACE_TICKS
@@ -3636,6 +3664,12 @@ impl<'gc> MovieClip<'gc> {
                     }
                     verdict == Some(false)
                 };
+                super::AQW_ORPHAN_PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.0.aqw_inert_streak.set(if inert {
+                    self.0.aqw_inert_streak.get().saturating_add(1)
+                } else {
+                    0
+                });
                 self.0.aqw_orphan_freeze.set(if inert { 3 } else { 2 });
                 inert
             }

@@ -124,6 +124,8 @@ pub struct BitmapCache {
     deferred_frames: u32,
 
     dirty_streak: u32,
+    /// Complex blend passes the last bake of this cache emitted.
+    last_bake_blends: u32,
 
     bake_count: u32,
 
@@ -198,6 +200,257 @@ pub(crate) fn script_requeue_disabled() -> bool {
 pub(crate) fn redraw_defer_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_REDRAW_DEFER", false))
+}
+
+/// How long a subtree must stay off the stage before its cache textures are dropped.
+pub(crate) fn aqw_cache_release_idle_ticks() -> u16 {
+    static TICKS: OnceLock<u16> = OnceLock::new();
+    *TICKS.get_or_init(|| {
+        std::env::var("RUFFLE_AQW_CACHE_RELEASE_IDLE_TICKS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u16>().ok())
+            .unwrap_or(256)
+    })
+}
+
+/// Cache textures dropped per registry pass, so a big cleanup is spread over frames.
+const AQW_DETACHED_RELEASE_BUDGET: u32 = 96;
+
+/// Below this a bake is cheap enough that charging it would only add bookkeeping.
+const AQW_BAKE_BLEND_CHARGE_FLOOR: u32 = 24;
+
+/// How often the registry is walked.
+const AQW_RELEASE_PASS_TICKS: u64 = 16;
+
+pub(crate) static AQW_REG_PASS_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Retained cache textures grouped by owner class and source file.
+static AQW_CACHE_OWNERS: std::sync::Mutex<Option<std::collections::HashMap<String, (u64, u64)>>> =
+    std::sync::Mutex::new(None);
+
+pub(crate) static AQW_REG_ONSTAGE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_REG_DEAD: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_REG_IDLE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_REG_AGED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_REG_BUDGET_HIT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Redraws refused for blend cost, and the worst per-bake blend cost seen.
+pub(crate) static AQW_BAKE_BLEND_REFUSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_BAKE_BLEND_MAX: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn aqw_bake_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_BAKE_PROFILE", false))
+}
+
+fn aqw_note_cache_owner(label: String, bytes: u64) {
+    let Ok(mut guard) = AQW_CACHE_OWNERS.lock() else {
+        return;
+    };
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    let entry = map.entry(label).or_insert((0, 0));
+    entry.0 += 1;
+    entry.1 += bytes;
+}
+
+fn take_cache_owners(limit: usize) -> String {
+    let Ok(mut guard) = AQW_CACHE_OWNERS.lock() else {
+        return String::new();
+    };
+    let Some(map) = guard.take() else {
+        return String::new();
+    };
+    let mut owners: Vec<(String, (u64, u64))> = map.into_iter().collect();
+    owners.sort_unstable_by_key(|(_, (_, bytes))| std::cmp::Reverse(*bytes));
+    owners.truncate(limit);
+    owners
+        .into_iter()
+        .map(|(name, (count, bytes))| format!("{name}:{count}/{}MB", bytes / (1024 * 1024)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+pub(crate) fn aqw_auto_cache_budget_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_AUTO_CACHE_BUDGET", false))
+}
+
+pub(crate) fn aqw_idle_cache_release_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| aqw_env_flag("RUFFLE_AQW_NO_IDLE_CACHE_RELEASE", false))
+}
+
+/// How many `BitmapCache` structs currently hold a texture, against the live count of
+/// cache-origin textures.
+/// Monotonic AQW tick, used to age registry entries.
+pub(crate) static AQW_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) static AQW_DETACHED_TRACKED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) static AQW_CACHES_HOLDING_TEXTURE: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+pub(crate) static AQW_CACHE_RELEASED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AQW_CACHE_RELEASED_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Drops the cache textures in a subtree, keeping the caches themselves: `is_dirty`
+/// reports true once the texture is gone, so anything drawn again bakes once more.
+/// Edges that keep a display object alive without putting it in a render list: a masker
+/// hangs off its maskee, and a button holds all four states while rendering one.
+fn aqw_offlist_children<'gc>(obj: DisplayObject<'gc>, out: &mut Vec<DisplayObject<'gc>>) {
+    if let Some(masker) = obj.masker() {
+        out.push(masker);
+    }
+    if let Some(button) = obj.as_avm2_button() {
+        for state in [
+            swf::ButtonState::UP,
+            swf::ButtonState::OVER,
+            swf::ButtonState::DOWN,
+            swf::ButtonState::HIT_TEST,
+        ] {
+            if let Some(child) = button.get_state_child(state) {
+                out.push(child);
+            }
+        }
+    }
+}
+
+/// Sums the cache textures held inside a subtree, for reporting by owner.
+fn aqw_count_subtree_caches(obj: DisplayObject<'_>, bytes: &mut u64, depth: u32) {
+    if depth > 256 {
+        return;
+    }
+    {
+        let base = obj.base();
+        if let Some(cache) = &*base.bitmap_cache_mut()
+            && cache.bitmap.is_some()
+        {
+            *bytes += cache.estimated_bytes();
+        }
+    }
+    let mut offlist = Vec::new();
+    aqw_offlist_children(obj, &mut offlist);
+    for child in offlist {
+        aqw_count_subtree_caches(child, bytes, depth + 1);
+    }
+    if let Some(container) = obj.as_container() {
+        for child in container.iter_render_list() {
+            aqw_count_subtree_caches(child, bytes, depth + 1);
+        }
+    }
+}
+
+/// Walks the registry, dropping the textures of subtrees that have stayed off the stage
+/// and forgetting the entries that died or came back.
+fn aqw_release_detached_caches(context: &mut UpdateContext<'_>, tick: u64) {
+    if aqw_idle_cache_release_disabled() {
+        return;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    let idle_ticks = u64::from(aqw_cache_release_idle_ticks());
+    // Naming the owners costs a label per entry, so it runs on a slower cadence.
+    let census = aqw_bake_profile_enabled() && tick.is_multiple_of(96);
+    let entries = context.orphan_manager.take_detached();
+    // Every bake registers the object again, so collapse by identity first, keeping the
+    // most recent tick: the age that counts is time since it was last drawn.
+    let mut newest: std::collections::HashMap<usize, (DisplayObject<'_>, u64)> =
+        std::collections::HashMap::with_capacity(entries.len());
+    let mut weaks: std::collections::HashMap<usize, _> = std::collections::HashMap::new();
+    let (mut on_stage, mut dead, mut idle, mut aged) = (0u64, 0u64, 0u64, 0u64);
+    for (weak, seen_at) in entries {
+        let Some(dobj) = crate::orphan_manager::OrphanManager::upgrade_detached(weak, context.gc())
+        else {
+            dead += 1;
+            continue; // collected; its caches went with it
+        };
+        let ptr = dobj.as_ptr() as usize;
+        weaks.entry(ptr).or_insert(weak);
+        newest
+            .entry(ptr)
+            .and_modify(|slot| {
+                if seen_at > slot.1 {
+                    slot.1 = seen_at;
+                }
+            })
+            .or_insert((dobj, seen_at));
+    }
+
+    let mut budget = AQW_DETACHED_RELEASE_BUDGET;
+    let mut kept = Vec::with_capacity(newest.len());
+    for (ptr, (dobj, seen_at)) in newest {
+        let weak = weaks[&ptr];
+        if dobj.is_on_stage(context) {
+            // Still being drawn; keep tracking it with a fresh stamp, so it is already
+            // known when it does leave the stage.
+            on_stage += 1;
+            kept.push((weak, tick));
+            continue;
+        }
+        if census {
+            let mut bytes = 0;
+            aqw_count_subtree_caches(dobj, &mut bytes, 0);
+            if bytes > 0 {
+                aqw_note_cache_owner(aqw_blend_label(dobj), bytes);
+            }
+        }
+        if tick.saturating_sub(seen_at) < idle_ticks {
+            idle += 1;
+            kept.push((weak, seen_at));
+            continue;
+        }
+        if budget == 0 {
+            AQW_REG_BUDGET_HIT.fetch_add(1, Relaxed);
+            kept.push((weak, seen_at));
+            continue;
+        }
+        aged += 1;
+        aqw_release_subtree_caches(dobj, &mut budget);
+    }
+    AQW_REG_ONSTAGE.store(on_stage, Relaxed);
+    AQW_REG_DEAD.fetch_add(dead, Relaxed);
+    AQW_REG_IDLE.store(idle, Relaxed);
+    AQW_REG_AGED.fetch_add(aged, Relaxed);
+    AQW_DETACHED_TRACKED.store(kept.len() as u64, Relaxed);
+    context.orphan_manager.put_detached(kept);
+}
+
+pub(crate) fn aqw_release_subtree_caches(obj: DisplayObject<'_>, budget: &mut u32) {
+    if *budget == 0 {
+        return;
+    }
+    {
+        let base = obj.base();
+        if let Some(cache) = &mut *base.bitmap_cache_mut()
+            && cache.bitmap.is_some()
+        {
+            let bytes = cache.estimated_bytes();
+            cache.clear();
+            *budget -= 1;
+            AQW_CACHE_RELEASED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            AQW_CACHE_RELEASED_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let mut offlist = Vec::new();
+    aqw_offlist_children(obj, &mut offlist);
+    for child in offlist {
+        aqw_release_subtree_caches(child, budget);
+    }
+    if let Some(container) = obj.as_container() {
+        for child in container.iter_render_list() {
+            aqw_release_subtree_caches(child, budget);
+        }
+    }
 }
 
 pub(crate) fn aqw_defer_max_stale_frames() -> u32 {
@@ -452,6 +705,14 @@ fn aqw_report_stage_children(context: &mut UpdateContext<'_>) {
     );
 }
 
+impl Drop for BitmapCache {
+    fn drop(&mut self) {
+        if self.bitmap.is_some() {
+            AQW_CACHES_HOLDING_TEXTURE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 impl BitmapCache {
     /// Forcefully make this BitmapCache invalid and require regeneration.
     /// This should be used for changes that aren't automatically detected, such as children.
@@ -631,12 +892,21 @@ impl BitmapCache {
             && acceptable_size
         {
             let handle = renderer.create_empty_texture(alloc_width, alloc_height);
+            if self.bitmap.is_some() {
+                AQW_CACHES_HOLDING_TEXTURE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
             self.bitmap = handle.ok().map(|handle| BitmapInfo {
                 width: alloc_width.get(),
                 height: alloc_height.get(),
                 handle,
             });
+            if self.bitmap.is_some() {
+                AQW_CACHES_HOLDING_TEXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         } else {
+            if self.bitmap.is_some() {
+                AQW_CACHES_HOLDING_TEXTURE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
             self.bitmap = None;
         }
     }
@@ -645,6 +915,9 @@ impl BitmapCache {
     /// This should only be used in situations where you can't render to the cache and it needs to be
     /// temporarily disabled.
     fn clear(&mut self) {
+        if self.bitmap.is_some() {
+            AQW_CACHES_HOLDING_TEXTURE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.bitmap = None;
         self.dirty_streak = 0;
     }
@@ -1744,8 +2017,16 @@ impl Drop for AqwBakeScope {
     }
 }
 
+thread_local! {
+    /// Complex blend passes emitted so far, read as a delta across a bake.
+    static AQW_COMPLEX_BLENDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 fn note_blend_emitted<'gc>(this: DisplayObject<'gc>, owner: Option<&str>, complex: bool) {
     use std::sync::atomic::Ordering::Relaxed;
+    if complex {
+        AQW_COMPLEX_BLENDS.with(|n| n.set(n.get().saturating_add(1)));
+    }
     match (owner.is_some(), complex) {
         (true, true) => AQW_BLEND_COMPLEX_BAKED.fetch_add(1, Relaxed),
         (true, false) => AQW_BLEND_TRIVIAL_BAKED.fetch_add(1, Relaxed),
@@ -2148,6 +2429,10 @@ fn take_invalidate_origins(limit: usize) -> Vec<String> {
 }
 
 pub(crate) static AQW_ORPHAN_PROBE_EXHAUSTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Inert probes actually run.
+pub(crate) static AQW_ORPHAN_PROBES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) static AQW_ORPHAN_POP: std::sync::atomic::AtomicU64 =
@@ -2664,6 +2949,17 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
         return;
     }
 
+    let tick = AQW_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Walking the registry costs a weak upgrade per entry, so it runs on a cadence.
+    if tick.is_multiple_of(AQW_RELEASE_PASS_TICKS) {
+        let started = std::time::Instant::now();
+        aqw_release_detached_caches(context, tick);
+        AQW_REG_PASS_NS.fetch_add(
+            started.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     static SWEEP_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if !SWEEP_FRAME
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -2835,6 +3131,26 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
             format!("{blend_mul_opaque}/{blend_mul_total} ({blend_mul_opaque_mpx}Mpx)");
         let (render_encode_ms, render_submit_ms, render_frames, commit_mb) =
             context.renderer.take_render_timings();
+        let bake = context.renderer.take_bake_profile();
+        let bake_total_ms = bake.total_ms;
+        let bake_surface_ms = bake.surface_ms;
+        let bake_target_ms = bake.target_ms;
+        let bake_chunk_ms = bake.chunk_ms;
+        let bake_pass_ms = bake.pass_ms;
+        let bake_belt_ms = bake.belt_ms;
+        let bake_filter_ms = bake.filter_ms;
+        let bake_flush_ms = bake.flush_ms;
+        let bake_flushes = bake.flushes;
+        let bake_nested_ms = bake.nested_ms;
+        let bake_nested_calls = bake.nested_calls;
+        let frame_min_ms = bake.frame_min_ms;
+        let frame_max_ms = bake.frame_max_ms;
+        let frame_hist = bake
+            .frame_hist
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join("/");
         let avatar_caches = AQW_AVATAR_CACHES_ENABLED.load(Ordering::Relaxed);
         let blend_swfs = take_blend_sources(6)
             .iter()
@@ -2869,6 +3185,33 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
             .bitmap_texture_stats()
             .map(|(count, bytes)| (count, bytes / (1024 * 1024)))
             .unwrap_or((0, 0));
+        let cache_owned = AQW_CACHES_HOLDING_TEXTURE.load(Ordering::Relaxed);
+        let detached_tracked = AQW_DETACHED_TRACKED.load(Ordering::Relaxed);
+        let reg_onstage = AQW_REG_ONSTAGE.load(Ordering::Relaxed);
+        let reg_idle = AQW_REG_IDLE.load(Ordering::Relaxed);
+        let reg_dead = AQW_REG_DEAD.swap(0, Ordering::Relaxed);
+        let reg_aged = AQW_REG_AGED.swap(0, Ordering::Relaxed);
+        let reg_budget_hit = AQW_REG_BUDGET_HIT.swap(0, Ordering::Relaxed);
+        let reg_pass_ms = AQW_REG_PASS_NS.swap(0, Ordering::Relaxed) / 1_000_000;
+        let orph_probes = AQW_ORPHAN_PROBES.swap(0, Ordering::Relaxed);
+        let bake_blend_refused = AQW_BAKE_BLEND_REFUSED.swap(0, Ordering::Relaxed);
+        let bake_blend_max = AQW_BAKE_BLEND_MAX.swap(0, Ordering::Relaxed);
+        let cache_owner_top = take_cache_owners(8);
+        let cache_released = AQW_CACHE_RELEASED.swap(0, Ordering::Relaxed);
+        let cache_released_mb =
+            AQW_CACHE_RELEASED_BYTES.swap(0, Ordering::Relaxed) / (1024 * 1024);
+        let bmp_origin = {
+            let by = context.renderer.bitmap_texture_by_origin();
+            let names = ["content", "cache", "offscreen", "other"];
+            names
+                .iter()
+                .zip(by.iter())
+                .map(|(name, (count, bytes))| {
+                    format!("{name}:{count}/{}MB", bytes / (1024 * 1024))
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         let bmp_top = context
             .renderer
             .bitmap_texture_largest(15)
@@ -2947,10 +3290,10 @@ pub fn aqw_cache_sweep(context: &mut UpdateContext<'_>) {
              blend_triv_alloc={blend_triv_alloc}% \
              blend_triv_mpx={blend_triv_mpx} blend_triv_top={blend_triv_top} \
              render_encode_ms={render_encode_ms} render_submit_ms={render_submit_ms} \
-             render_frames={render_frames} commit_mb={commit_mb} \
+             render_frames={render_frames} commit_mb={commit_mb}              bake_total_ms={bake_total_ms} bake_surface_ms={bake_surface_ms}              bake_target_ms={bake_target_ms} bake_chunk_ms={bake_chunk_ms}              bake_pass_ms={bake_pass_ms} bake_belt_ms={bake_belt_ms}              bake_filter_ms={bake_filter_ms} bake_flush_ms={bake_flush_ms}              bake_flushes={bake_flushes} bake_nested_ms={bake_nested_ms}              bake_nested_calls={bake_nested_calls}                                        frame_min_ms={frame_min_ms} frame_max_ms={frame_max_ms}              frame_hist={frame_hist} \
              blend_swfs={blend_swfs} avatar_caches={avatar_caches} \
              dicts={dicts} dict_okeys={dict_okeys} \
-             bmp_tex={bmp_tex} bmp_mb={bmp_mb} bmp_top={bmp_top} \
+             bmp_tex={bmp_tex} bmp_mb={bmp_mb} bmp_origin={bmp_origin}              cache_released={cache_released} cache_released_mb={cache_released_mb}              cache_owned={cache_owned} detached_tracked={detached_tracked} reg_onstage={reg_onstage} reg_idle={reg_idle} reg_dead={reg_dead} reg_aged={reg_aged} reg_budget_hit={reg_budget_hit} reg_pass_ms={reg_pass_ms} orph_probes={orph_probes} bake_blend_refused={bake_blend_refused} bake_blend_max={bake_blend_max} cache_owner_top={cache_owner_top}                           bmp_top={bmp_top} \
              bmp_sizes={bmp_sizes} bmp_tracked_mb={bmp_tracked_mb} \
              inner_frames={inner_frames} inner_orphan_ms={inner_orphan_ms} \
              inner_stage_ms={inner_stage_ms} inner_bcast_ms={inner_bcast_ms} \
@@ -3705,7 +4048,9 @@ pub fn render_base<'gc>(
                             && (actual_width >= defer_min_side || actual_height >= defer_min_side);
                         let mut admitted_aged = false;
                         let grace_admitted = cache.dirty_streak <= aqw_defer_eligible_frames();
-                        let mut can_redraw_cache = if !allow_aqw_large_cache || aqw_auto_cache {
+                        let mut can_redraw_cache = if !allow_aqw_large_cache
+                            || (aqw_auto_cache && aqw_auto_cache_budget_disabled())
+                        {
                             true
                         } else if grace_admitted {
                             AQW_CACHE_DEFER_GRACE
@@ -3716,6 +4061,19 @@ pub fn render_base<'gc>(
                         } else {
                             context.try_reserve_small_cache_redraw(redraw_pixels)
                         };
+                        // Charged from the previous bake, so the first one is always free.
+                        if can_redraw_cache
+                            && cache.last_bake_blends >= AQW_BAKE_BLEND_CHARGE_FLOOR
+                            && !context.try_reserve_bake_blends(cache.last_bake_blends)
+                        {
+                            can_redraw_cache = false;
+                            AQW_BAKE_BLEND_REFUSED
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        AQW_BAKE_BLEND_MAX.fetch_max(
+                            u64::from(cache.last_bake_blends),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                         if !can_redraw_cache
                             && cache.deferred_frames >= aqw_stale_cache_aged_frames()
                             && context.try_reserve_aged_cache_redraw()
@@ -3729,6 +4087,7 @@ pub fn render_base<'gc>(
                             can_redraw_cache = true;
                         }
 
+                        let had_texture = cache.bitmap.is_some();
                         if can_redraw_cache {
                             cache.bake_count = cache.bake_count.saturating_add(1);
                             if aqw_diagnostics_enabled() {
@@ -3776,6 +4135,19 @@ pub fn render_base<'gc>(
                                 allow_aqw_large_cache,
                                 allow_size_padding,
                             );
+                            // Every cache texture passes through here exactly once, when
+                            // it is allocated.
+                            if !had_texture
+                                && cache.bitmap.is_some()
+                                && matches!(
+                                    this,
+                                    DisplayObject::MovieClip(_)
+                                        | DisplayObject::LoaderDisplay(_)
+                                        | DisplayObject::Bitmap(_)
+                                )
+                            {
+                                context.aqw_cached.push(this.downgrade());
+                            }
                             cache.deferred_frames = 0;
                             cache.stale_anchor = Point::new(
                                 bounds.x_min - base_transform.matrix.tx
@@ -3993,16 +4365,19 @@ pub fn render_base<'gc>(
                 },
                 perspective_projection: cache_info.base_transform.perspective_projection,
             });
+            let mut offscreen_cached = Vec::new();
             let mut offscreen_context = RenderContext {
                 renderer: context.renderer,
                 commands: CommandList::new(),
                 cache_draws: context.cache_draws,
+                aqw_cached: &mut offscreen_cached,
                 gc_context: context.gc_context,
                 library: context.library,
                 transform_stack: &mut transform_stack,
                 is_offscreen: true,
                 use_bitmap_cache: !is_aqw_movie_url(this.movie().url()),
                 cache_filtered_children: true,
+                bake_blend_budget_remaining: u32::MAX,
                 dirty_cache_redraws_remaining: u32::MAX,
                 dirty_cache_redraws_reserved: 0,
                 dirty_cache_redraw_pixels_remaining: u64::MAX,
@@ -4013,7 +4388,14 @@ pub fn render_base<'gc>(
                 stage: context.stage,
             };
             let _bake_scope = AqwBakeScope::enter(this);
+            let blends_before = AQW_COMPLEX_BLENDS.with(std::cell::Cell::get);
             this.render_self(&mut offscreen_context);
+            let baked_blends = AQW_COMPLEX_BLENDS
+                .with(std::cell::Cell::get)
+                .saturating_sub(blends_before);
+            if let Some(cache) = &mut *this.base().bitmap_cache_mut() {
+                cache.last_bake_blends = baked_blends.min(u64::from(u32::MAX)) as u32;
+            }
             offscreen_context.cache_draws.push(BitmapCacheEntry {
                 handle: cache_info.handle.clone(),
                 commands: offscreen_context.commands,
@@ -4908,6 +5290,13 @@ pub trait TDisplayObject<'gc>:
         if parent_removed {
             if let Some(int) = self.as_interactive() {
                 int.drop_focus(context);
+            }
+
+            if !aqw_idle_cache_release_disabled()
+                && is_aqw_movie_url(context.stage.movie().url())
+            {
+                let tick = AQW_TICK.load(std::sync::atomic::Ordering::Relaxed);
+                context.orphan_manager.note_detached(self.into(), tick);
             }
 
             self.on_parent_removed(context);

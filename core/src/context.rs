@@ -557,6 +557,10 @@ pub struct RenderContext<'a, 'gc> {
     /// Any offscreen draws that should be used to redraw a cacheAsBitmap
     pub cache_draws: &'a mut Vec<BitmapCacheEntry>,
 
+    /// Objects whose bitmap cache just allocated a texture, handed to the orphan manager
+    /// once the render pass is done.
+    pub aqw_cached: &'a mut Vec<crate::display_object::DisplayObjectWeak<'gc>>,
+
     /// The GC context, used to perform any `Gc` writes that must occur during rendering.
     pub gc_context: &'gc Mutation<'gc>,
 
@@ -573,6 +577,9 @@ pub struct RenderContext<'a, 'gc> {
     pub use_bitmap_cache: bool,
 
     pub cache_filtered_children: bool,
+
+    /// Complex blend passes the frame's cache bakes may still emit.
+    pub bake_blend_budget_remaining: u32,
 
     pub dirty_cache_redraws_remaining: u32,
 
@@ -631,6 +638,20 @@ impl<'gc> RenderContext<'_, 'gc> {
         } else {
             remaining - pixels
         };
+        true
+    }
+
+    /// Charges a redraw by what its last bake cost in complex blend passes, which the
+    /// count and pixel budgets cannot see.
+    pub fn try_reserve_bake_blends(&mut self, blends: u32) -> bool {
+        if self.bake_blend_budget_remaining == u32::MAX {
+            return true;
+        }
+        if blends > self.bake_blend_budget_remaining {
+            self.bake_blend_budget_remaining = 0;
+            return false;
+        }
+        self.bake_blend_budget_remaining -= blends;
         true
     }
 

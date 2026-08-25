@@ -2,7 +2,7 @@ mod commands;
 pub mod target;
 
 use crate::Transforms;
-use crate::backend::RenderTargetMode;
+use crate::backend::{RenderTargetMode, bake_profile, bake_profile_enabled};
 use crate::blend::ComplexBlend;
 use crate::buffer_builder::BufferBuilder;
 use crate::buffer_pool::TexturePool;
@@ -139,6 +139,27 @@ impl Surface {
     ) -> CommandTarget {
         let dest_opaque = render_target_mode.clears_opaque();
 
+        // Blend and mask chunks re-enter this function, so only the outermost call of a
+        // bake attributes its parts; the recursion is reported on its own as `nested`.
+        let profiling =
+            bake_profile_enabled() && bake_profile::IN_BAKE.with(std::cell::Cell::get);
+        let depth = if profiling {
+            bake_profile::DEPTH.with(|d| {
+                let was = d.get();
+                d.set(was + 1);
+                was
+            })
+        } else {
+            0
+        };
+        let outermost = profiling && depth == 0;
+        if profiling && depth >= 1 {
+            bake_profile::NESTED_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Timed at depth 1 only: that call already encloses any deeper recursion.
+        let nested_started = (profiling && depth == 1).then(std::time::Instant::now);
+
+        let target_started = outermost.then(std::time::Instant::now);
         let target = CommandTarget::new(
             descriptors,
             texture_pool,
@@ -149,9 +170,16 @@ impl Surface {
             draw_encoder,
             false,
         );
+        if let Some(started) = target_started {
+            bake_profile::TARGET_NS.fetch_add(
+                started.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
 
         let mut num_masks = 0;
         let mut mask_state = MaskState::NoMask;
+        let chunk_started = outermost.then(std::time::Instant::now);
         let (chunks, content_bounds) = chunk_blends(
             commands,
             descriptors,
@@ -170,8 +198,16 @@ impl Surface {
             self.origin,
             dest_opaque,
         );
+        if let Some(started) = chunk_started {
+            bake_profile::CHUNK_NS.fetch_add(
+                started.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         target.set_content_bounds(content_bounds);
 
+        let pass_started = outermost.then(std::time::Instant::now);
+        let mut belt_ns: u64 = 0;
         for chunk in chunks {
             match chunk {
                 Chunk::Draw {
@@ -179,12 +215,16 @@ impl Surface {
                     needs_stencil,
                     transforms,
                 } => {
+                    let belt_started = outermost.then(std::time::Instant::now);
                     transforms.copy_to(
                         staging_belt,
                         &descriptors.device,
                         draw_encoder,
                         &dynamic_transforms.buffer,
                     );
+                    if let Some(started) = belt_started {
+                        belt_ns += started.elapsed().as_nanos() as u64;
+                    }
                     let mut render_pass =
                         draw_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: create_debug_label!(
@@ -426,8 +466,25 @@ impl Surface {
             }
         }
 
+        if let Some(started) = pass_started {
+            use std::sync::atomic::Ordering::Relaxed;
+            let elapsed = started.elapsed().as_nanos() as u64;
+            bake_profile::PASS_NS.fetch_add(elapsed.saturating_sub(belt_ns), Relaxed);
+            bake_profile::BELT_NS.fetch_add(belt_ns, Relaxed);
+        }
+
         // If nothing happened, ensure it's cleared so we don't operate on garbage data
         target.ensure_cleared(draw_encoder);
+
+        if profiling {
+            bake_profile::DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            if let Some(started) = nested_started {
+                bake_profile::NESTED_NS.fetch_add(
+                    started.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+        }
 
         target
     }

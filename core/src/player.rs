@@ -88,6 +88,21 @@ pub const FALLBACK_DEVICE_FONT: &[u8] = include_bytes!("../assets/notosans.subse
 const AQW_DIRTY_CACHE_REDRAWS_PER_FRAME: u32 = 8;
 const AQW_DIRTY_CACHE_REDRAW_PIXELS_PER_FRAME: u64 = 6_000_000;
 const AQW_SMALL_CACHE_REDRAWS_PER_FRAME: u32 = 32;
+const AQW_BAKE_BLENDS_PER_FRAME: u32 = 96;
+
+fn aqw_bake_blend_budget() -> u32 {
+    static BUDGET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        match std::env::var("RUFFLE_AQW_BAKE_BLEND_BUDGET")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+        {
+            Some(0) => u32::MAX,
+            Some(n) => n,
+            None => AQW_BAKE_BLENDS_PER_FRAME,
+        }
+    })
+}
 const AQW_AGED_CACHE_REDRAWS_PER_FRAME: u32 = 2;
 
 fn aqw_small_cache_redraw_budget() -> u32 {
@@ -2110,18 +2125,25 @@ impl Player {
             let stage = gc_root.stage;
 
             let mut cache_draws = vec![];
+            let mut aqw_cached: Vec<crate::display_object::DisplayObjectWeak<'_>> = vec![];
             let vram_pressure = crate::display_object::aqw_vram_pressure();
             let no_defer = crate::display_object::redraw_defer_disabled();
             let mut render_context = RenderContext {
                 renderer: this.renderer.deref_mut(),
                 commands: CommandList::new(),
                 cache_draws: &mut cache_draws,
+                aqw_cached: &mut aqw_cached,
                 gc_context,
                 library: &gc_root.library,
                 transform_stack: &mut this.transform_stack,
                 is_offscreen: false,
                 use_bitmap_cache: true,
                 cache_filtered_children: false,
+                bake_blend_budget_remaining: if no_defer {
+                    u32::MAX
+                } else {
+                    aqw_bake_blend_budget()
+                },
                 dirty_cache_redraws_remaining: match vram_pressure {
                     _ if no_defer => u32::MAX,
                     0 => AQW_DIRTY_CACHE_REDRAWS_PER_FRAME,
@@ -2171,6 +2193,12 @@ impl Player {
                 };
 
             let commands = render_context.commands;
+            if !aqw_cached.is_empty() {
+                let tick = crate::display_object::AQW_TICK.load(std::sync::atomic::Ordering::Relaxed);
+                for weak in aqw_cached {
+                    gc_root.orphan_manager.note_cached_weak(weak, tick);
+                }
+            }
             (cache_draws, commands)
         });
 
